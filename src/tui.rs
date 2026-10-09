@@ -131,6 +131,10 @@ struct App {
     compose: Option<Compose>,
     /// An error to show in the footer until the next key.
     notice: Option<String>,
+    /// Progress or an outcome to show in the footer until the next key.
+    info: Option<String>,
+    /// Push and open the previewed PR once the "pushing" footer has been drawn.
+    opening: bool,
     tab: usize,
     /// The selected task's tool calls as (tool, target), newest last.
     activity: Vec<(String, String)>,
@@ -192,6 +196,8 @@ pub fn run(repo: &Path) -> Result<()> {
         help: false,
         compose: None,
         notice: None,
+        info: None,
+        opening: false,
         tab: 0,
         activity: Vec::new(),
         gate_log: String::new(),
@@ -215,6 +221,14 @@ pub fn run(repo: &Path) -> Result<()> {
             let tick = (start.elapsed().as_millis() / 125) as usize; // spinner at 8 Hz
             // ratatui only writes cells that changed, so an idle screen draws nothing
             terminal.draw(|f| draw(f, &app, &theme, tick, SystemTime::now()))?;
+            // ponytail: pushes from the TUI, which freezes for the push; a worker can do it if slow
+            if std::mem::take(&mut app.opening) {
+                match app.open_pr() {
+                    Ok(url) => app.info = Some(format!("PR opened: {url}")),
+                    Err(e) => (app.info, app.notice) = (None, Some(format!("{e:#}"))),
+                }
+                continue;
+            }
             let running = app.tasks.iter().any(|(t, _)| running(t));
             let wait = Duration::from_millis(if running { 125 } else { 250 });
             if event::poll(wait)?
@@ -293,6 +307,7 @@ impl App {
         let ctrl =
             |c| key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c);
         self.notice = None;
+        self.info = None;
         if ctrl('c') {
             return false;
         }
@@ -329,9 +344,8 @@ impl App {
             match key.code {
                 KeyCode::Esc => self.preview = false,
                 KeyCode::Enter => {
-                    if let Err(e) = self.open_pr() {
-                        self.notice = Some(format!("{e:#}"));
-                    }
+                    self.opening = true;
+                    self.info = Some("pushing the branch and opening the PR…".into());
                 }
                 KeyCode::Char('g') => {
                     self.instruction = Some(field("e.g. shorter, drop the critic line"));
@@ -508,7 +522,8 @@ impl App {
     }
 
     /// `enter` in the preview: pushes, opens the PR, then tears down and frees the slot.
-    fn open_pr(&mut self) -> Result<()> {
+    /// Returns the PR's URL.
+    fn open_pr(&mut self) -> Result<String> {
         let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
         let mut t = t.clone();
         let dir = self.slot_dir().context("this task has no worktree")?;
@@ -521,11 +536,12 @@ impl App {
             "the branch changed since this draft; press m to redraft"
         );
         let cfg = config::load(&self.repo)?;
-        // ponytail: pushes from the TUI, which freezes for the push; a worker can do it if slow
-        t.pr_url = Some(pr::open(&t, &dir, BASE, cfg.pr.draft)?);
+        let url = pr::open(&t, &dir, BASE, cfg.pr.draft)?;
+        t.pr_url = Some(url.clone());
         t.status = Status::PrOpen;
         self.preview = false;
-        self.free_slot(t, "PR opened")
+        self.free_slot(t, &format!("PR opened ({url})"))?;
+        Ok(url)
     }
 
     /// Files the composed request as an approved task and starts whatever is ready.
@@ -709,9 +725,10 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             Span::raw(format!("{label} ")).dim(),
         ]
     });
-    let line = match &app.notice {
-        Some(notice) => Line::styled(format!(" {notice}"), theme.red),
-        None => Line::from(keys.collect::<Vec<_>>()),
+    let line = match (&app.notice, &app.info) {
+        (Some(notice), _) => Line::styled(format!(" {notice}"), theme.red),
+        (None, Some(info)) => Line::styled(format!(" {info}"), theme.accent),
+        (None, None) => Line::from(keys.collect::<Vec<_>>()),
     };
     f.render_widget(line, footer);
     if app.help {
@@ -1141,6 +1158,8 @@ mod tests {
             help: false,
             compose: None,
             notice: None,
+            info: None,
+            opening: false,
             tab: 0,
             activity: Vec::new(),
             gate_log: String::new(),

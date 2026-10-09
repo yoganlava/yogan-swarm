@@ -1,4 +1,4 @@
-- [ ] **T19 Push + open PR**
+- [x] **T19 Push + open PR**
 
 Plan: Gate, review and PRs › PR drafts (Approval); Gate, review and PRs (Opening the PR step 5, "From there the PR is yours").
 
