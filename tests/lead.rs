@@ -6,11 +6,13 @@ use yogan_swarm::lead::{self, Phase, Request};
 use yogan_swarm::task::{self, Status};
 
 /// Stand-in for Claude: records its args, then files one task through `yogan` on its PATH, a
-/// revised one when resumed. A request of `fail` exits 1.
+/// revised one when resumed. A request of `fail` exits 1, and `die` exits 1 after starting its
+/// session.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$YOGAN_DIR/claude.args"
 [ "$2" = fail ] && exit 1
 echo '{"type":"system","subtype":"init","session_id":"s-lead","model":"m","tools":[],"mcp_servers":[]}'
+[ "$2" = die ] && exit 1
 title="Reject negative max_delay"
 case "$*" in *--resume*) title="Reject negative max_delay and min_delay" ;; esac
 id=$(yogan task propose --title "$title" --crates ledger \
@@ -111,6 +113,34 @@ fn lead_files_proposals() {
     assert!(!ok);
     assert_eq!(r2.status, Phase::Failed);
     assert!(r2.summary.unwrap().contains("claude exited"));
+
+    // t: a lead that never got a session plans afresh
+    assert_eq!(lead::retry(&state, "r2").unwrap(), None);
+    assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Planning);
+    let again = lead::retry(&state, "r2").unwrap_err();
+    assert_eq!(again.to_string(), "only a failed request can be retried");
+
+    // one that died mid-session resumes it, told why it stopped, and files its proposals
+    let (ok, r3) = lead("r3", "die");
+    assert!(!ok);
+    assert_eq!(
+        (r3.status, r3.session.as_deref()),
+        (Phase::Failed, Some("s-lead"))
+    );
+    let prompt = lead::retry(&state, "r3").unwrap().unwrap();
+    assert!(
+        prompt.contains("stopped before finishing: claude exited"),
+        "{prompt}"
+    );
+    let (ok, r3) = yogan(&["r3", "--reply", &prompt]);
+    assert!(ok);
+    assert_eq!(r3.status, Phase::Done);
+    let filed = task::load_all(&state).unwrap();
+    assert!(
+        filed
+            .iter()
+            .any(|t| t.plan == "r3" && t.status == Status::Proposed)
+    );
 
     fs::remove_dir_all(&root).unwrap();
 }

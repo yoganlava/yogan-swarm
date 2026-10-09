@@ -39,7 +39,7 @@ const GROUPS: [(Status, &str); 7] = [
 
 const TABS: [&str; 4] = ["Summary", "Activity", "Gate", "Diff"];
 
-const KEYS: [(&str, &str); 13] = [
+const KEYS: [(&str, &str); 14] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -50,6 +50,7 @@ const KEYS: [(&str, &str); 13] = [
     ("A", "approve all"),
     ("e", "edit"),
     ("r", "reply"),
+    ("t", "retry"),
     ("x", "discard"),
     ("?", "help"),
     ("q", "quit"),
@@ -409,7 +410,7 @@ impl App {
             None => self.task().map(|(t, _)| t.id.clone()),
         };
         let mut requests = lead::load_all(state)?;
-        requests.retain(|r| r.status != Phase::Done);
+        requests.retain(|r| matches!(r.status, Phase::Planning | Phase::Failed));
         requests.sort_by(|a, b| a.id.cmp(&b.id));
         self.requests = requests;
         let rank = |s: Status| GROUPS.iter().position(|(g, _)| *g == s);
@@ -539,6 +540,7 @@ impl App {
         let proposed = self
             .task()
             .is_some_and(|(t, _)| t.status == Status::Proposed);
+        let failed = self.request().is_some_and(|r| r.status == Phase::Failed);
         match key.code {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('n') => self.compose = Some(Compose::new()),
@@ -547,7 +549,12 @@ impl App {
                 Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default())),
                 None => self.notice = Some("this task has no worktree".into()),
             },
-            KeyCode::Char('x') => self.confirm = !self.tasks.is_empty(),
+            KeyCode::Char('x') => self.confirm = self.task().is_some() || failed,
+            KeyCode::Char('t') if failed => {
+                if let Err(e) = self.retry() {
+                    self.notice = Some(format!("{e:#}"));
+                }
+            }
             KeyCode::Char('m') => {
                 if let Err(e) = self.draft(None) {
                     self.notice = Some(format!("{e:#}"));
@@ -605,6 +612,11 @@ impl App {
 
     /// Stops the task's worker, runs `[scripts] teardown` in its slot and frees the slot.
     fn discard(&mut self) -> Result<()> {
+        if let Some(r) = self.request() {
+            let mut r = r.clone();
+            r.status = Phase::Dismissed;
+            return r.save(&self.state);
+        }
         let Some((t, _)) = self.task() else {
             return Ok(());
         };
@@ -616,6 +628,15 @@ impl App {
         }
         t.status = Status::Discarded;
         self.free_slot(t, "discarded")
+    }
+
+    /// `t` on a failed request: reruns its lead, resuming the session when it has one.
+    fn retry(&mut self) -> Result<()> {
+        let id = self.request().context("no request selected")?.id.clone();
+        let prompt = lead::retry(&self.state, &id)?;
+        lead::spawn(&self.repo, &id, prompt.as_deref())?;
+        self.info = Some("the lead is planning again".into());
+        Ok(())
     }
 
     /// Runs `[scripts] teardown` in the task's slot, then saves it with the slot freed.
@@ -875,6 +896,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     .areas(f.area());
     f.render_widget(header_line(app, theme), header);
     let selected = app.task().map(|(t, _)| t);
+    let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
     let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
         compose(f, body, c, theme);
@@ -906,7 +928,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         KEYS.into_iter()
             .filter(|(k, _)| match *k {
                 "d" => selected.is_some_and(|t| t.slot.is_some()),
-                "x" | "1-4" => selected.is_some(),
+                "x" => selected.is_some() || failed,
+                "t" => failed,
+                "1-4" => selected.is_some(),
                 "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
                 "a" | "e" | "r" => selected.is_some_and(|t| t.status == Status::Proposed),
                 "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
@@ -929,25 +953,34 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     if app.help {
         help(f, theme);
     }
+    let confirm = match (app.request(), selected) {
+        (Some(r), _) => Some((
+            "Dismiss",
+            r.text.lines().next().unwrap_or_default(),
+            "dismiss it",
+        )),
+        (None, Some(t)) => Some(("Discard", t.title.as_str(), "discard and free its slot")),
+        _ => None,
+    };
     if app.confirm
-        && let Some(t) = selected
+        && let Some((verb, title, does)) = confirm
     {
         // a modal over the dimmed screen
         let all = f.area();
         f.buffer_mut().set_style(all, Style::new().dim());
         let area = centered(f.area(), 52, 5);
         let text = vec![
-            Line::raw(format!("Discard “{}”?", t.title)),
+            Line::raw(format!("{verb} “{title}”?")),
             Line::from(vec![
                 Span::styled("y ", theme.accent),
-                Span::raw("discard and free its slot   ").dim(),
+                Span::raw(format!("{does}   ")).dim(),
                 Span::styled("any key ", theme.accent),
                 Span::raw("cancel").dim(),
             ]),
         ];
         f.render_widget(Clear, area);
         let text = Paragraph::new(text).wrap(Wrap { trim: true });
-        f.render_widget(text.block(pane("Discard", true, theme)), area);
+        f.render_widget(text.block(pane(verb, true, theme)), area);
     }
     if let Some(input) = &app.reply {
         let all = f.area();
@@ -1812,12 +1845,35 @@ mod tests {
                 "│                                           ││ It panics in the retry loop.                        │",
                 "│ Failed                                    ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  ? help  q quit                                                     ",
+                " n new task  j/k move  tab pane  t retry  x discard  ? help  q quit                                 ",
             ]
         );
         assert!(app.task().is_none());
         app.selected = 2;
         assert_eq!(app.task().unwrap().0.id, "t1");
+    }
+
+    #[test]
+    fn dismissing_a_failed_request() {
+        let (mut app, _) = app();
+        let state = std::env::temp_dir().join(format!("yogan-dismiss-{}", std::process::id()));
+        let failed = Request {
+            id: "r2".into(),
+            text: "Reject a negative max_delay".into(),
+            status: Phase::Failed,
+            ..Default::default()
+        };
+        failed.save(&state).unwrap();
+        app.state = state.clone();
+        app.reload(&state).unwrap();
+        app.selected = 0;
+        let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert!(app.key(press('x')) && app.confirm);
+        assert!(app.key(press('y')) && app.notice.is_none());
+        assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Dismissed);
+        app.reload(&state).unwrap();
+        assert!(app.requests.is_empty());
+        fs::remove_dir_all(&state).unwrap();
     }
 
     #[test]

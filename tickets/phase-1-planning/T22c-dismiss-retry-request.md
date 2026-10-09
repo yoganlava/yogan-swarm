@@ -1,4 +1,4 @@
-- [ ] **T22c Dismiss or retry a failed request**
+- [x] **T22c Dismiss or retry a failed request**
 
 Plan: Lead agent; TUI › Keys (`x` discard after a confirm, Any).
 

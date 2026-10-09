@@ -20,6 +20,8 @@ pub enum Phase {
     Planning,
     Done,
     Failed,
+    /// A failed request the human set aside.
+    Dismissed,
 }
 
 /// One compose submission, saved as `requests/<id>.toml`.
@@ -129,6 +131,39 @@ pub fn reply(state: &Path, id: &str, feedback: &str) -> Result<String> {
         ));
     }
     Ok(prompt)
+}
+
+/// Readies failed request `id` for another run. Returns the prompt that resumes its session,
+/// or `None` to plan afresh when it never got one.
+pub fn retry(state: &Path, id: &str) -> Result<Option<String>> {
+    let mut req = load(state, id)?;
+    ensure!(
+        req.status == Phase::Failed,
+        "only a failed request can be retried"
+    );
+    let why = req.summary.take().unwrap_or_default();
+    req.status = Phase::Planning;
+    req.pid = None;
+    req.save(state)?;
+    if req.session.is_none() {
+        return Ok(None);
+    }
+    let filed: Vec<_> = task::load_all(state)?
+        .into_iter()
+        .filter(|t| t.plan == id && t.status != Status::Discarded)
+        .map(|t| format!("- {} “{}”", t.id, t.title))
+        .collect();
+    let mut prompt = format!(
+        "Your last run stopped before finishing: {why}\n\nCarry on with the plan, filing the \
+         tasks still missing with `yogan task propose`.\n"
+    );
+    if !filed.is_empty() {
+        prompt.push_str(&format!(
+            "\nAlready filed; don't refile these:\n{}\n",
+            filed.join("\n")
+        ));
+    }
+    Ok(Some(prompt))
 }
 
 /// The lead's main: plans the request, or resumes its session with a `reply`. Records the
