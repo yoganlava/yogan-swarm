@@ -90,9 +90,7 @@ pub fn setup(
         .filter(|name| repo.join(name).exists() && !slot.join(name).exists())
         .map(|name| repo.join(name))
         .collect();
-    if !missing.is_empty() {
-        clone_into(&missing, slot)?;
-    }
+    clone_into(&missing, slot)?;
     match script {
         Some(cmd) => run_script(cmd, slot, env, log),
         None => Ok(()),
@@ -127,29 +125,10 @@ fn seed(repo: &Path, slot: &Path) -> Result<()> {
     if !repo.join("Cargo.toml").exists() {
         return Ok(());
     }
-    let out = Command::new("cargo")
-        .current_dir(repo)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--offline",
-        ])
-        .output()?;
-    ensure!(
-        out.status.success(),
-        "cargo metadata: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let meta: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    let main_target = Path::new(
-        meta["target_directory"]
-            .as_str()
-            .context("no target_directory")?,
-    );
+    // ponytail: assumes the default `<repo>/target`; ask `cargo metadata` if a repo sets target-dir
+    let main_target = repo.join("target");
     if main_target.is_dir() {
-        clone_tree(main_target, &slot.join("target"), 0)?;
+        clone_tree(&main_target, &slot.join("target"), 0)?;
     }
     copy_mtimes(repo, slot)
 }
@@ -174,14 +153,14 @@ fn clone_tree(src: &Path, dst: &Path, depth: u8) -> Result<()> {
             whole.push(path);
         }
     }
-    if whole.is_empty() {
-        return Ok(());
-    }
     clone_into(&whole, dst)
 }
 
 /// `cp -a`, copy-on-write where the filesystem supports it.
 fn clone_into(srcs: &[PathBuf], dst: &Path) -> Result<()> {
+    if srcs.is_empty() {
+        return Ok(());
+    }
     let clone = if cfg!(target_os = "macos") {
         "-c"
     } else {
