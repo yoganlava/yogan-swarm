@@ -1,4 +1,4 @@
-- [ ] **T13 Scheduler**
+- [x] **T13 Scheduler**
 
 Plan: Task lifecycle › Scheduling rules; Architecture ("The worker owns a task's whole lifecycle").
 

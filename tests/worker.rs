@@ -2,6 +2,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+use rustix::process::{Pid, test_kill_process};
 
 use yogan_swarm::task::{self, Status, Task};
 
@@ -82,7 +85,8 @@ fn worker_runs_setup_then_claude() {
 
     let worker = |id: &str, setup: &str, mcp: &str, denied: &str, effort: Option<&str>| {
         let worker_cfg = "[worker]\nmcp_config = \".mcp.json\"\nallowed_tools = [\"Read\"]\n\
-                          read_tools = [\"mcp__graft__find\"]\ndeny = [\"Bash(curl *)\"]\n";
+                          read_tools = [\"mcp__graft__find\"]\ndeny = [\"Bash(curl *)\"]\n\
+                          slots = 9\nconcurrency = 1\n";
         let scripts = format!("[scripts]\nsetup = \"{setup}\"\n[cargo]\nnofile = 777\n");
         fs::write(&project, format!("{worker_cfg}{scripts}")).unwrap();
         let task = Task {
@@ -186,6 +190,37 @@ fn worker_runs_setup_then_claude() {
     assert_eq!(t5.status, Status::Failed);
     assert!(t5.summary.unwrap().contains("\"bogus\""));
     assert!(!state.join("logs/t5.jsonl").exists());
+
+    // queued tasks drain one at a time (concurrency 1), each worker starting the next on exit
+    for id in ["t6", "t7"] {
+        let task = Task {
+            id: id.into(),
+            branch: format!("u/{id}"),
+            status: Status::Approved,
+            ..Default::default()
+        };
+        task.save(&state).unwrap();
+    }
+    let (ok, _) = worker("t8", "true", "graft", "", None);
+    assert!(ok);
+    let start = Instant::now();
+    loop {
+        let tasks = task::load_all(&state).unwrap();
+        // done once both reached Review and their workers have exited
+        let done = |id: &str| {
+            let t = tasks.iter().find(|t| t.id == id).unwrap();
+            let pid = Pid::from_raw(t.pid.unwrap() as i32).unwrap();
+            t.status == Status::Review && test_kill_process(pid).is_err()
+        };
+        if done("t6") && done("t7") {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "queue stuck: {tasks:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     fs::remove_dir_all(&root).unwrap();
 }

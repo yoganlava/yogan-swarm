@@ -51,6 +51,8 @@ pub struct Worker {
     pub model: String,
     pub effort: String,
     pub slots: u32,
+    /// Workers running at once.
+    pub concurrency: u32,
     /// Relative to the slot, e.g. `.mcp.json`.
     pub mcp_config: Option<String>,
     #[serde(default)]

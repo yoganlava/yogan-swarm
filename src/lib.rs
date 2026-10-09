@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 pub mod config;
 pub mod gate;
 pub mod redact;
+pub mod sched;
 pub mod shim;
 pub mod slot;
 pub mod stream;

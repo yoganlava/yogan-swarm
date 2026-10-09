@@ -75,7 +75,8 @@ pub fn stop(pid: u32) -> Result<()> {
     Ok(kill_process_group(pid, Signal::TERM)?)
 }
 
-/// The worker's main. Any error marks the task `Failed`, with the error as its summary.
+/// The worker's main. Any error marks the task `Failed`, with the error as its summary. On exit it
+/// starts whatever is ready next.
 pub fn run(repo: &Path, id: &str) -> Result<()> {
     let state = task::state_dir(repo)?;
     let mut task = task::load_all(&state)?
@@ -88,7 +89,10 @@ pub fn run(repo: &Path, id: &str) -> Result<()> {
         task.summary = Some(format!("{e:#}"));
         task.save(&state)?;
     }
-    res
+    // this worker's slot lock is released by now, so the next task can take it
+    let next = crate::sched::run(repo);
+    res?;
+    next
 }
 
 fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
