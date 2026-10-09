@@ -25,6 +25,20 @@ pub struct Config {
     pub gate: Gate,
     pub watch: Watch,
     pub disk: Disk,
+    pub tui: Tui,
+    pub notify: Notify,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Tui {
+    /// Capture the mouse: click selects, the wheel scrolls.
+    pub mouse: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Notify {
+    /// Run with `sh` when a task reaches Review; empty runs nothing.
+    pub on_review_ready: String,
 }
 
 /// Slot cleanup thresholds.

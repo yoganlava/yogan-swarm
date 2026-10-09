@@ -1,22 +1,26 @@
 //! The TUI: tasks grouped by status on the left, the selected task on the right. It only reads
 //! the state directory; workers run detached, so closing it changes nothing.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
-use ratatui::Frame;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
+use ratatui::{DefaultTerminal, Frame};
 use regex::Regex;
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -40,11 +44,12 @@ const GROUPS: [(Status, &str); 7] = [
 
 const TABS: [&str; 6] = ["Summary", "Activity", "Gate", "Findings", "Diff", "Run"];
 const FINDINGS: usize = 3;
+const DIFF: usize = 4;
 const RUN: usize = 5;
 /// Lines a scroll key moves the detail pane.
 const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 21] = [
+const KEYS: [(&str, &str); 22] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -64,6 +69,7 @@ const KEYS: [(&str, &str); 21] = [
     ("c", "continue"),
     ("w", "rewind"),
     ("R", "run"),
+    ("o", "open"),
     (",", "settings"),
     ("pgup/pgdn", "scroll"),
 ];
@@ -219,11 +225,12 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Truecolor when `COLORTERM` says so, ASCII glyphs under `YOGAN_ASCII=1`.
+    /// Truecolor when `COLORTERM` says so, except in VS Code, whose 16 ANSI colours follow its
+    /// theme; ASCII glyphs under `YOGAN_ASCII=1`.
     pub fn detect() -> Theme {
         let env = |k: &str, vals: &[&str]| std::env::var(k).is_ok_and(|v| vals.contains(&&*v));
         Theme::new(
-            env("COLORTERM", &["truecolor", "24bit"]),
+            env("COLORTERM", &["truecolor", "24bit"]) && !vscode(),
             env("YOGAN_ASCII", &["1"]),
         )
     }
@@ -266,6 +273,10 @@ impl Theme {
     }
 }
 
+fn vscode() -> bool {
+    std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "vscode")
+}
+
 struct App {
     repo: PathBuf,
     state: PathBuf,
@@ -296,8 +307,8 @@ struct App {
     loaded: Option<(String, Option<SystemTime>)>,
     /// Asking whether to discard the selected task.
     confirm: bool,
-    /// A slot and its base, whose full diff to page once the TUI is suspended.
-    pager: Option<(PathBuf, String)>,
+    /// A slot, its base and optionally one file, whose diff to page once the TUI is suspended.
+    pager: Option<(PathBuf, String, Option<String>)>,
     /// Showing the selected task's PR draft.
     preview: bool,
     /// A task being drafted, with the draft it had and the drafting worker's pid, to preview
@@ -334,6 +345,27 @@ struct App {
     /// Tasks whose run script is running.
     serving: Vec<String>,
     settings: Option<Settings>,
+    /// Running in VS Code's terminal.
+    vscode: bool,
+    /// A `code --wait` on a file from `edit_file`, applied once it exits.
+    editing: Option<(Child, Edit)>,
+    /// A file and line to open in `$EDITOR` once the TUI is suspended.
+    open_at: Option<(PathBuf, Option<u32>)>,
+    /// The cursor over the Diff tab's files.
+    diff_file: usize,
+    /// Where the last frame drew things, for the mouse.
+    hits: RefCell<Hits>,
+}
+
+/// A file `e` edits, as (task id, whether it's the PR draft, path).
+type Edit = (String, bool, PathBuf);
+
+/// The list and detail panes, and each list row's screen line and row index.
+#[derive(Default)]
+struct Hits {
+    list: Rect,
+    detail: Rect,
+    rows: Vec<(u16, usize)>,
 }
 
 /// The Run tab: the slot's ports and `[scripts]`, read when the task changes, and the run
@@ -355,7 +387,7 @@ struct Compose {
     request: TextArea<'static>,
     ticket: TextArea<'static>,
     mode: Mode,
-    /// The focused field: request, ticket, then mode.
+    /// The focused field: request, ticket, mode, then the Submit button.
     focus: usize,
 }
 
@@ -428,9 +460,16 @@ pub fn run(repo: &Path) -> Result<()> {
         run: RunTab::default(),
         serving: Vec::new(),
         settings: None,
+        vscode: vscode(),
+        editing: None,
+        open_at: None,
+        diff_file: 0,
+        hits: RefCell::default(),
     };
     let theme = Theme::detect();
-    let mut terminal = ratatui::init();
+    let mouse = config::load(repo).is_ok_and(|c| c.tui.mouse);
+    let mut terminal = init(mouse);
+    let mut in_review: Option<Vec<String>> = None;
     let start = Instant::now();
     let res = (|| -> Result<()> {
         loop {
@@ -439,6 +478,14 @@ pub fn run(repo: &Path) -> Result<()> {
             app.reload(&state)?;
             app.load_tab();
             app.check_awaiting(exited);
+            let review = app.tasks.iter().filter(|(t, _)| t.status == Status::Review);
+            let review: Vec<_> = review.map(|(t, _)| t.id.clone()).collect();
+            // a bell when a task newly reaches Review; VS Code marks its terminal tab
+            if in_review.is_some_and(|was| review.iter().any(|id| !was.contains(id))) {
+                print!("\x07");
+                std::io::stdout().flush()?;
+            }
+            in_review = Some(review);
             let tick = (start.elapsed().as_millis() / 125) as usize; // spinner at 8 Hz
             // ratatui only writes cells that changed, so an idle screen draws nothing
             terminal.draw(|f| draw(f, &app, &theme, tick, SystemTime::now()))?;
@@ -452,50 +499,119 @@ pub fn run(repo: &Path) -> Result<()> {
             }
             let running = app.tasks.iter().any(|(t, _)| running(t));
             let wait = Duration::from_millis(if running { 125 } else { 250 });
-            if event::poll(wait)?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && !app.key(key)
-            {
-                return Ok(());
+            if event::poll(wait)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press && !app.key(key) => {
+                        return Ok(());
+                    }
+                    Event::Mouse(m) => app.mouse(m),
+                    _ => {}
+                }
             }
-            if let Some((dir, base)) = app.pager.take() {
-                ratatui::restore();
+            if let Some((dir, base, path)) = app.pager.take() {
+                restore(mouse);
                 let diff = format!("{base}...HEAD");
                 Command::new("git")
                     .arg("-C")
                     .arg(&dir)
-                    .args(["diff", &diff])
+                    .args(["diff", &diff, "--"])
+                    .args(path)
                     .status()?;
-                terminal = ratatui::init();
+                terminal = init(mouse);
             }
             if let Some((dir, session)) = app.interactive.take() {
-                ratatui::restore();
+                restore(mouse);
                 let ran = Command::new("claude")
                     .args(["--resume", &session])
                     .current_dir(&dir)
                     .status();
-                terminal = ratatui::init();
+                terminal = init(mouse);
                 if let Err(e) = ran {
                     app.notice = Some(format!("claude: {e}"));
                 }
             }
-            if std::mem::take(&mut app.edit) {
-                ratatui::restore();
-                let edited = if app.preview {
-                    app.edit_draft()
-                } else {
-                    app.edit_task()
-                };
-                terminal = ratatui::init();
-                if let Err(e) = edited {
+            if let Some((file, line)) = app.open_at.take() {
+                restore(mouse);
+                let opened = editor(&file, line);
+                terminal = init(mouse);
+                if let Err(e) = opened {
                     app.notice = Some(format!("{e:#}"));
                 }
             }
+            if std::mem::take(&mut app.edit) {
+                match app.edit_file() {
+                    Err(e) => app.notice = Some(format!("{e:#}")),
+                    // VS Code edits in a tab while the TUI stays up
+                    Ok(edit) if app.vscode => {
+                        let code = Command::new("code")
+                            .arg("--wait")
+                            .arg(&edit.2)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn();
+                        match code {
+                            Ok(child) => app.editing = Some((child, edit)),
+                            Err(e) => app.notice = Some(format!("code: {e}")),
+                        }
+                    }
+                    Ok(edit) => {
+                        restore(mouse);
+                        let edited = editor(&edit.2, None);
+                        terminal = init(mouse);
+                        if let Err(e) = edited.and_then(|()| app.apply_edit(edit)) {
+                            app.notice = Some(format!("{e:#}"));
+                        }
+                    }
+                }
+            }
+            let closed = app.editing.as_mut().map(|(c, _)| c.try_wait());
+            if closed.is_some_and(|w| !matches!(w, Ok(None)))
+                && let Some((_, edit)) = app.editing.take()
+                && let Err(e) = app.apply_edit(edit)
+            {
+                app.notice = Some(format!("{e:#}"));
+            }
         }
     })();
-    ratatui::restore();
+    restore(mouse);
     res
+}
+
+/// `ratatui::init`, capturing the mouse when `mouse`.
+fn init(mouse: bool) -> DefaultTerminal {
+    let terminal = ratatui::init();
+    if mouse {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    }
+    terminal
+}
+
+fn restore(mouse: bool) {
+    if mouse {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
+    ratatui::restore();
+}
+
+/// Runs VS Code's `code` CLI, which hands the file to the window and returns.
+fn code(args: &[&std::ffi::OsStr]) -> Result<()> {
+    let status = Command::new("code")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running code")?;
+    ensure!(status.success(), "code exited with {status}");
+    Ok(())
+}
+
+/// A finding's `path:line` (or `path:line-end`) as the path and line.
+fn path_line(location: &str) -> (String, Option<u32>) {
+    let (path, rest) = location.split_once(':').unwrap_or((location, ""));
+    let digits = rest.split(|c: char| !c.is_ascii_digit()).next();
+    (path.to_string(), digits.and_then(|d| d.parse().ok()))
 }
 
 /// Approves `ids` in `tasks`. Errs when one's parent would stay unapproved; returns a warning
@@ -559,11 +675,12 @@ fn edited(t: &Task, text: &str) -> Result<Task> {
     Ok(toml::Value::Table(table).try_into()?)
 }
 
-/// Opens `file` in `$EDITOR` (default `vi`) and waits for it to exit.
-fn editor(file: &Path) -> Result<()> {
+/// Opens `file`, at `line` if given, in `$EDITOR` (default `vi`) and waits for it to exit.
+fn editor(file: &Path, line: Option<u32>) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let at = line.map_or(String::new(), |l| format!(" +{l}"));
     let edited = Command::new("sh")
-        .args(["-c", &format!("{editor} \"$1\""), "sh"])
+        .args(["-c", &format!("{editor}{at} \"$1\""), "sh"])
         .arg(file)
         .status()?;
     ensure!(edited.success(), "{editor} exited with {edited}");
@@ -680,6 +797,11 @@ impl App {
         self.detail && self.tab == FINDINGS && self.task().is_some()
     }
 
+    /// Whether `j/k` and `enter` act on the Diff tab's files.
+    fn on_diff(&self) -> bool {
+        self.detail && self.tab == DIFF && self.task().is_some()
+    }
+
     /// The selected row's request, if it's one.
     fn request(&self) -> Option<&Request> {
         self.requests.get(self.selected)
@@ -708,9 +830,16 @@ impl App {
             return false;
         }
         if let Some(c) = &mut self.compose {
+            let ctrl_enter = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Esc => self.compose = None,
-                KeyCode::Tab => c.focus = (c.focus + 1) % 3,
+                KeyCode::Tab => c.focus = (c.focus + 1) % 4,
+                // enter alone and alt+enter (VS Code's shift+enter) are newlines in the request
+                KeyCode::Enter if c.focus == 3 || ctrl_enter => {
+                    if let Err(e) = self.submit() {
+                        self.notice = Some(format!("{e:#}"));
+                    }
+                }
                 _ if ctrl('s') => {
                     if let Err(e) = self.submit() {
                         self.notice = Some(format!("{e:#}"));
@@ -721,7 +850,7 @@ impl App {
                     let step = if key.code == KeyCode::Right { 1 } else { 2 };
                     c.mode = MODES[(i + step) % 3].0;
                 }
-                _ if c.focus == 2 => {}
+                _ if c.focus >= 2 => {}
                 KeyCode::Enter if c.focus == 1 => {}
                 _ if c.focus == 1 => _ = c.ticket.input(key),
                 _ => _ = c.request.input(key),
@@ -844,6 +973,26 @@ impl App {
                 _ => {}
             }
         }
+        if self.on_diff() {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let n = self.diff.len();
+                    self.diff_file = (self.diff_file + 1).min(n.saturating_sub(1));
+                    return true;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.diff_file = self.diff_file.saturating_sub(1);
+                    return true;
+                }
+                KeyCode::Enter => {
+                    if let Err(e) = self.open_diff() {
+                        self.notice = Some(format!("{e:#}"));
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         let before = (self.selected, self.tab);
         match key.code {
             // before `d`, which would take ctrl-d too
@@ -870,8 +1019,13 @@ impl App {
                     self.notice = Some(format!("{e:#}"));
                 }
             }
+            KeyCode::Char('o') if self.task().is_some() => {
+                if let Err(e) = self.open() {
+                    self.notice = Some(format!("{e:#}"));
+                }
+            }
             KeyCode::Char('d') => match self.slot_dir() {
-                Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default())),
+                Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default(), None)),
                 None => self.notice = Some("this task has no worktree".into()),
             },
             KeyCode::Char('x') => self.confirm = self.task().is_some() || failed || answered,
@@ -931,6 +1085,7 @@ impl App {
         }
         if (self.selected, self.tab) != before {
             self.scroll.set(0);
+            self.diff_file = 0;
         }
         true
     }
@@ -1007,6 +1162,7 @@ impl App {
                 .slot_dir()
                 .map(|d| diffstat(&d, &base))
                 .unwrap_or_default();
+            self.diff_file = self.diff_file.min(self.diff.len().saturating_sub(1));
             self.findings = Findings::load(&self.state, &id).unwrap_or_default();
             let n = self.findings.actionable().count();
             self.finding = self.finding.min(n.saturating_sub(1));
@@ -1159,22 +1315,155 @@ impl App {
         }
     }
 
-    /// `e` in the preview: the draft as `title`, blank line, body in `$EDITOR`.
-    fn edit_draft(&mut self) -> Result<()> {
+    /// `e`: writes what it edits for the selected task to a file: in the preview, the PR draft
+    /// as `title`, blank line, body; else the proposal's editable fields as TOML.
+    fn edit_file(&self) -> Result<Edit> {
+        ensure!(self.editing.is_none(), "already editing in VS Code");
         let (t, _) = self.task().context("no task selected")?;
-        let mut t = t.clone();
-        let dir = self.slot_dir().context("this task has no worktree")?;
-        let draft = t.pr_draft.as_mut().context("no PR draft")?;
-        let file = self.state.join(format!("logs/{}.pr.md", t.id));
-        fs::write(&file, format!("{}\n\n{}\n", draft.title, draft.body))?;
-        editor(&file)?;
+        fs::create_dir_all(self.state.join("logs"))?;
+        if self.preview {
+            let draft = t.pr_draft.as_ref().context("no PR draft")?;
+            let file = self.state.join(format!("logs/{}.pr.md", t.id));
+            fs::write(&file, format!("{}\n\n{}\n", draft.title, draft.body))?;
+            return Ok((t.id.clone(), true, file));
+        }
+        ensure!(
+            t.status == Status::Proposed,
+            "only a proposal can be edited"
+        );
+        let table: toml::Table = toml::from_str(&toml::to_string(t)?)?;
+        let shown: toml::Table = table
+            .into_iter()
+            .filter(|(k, _)| EDITABLE.contains(&k.as_str()))
+            .collect();
+        let file = self.state.join(format!("logs/{}.task.toml", t.id));
+        let header = format!("# Editable: {}\n", EDITABLE.join(", "));
+        fs::write(&file, format!("{header}{}", toml::to_string(&shown)?))?;
+        Ok((t.id.clone(), false, file))
+    }
+
+    /// Applies a file from `edit_file`, once edited, to its task; a proposal is checked like a
+    /// new one.
+    fn apply_edit(&mut self, (id, draft, file): Edit) -> Result<()> {
+        let all = task::load_all(&self.state)?;
+        let t = all
+            .iter()
+            .find(|t| t.id == id)
+            .context("the task is gone")?;
         let text = fs::read_to_string(&file)?;
+        if !draft {
+            ensure!(t.status == Status::Proposed, "it's no longer a proposal");
+            let t = edited(t, &text)?;
+            task::check_proposal(&t, &all)?;
+            return t.save(&self.state);
+        }
+        let mut t = t.clone();
+        let n = t.slot.context("this task has no worktree")?;
+        let dir = self.state.join("slots").join(n.to_string());
+        let base = task::base(&t, all.iter());
+        let draft = t.pr_draft.as_mut().context("no PR draft")?;
         let (title, body) = text.trim().split_once('\n').unwrap_or((text.trim(), ""));
         (draft.title, draft.body) = (pr::clean(title.trim()), pr::clean(body.trim()));
         let cfg = config::load(&self.repo)?;
-        let migration = pr::migration(&dir, &self.base()?)?;
+        let migration = pr::migration(&dir, &base)?;
         draft.problem = pr::check_title(&draft.title, &cfg.pr.types, migration).err();
         t.save(&self.state)
+    }
+
+    /// `o`: opens the selected finding's `path:line` in the editor, or else the task's worktree.
+    fn open(&mut self) -> Result<()> {
+        let dir = self.slot_dir().context("this task has no worktree")?;
+        let finding = self
+            .on_findings()
+            .then(|| self.findings.actionable().nth(self.finding));
+        let at = finding.flatten().map(|f| path_line(&f.location));
+        match (at, self.vscode) {
+            (Some((path, line)), true) => {
+                let line = line.map_or(String::new(), |l| format!(":{l}"));
+                let at = format!("{}{line}", dir.join(path).display());
+                code(&["-g".as_ref(), at.as_ref()])?;
+            }
+            (Some((path, line)), false) => self.open_at = Some((dir.join(path), line)),
+            (None, true) => code(&["-n".as_ref(), dir.as_os_str()])?,
+            (None, false) => self.info = Some(dir.display().to_string()),
+        }
+        Ok(())
+    }
+
+    /// `enter` on the Diff tab: the selected file's diff in VS Code's diff editor against its
+    /// base version, else paged.
+    fn open_diff(&mut self) -> Result<()> {
+        let (t, _) = self.task().context("no task selected")?;
+        let id = t.id.clone();
+        let (path, ..) = self.diff.get(self.diff_file).context("no file selected")?;
+        let path = path.clone();
+        let dir = self.slot_dir().context("this task has no worktree")?;
+        let base = self.base()?;
+        if !self.vscode {
+            self.pager = Some((dir, base, Some(path)));
+            return Ok(());
+        }
+        let fork = git(&dir, &["merge-base", &base, "HEAD"])?;
+        // a file the change adds has no base version, so it diffs against an empty one
+        let old = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["show", &format!("{fork}:{path}")])
+            .output()?;
+        let name = Path::new(&path).file_name().unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!("yogan-{id}-base-{}", name.display()));
+        fs::write(
+            &tmp,
+            if old.status.success() {
+                old.stdout
+            } else {
+                Vec::new()
+            },
+        )?;
+        code(&[
+            "--diff".as_ref(),
+            tmp.as_os_str(),
+            dir.join(&path).as_os_str(),
+        ])
+    }
+
+    /// Click selects a row; the wheel scrolls the detail pane or moves through the list.
+    fn mouse(&mut self, m: MouseEvent) {
+        let modal = self.compose.is_some() || self.settings.is_some() || self.reply.is_some();
+        if modal || self.preview || self.confirm || self.help || self.instruction.is_some() {
+            return;
+        }
+        let at = Position::new(m.column, m.row);
+        let (in_list, in_detail, row) = {
+            let hits = self.hits.borrow();
+            let row = hits.rows.iter().find(|(y, _)| *y == m.row).map(|(_, i)| *i);
+            (hits.list.contains(at), hits.detail.contains(at), row)
+        };
+        let before = self.selected;
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if in_list => {
+                if let Some(i) = row {
+                    self.selected = i;
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = m.kind == MouseEventKind::ScrollDown;
+                if in_detail {
+                    self.scroll_by(down);
+                } else if in_list {
+                    let rows = self.requests.len() + self.tasks.len();
+                    self.selected = match down {
+                        true => (self.selected + 1).min(rows.saturating_sub(1)),
+                        false => self.selected.saturating_sub(1),
+                    };
+                }
+            }
+            _ => {}
+        }
+        if self.selected != before {
+            self.scroll.set(0);
+            self.diff_file = 0;
+        }
     }
 
     /// `enter` in the preview: pushes, opens the PR, then tears down and frees the slot.
@@ -1256,28 +1545,6 @@ impl App {
             None => format!("approved {} tasks", ids.len()),
         });
         Ok(())
-    }
-
-    /// `e` on a proposal: its editable fields as TOML in `$EDITOR`, checked like a new proposal.
-    fn edit_task(&mut self) -> Result<()> {
-        let (t, _) = self.task().context("no task selected")?;
-        ensure!(
-            t.status == Status::Proposed,
-            "only a proposal can be edited"
-        );
-        let table: toml::Table = toml::from_str(&toml::to_string(t)?)?;
-        let shown: toml::Table = table
-            .into_iter()
-            .filter(|(k, _)| EDITABLE.contains(&k.as_str()))
-            .collect();
-        let file = self.state.join(format!("logs/{}.task.toml", t.id));
-        fs::create_dir_all(self.state.join("logs"))?;
-        let header = format!("# Editable: {}\n", EDITABLE.join(", "));
-        fs::write(&file, format!("{header}{}", toml::to_string(&shown)?))?;
-        editor(&file)?;
-        let t = edited(t, &fs::read_to_string(&file)?)?;
-        task::check_proposal(&t, &task::load_all(&self.state)?)?;
-        t.save(&self.state)
     }
 
     /// Sends `text` to the selected proposal's lead, which refiles its revised plan.
@@ -1492,9 +1759,15 @@ fn diffstat(slot: &Path, base: &str) -> Vec<(String, u64, u64)> {
         .collect()
 }
 
+/// Below this many rows, the header and footer share one line, the list drops its group headings
+/// and the detail pane shows only the active tab's name.
+const COMPACT: u16 = 24;
+
 fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
+    *app.hits.borrow_mut() = Hits::default();
+    let compact = f.area().height < COMPACT;
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(if compact { 0 } else { 1 }),
         Constraint::Fill(1),
         Constraint::Length(1),
     ])
@@ -1538,8 +1811,20 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         let mut keys = vec![("j/k", "finding")];
         keys.extend((app.findings.is_disputed(app.finding)).then_some(("r", "uphold")));
         keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive")));
-        keys.extend([("tab", "pane"), ("1-6", "tabs"), ("?", "help")]);
+        keys.extend([
+            ("o", "open"),
+            ("tab", "pane"),
+            ("1-6", "tabs"),
+            ("?", "help"),
+        ]);
         keys
+    } else if app.on_diff() {
+        let keys = [("j/k", "file"), ("enter", "file diff"), ("d", "full diff")];
+        [
+            &keys[..],
+            &[("tab", "pane"), ("1-6", "tabs"), ("?", "help")],
+        ]
+        .concat()
     } else if app.instruction.is_some() {
         vec![("enter", "redraft"), ("esc", "cancel")]
     } else if app.preview {
@@ -1549,7 +1834,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         // only the keys that do something for the selected task
         KEYS.into_iter()
             .filter(|(k, _)| match *k {
-                "d" => selected.is_some_and(|t| t.slot.is_some()),
+                "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
                 "x" => selected.is_some() || failed || answered,
                 "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
                 "c" => {
@@ -1578,12 +1863,21 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             Span::raw(format!("{label} ")).dim(),
         ]
     });
-    let line = match (&app.notice, &app.info) {
-        (Some(notice), _) => Line::styled(format!(" {notice}"), theme.red),
-        (None, Some(info)) => Line::styled(format!(" {info}"), theme.accent),
-        (None, None) => Line::from(keys.collect::<Vec<_>>()),
+    let mut line = match (&app.notice, &app.info) {
+        (Some(notice), _) => vec![Span::styled(format!(" {notice}"), theme.red)],
+        (None, Some(info)) => vec![Span::styled(format!(" {info}"), theme.accent)],
+        (None, None) if app.editing.is_some() => {
+            vec![Span::styled(
+                " editing in VS Code; close its tab to apply",
+                theme.accent,
+            )]
+        }
+        (None, None) => keys.collect(),
     };
-    f.render_widget(line, footer);
+    if compact {
+        line.splice(0..0, header_line(app, theme).spans);
+    }
+    f.render_widget(Line::from(line), footer);
     if app.help {
         help(f, theme);
     }
@@ -1737,12 +2031,18 @@ fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
 }
 
 fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
-    let [mode, request, ticket] = Layout::vertical([
+    let [mode, request, ticket, submit] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Fill(1),
         Constraint::Length(3),
+        Constraint::Length(1),
     ])
     .areas(area);
+    let button = match c.focus == 3 {
+        true => Span::styled(" [ Submit ] ", theme.accent).bold(),
+        false => Span::raw(" [ Submit ] ").dim(),
+    };
+    f.render_widget(Line::from(button), submit);
     let modes = MODES.iter().flat_map(|(m, name)| {
         let name = match *m == c.mode {
             true => Span::styled(*name, theme.accent).bold().underlined(),
@@ -1800,23 +2100,37 @@ fn list(
     now: SystemTime,
 ) {
     let block = pane("Tasks", focused, theme);
-    let width = block.inner(area).width as usize;
+    let inner = block.inner(area);
+    let width = inner.width as usize;
+    // compact drops headings and the blank lines between groups; the glyphs carry the status
+    let compact = f.area().height < COMPACT;
     let (mut items, mut selected, mut i) = (Vec::new(), None, 0);
+    // the row index of each item, for the mouse; None for headings and blanks
+    let mut rows = Vec::new();
+    let heading = |items: &mut Vec<ListItem>, rows: &mut Vec<_>, label| {
+        if compact {
+            return;
+        }
+        if !items.is_empty() {
+            items.push(ListItem::new(""));
+            rows.push(None);
+        }
+        items.push(ListItem::new(Line::raw(label).dim()));
+        rows.push(None);
+    };
     let mut group = None;
     for r in &app.requests {
         let question = r.status == Phase::Done;
         if group != Some(question) {
-            if !items.is_empty() {
-                items.push(ListItem::new(""));
-            }
             let label = if question { "Questions" } else { "Planning" };
-            items.push(ListItem::new(Line::raw(label).dim()));
+            heading(&mut items, &mut rows, label);
             group = Some(question);
         }
         let sel = i == app.selected;
         if sel {
             selected = Some(items.len());
         }
+        rows.push(Some(i));
         let (glyph, right) = match r.status {
             Phase::Failed => (Span::styled(theme.fail, theme.red), "failed"),
             Phase::Done => (Span::styled(theme.pass, theme.green), "answered"),
@@ -1845,15 +2159,13 @@ fn list(
         if group.is_empty() {
             continue;
         }
-        if !items.is_empty() {
-            items.push(ListItem::new(""));
-        }
-        items.push(ListItem::new(Line::raw(label).dim()));
+        heading(&mut items, &mut rows, label);
         for (t, since) in group {
             let sel = i == app.selected;
             if sel {
                 selected = Some(items.len());
             }
+            rows.push(Some(i));
             let age = since.and_then(|s| now.duration_since(s).ok());
             let age = age.map(short).unwrap_or_default();
             // ponytail: the step is the status; T16's Activity knows the real one (testing, editing)
@@ -1875,6 +2187,13 @@ fn list(
     }
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(List::new(items).block(block), area, &mut state);
+    let mut hits = app.hits.borrow_mut();
+    hits.list = area;
+    let shown = rows
+        .into_iter()
+        .skip(state.offset())
+        .zip(inner.y..inner.bottom());
+    hits.rows = shown.filter_map(|(i, y)| Some((y, i?))).collect();
 }
 
 /// `▌ ⠋ title…          working · 4m`: never wraps, the title gives way.
@@ -1932,6 +2251,8 @@ fn row_line(
 }
 
 fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
+    app.hits.borrow_mut().detail = area;
+    let compact = f.area().height < COMPACT;
     let block = pane("Task", focused, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1944,7 +2265,7 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     };
     let [tabs, _, body] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(if compact { 0 } else { 1 }),
         Constraint::Fill(1),
     ])
     .areas(inner);
@@ -1956,7 +2277,11 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
         };
         [name, Span::raw("  ")]
     });
-    f.render_widget(Line::from(tabs_line.collect::<Vec<_>>()), tabs);
+    let tabs_line = match compact {
+        true => Line::from(vec![Span::raw(TABS[app.tab]).bold(), Span::raw(" ▾").dim()]),
+        false => Line::from(tabs_line.collect::<Vec<_>>()),
+    };
+    f.render_widget(tabs_line, tabs);
     match app.tab {
         0 => {
             let parent = t.parent.as_ref().map(|p| {
@@ -1972,7 +2297,10 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
             findings_tab(f, body, &app.findings, cursor, theme, &app.scroll)
         }
         RUN => run_tab(f, body, t, &app.run, theme, &app.scroll),
-        _ => diff_tab(f, body, &app.diff, theme, &app.scroll),
+        _ => {
+            let cursor = app.on_diff().then_some(app.diff_file);
+            diff_tab(f, body, &app.diff, cursor, theme, &app.scroll)
+        }
     }
 }
 
@@ -2343,11 +2671,13 @@ fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scrol
     f.render_widget(Paragraph::new(lines.split_off(skip)), output);
 }
 
-/// git-style `+`/`-` counts with bars scaled to the largest change.
+/// git-style `+`/`-` counts with bars scaled to the largest change; `cursor` marks the file
+/// `enter` opens, and stays in view.
 fn diff_tab(
     f: &mut Frame,
     area: Rect,
     files: &[(String, u64, u64)],
+    cursor: Option<usize>,
     theme: &Theme,
     scroll: &Cell<u16>,
 ) {
@@ -2358,14 +2688,27 @@ fn diff_tab(
     let (added, deleted) = files.iter().fold((0, 0), |(a, d), f| (a + f.1, d + f.2));
     let max = files.iter().map(|f| f.1 + f.2).max().unwrap_or(1).max(1);
     let bar_width = 20u64.min(max);
-    let path_width = (area.width as usize).saturating_sub(13 + bar_width as usize);
+    let bar = if cursor.is_some() { 2 } else { 0 };
+    let path_width = (area.width as usize).saturating_sub(13 + bar + bar_width as usize);
     let scale = |n: u64| ((n * bar_width).div_ceil(max)) as usize;
+    if let Some(c) = cursor.map(|c| c as u16) {
+        let top = scroll.get().max((c + 1).saturating_sub(area.height));
+        scroll.set(top.min(c));
+    }
     let mut lines: Vec<Line> = files
         .iter()
-        .map(|(path, a, d)| {
+        .enumerate()
+        .map(|(i, (path, a, d))| {
             let path = truncate(path, path_width, theme.ellipsis);
+            let sel = cursor == Some(i);
+            let mark = match cursor {
+                Some(_) => format!("{} ", if sel { theme.bar } else { " " }),
+                None => String::new(),
+            };
+            let path = Span::raw(format!("{path:<path_width$} "));
             Line::from(vec![
-                Span::raw(format!("{path:<path_width$} ")),
+                Span::styled(mark, theme.accent),
+                if sel { path.bold() } else { path },
                 Span::styled(format!("{:>5}", format!("+{a}")), theme.green),
                 Span::styled(format!("{:>6} ", format!("-{d}")), theme.red),
                 Span::styled("+".repeat(scale(*a)), theme.green),
@@ -2495,6 +2838,11 @@ mod tests {
             run: RunTab::default(),
             serving: Vec::new(),
             settings: None,
+            vscode: false,
+            editing: None,
+            open_at: None,
+            diff_file: 0,
+            hits: RefCell::default(),
         };
         (app, now)
     }
@@ -2527,10 +2875,8 @@ mod tests {
         assert_eq!(
             tab_screen(app, 0),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
-                "│                                                          │",
+                "│ Summary ▾                                                │",
                 "│ Reject negative max_delay                                │",
                 "│ Review · u/reject-negative · slot 1 · session 2/3 ·      │",
                 "│ opus/high · CC-687                                       │",
@@ -2539,8 +2885,10 @@ mod tests {
                 "│                                                          │",
                 "│ A negative value panics in the retry loop.               │",
                 "│                                                          │",
+                "│                                                          │",
+                "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
             ]
         );
     }
@@ -2614,10 +2962,8 @@ mod tests {
         assert_eq!(
             tab_screen(app, 1),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
-                "│                                                          │",
+                "│ Activity ▾                                               │",
                 "│ read    src/old.rs                                       │",
                 "│ read    src/config.rs                                    │",
                 "│ search  max_delay                                        │",
@@ -2626,8 +2972,10 @@ mod tests {
                 "│ write   crates/ledger/src/limits/negative_delay_regress… │",
                 "│ TodoWrite                                                │",
                 "│                                                          │",
+                "│                                                          │",
+                "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
             ]
         );
     }
@@ -2652,10 +3000,8 @@ mod tests {
         assert_eq!(
             tab_screen(app, 2),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
-                "│                                                          │",
+                "│ Gate ▾                                                   │",
                 "│ ✓  clean tree                                            │",
                 "│ ✓  fmt                                                   │",
                 "│ ✗  test                                                  │",
@@ -2664,8 +3010,10 @@ mod tests {
                 "│ $ cargo test -p ledger                                   │",
                 "│ thread 'parse' panicked at src/config.rs:40:9:           │",
                 "│ assertion failed: delay >= 0                             │",
+                "│                                                          │",
+                "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  d diff  r reply  ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
             ]
         );
     }
@@ -2684,10 +3032,8 @@ mod tests {
         assert_eq!(
             tab_screen(app, RUN),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
-                "│                                                          │",
+                "│ Run ▾                                                    │",
                 "│ slot 1 · ports 1160-1239                                 │",
                 "│ ✓ setup  ◆ run running  ○ teardown when freed            │",
                 "│                                                          │",
@@ -2696,8 +3042,10 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "│                                                          │",
+                "│                                                          │",
+                "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
             ]
         );
     }
@@ -2781,20 +3129,20 @@ mod tests {
         assert_eq!(
             tab_screen(app, 4),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
-                "│                                                          │",
-                "│ src/config.rs             +12    -3 ++++++--             │",
-                "│ crates/ledger/src/limi…   +40    -0 ++++++++++++++++++++ │",
-                "│ assets/logo.png            +0    -0                      │",
+                "│ Diff ▾                                                   │",
+                "│ ▌ src/config.rs           +12    -3 ++++++--             │",
+                "│   crates/ledger/src/li…   +40    -0 ++++++++++++++++++++ │",
+                "│   assets/logo.png          +0    -0                      │",
                 "│                                                          │",
                 "│ 3 files changed, +52 -3                                  │",
                 "│                                                          │",
                 "│                                                          │",
                 "│                                                          │",
+                "│                                                          │",
+                "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k file  enter file ",
             ]
         );
     }
@@ -2955,22 +3303,22 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ○ 3                                                                          ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff  Run        │",
-                "│   ✓ Reject negative max_delay             ││                                                     │",
-                "│                                           ││ Reject negative max_delay in the CLI                │",
-                "│ Proposed                                  ││ Proposed · CC-687 · cli, config · after “Validate   │",
-                "│   ○ Validate max_delay at parse time      ││ max_delay at parse time”                            │",
-                "│ ▌ ○ └ Reject negative max_delay in the …  ││                                                     │",
-                "│   ○ Bump sqlx to 0.9                      ││ Reuse the config check in the CLI.                  │",
+                "│   ✓ Reject negative max_delay             ││ Summary ▾                                           │",
+                "│   ○ Validate max_delay at parse time      ││ Reject negative max_delay in the CLI                │",
+                "│ ▌ ○ └ Reject negative max_delay in the …  ││ Proposed · CC-687 · cli, config · after “Validate   │",
+                "│   ○ Bump sqlx to 0.9                      ││ max_delay at parse time”                            │",
+                "│                                           ││                                                     │",
+                "│                                           ││ Reuse the config check in the CLI.                  │",
                 "│                                           ││                                                     │",
                 "│                                           ││ Done when                                           │",
                 "│                                           ││ - `yogan --max-delay -1` exits 2                    │",
                 "│                                           ││ - the error names the flag                          │",
                 "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  a approve  A approve all  e edit  r reply  x discard  ? h",
+                " yogan · fuse-os  ✓ 1  ○ 3   n new task  j/k move  tab pane  1-6 tabs  a approve  A approve all  e e",
             ]
         );
     }
@@ -3000,18 +3348,18 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ Planning                                  ││ Reject a negative max_delay                         │",
-                "│   ⠋ Split the ledger job into p… planning ││ Failed · CC-687                                     │",
-                "│ ▌ ✗ Reject a negative max_delay    failed ││                                                     │",
-                "│                                           ││ claude exited with exit status: 1                   │",
-                "│ Review                                    ││                                                     │",
-                "│   ✓ Reject negative max_delay          4m ││ Reject a negative max_delay                         │",
+                "│   ⠋ Split the ledger job into p… planning ││ Reject a negative max_delay                         │",
+                "│ ▌ ✗ Reject a negative max_delay    failed ││ Failed · CC-687                                     │",
+                "│   ✓ Reject negative max_delay          4m ││                                                     │",
+                "│   ✗ Bump sqlx to 0.9                   1h ││ claude exited with exit status: 1                   │",
+                "│   ⠋ Retry webhook sends     working · 12m ││                                                     │",
+                "│   ○ Split the ledger reconciliation j… 2m ││ Reject a negative max_delay                         │",
                 "│                                           ││ It panics in the retry loop.                        │",
-                "│ Failed                                    ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  t retry  x discard  ? help  q quit  , settings  pgup/pgdn scroll   ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  t retry  x discard  ? help  q",
             ]
         );
         assert!(app.task().is_none());
@@ -3061,20 +3409,20 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ Questions                                 ││ How are tasks saved?                                │",
-                "│ ▌ ✓ How are tasks saved?         answered ││ Question                                            │",
-                "│                                           ││                                                     │",
-                "│ Review                                    ││ Atomically                                          │",
-                "│   ✓ Reject negative max_delay          4m ││ A tmp file, then a rename:                          │",
+                "│ ▌ ✓ How are tasks saved?         answered ││ How are tasks saved?                                │",
+                "│   ✓ Reject negative max_delay          4m ││ Question                                            │",
+                "│   ✗ Bump sqlx to 0.9                   1h ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ Atomically                                          │",
+                "│   ○ Split the ledger reconciliation j… 2m ││ A tmp file, then a rename:                          │",
                 "│                                           ││   fs::rename(&tmp, &path)                           │",
-                "│ Failed                                    ││                                                     │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││ Cites                                               │",
+                "│                                           ││                                                     │",
+                "│                                           ││ Cites                                               │",
                 "│                                           ││ - src/task.rs:72                                    │",
-                "│ Running                                   ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  r reply  p plan it  y copy  x discard  ? help  q quit  , settings  ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  r reply  p plan it  y copy  x",
             ]
         );
 
@@ -3087,6 +3435,13 @@ mod tests {
         assert!(
             text.starts_with("How are tasks saved?\n\nThe answer to build on:\n\n## Atomically")
         );
+    }
+
+    #[test]
+    fn finding_locations() {
+        assert_eq!(path_line("src/a.rs:41"), ("src/a.rs".into(), Some(41)));
+        assert_eq!(path_line("src/a.rs:41-45"), ("src/a.rs".into(), Some(41)));
+        assert_eq!(path_line("src/a.rs"), ("src/a.rs".into(), None));
     }
 
     #[test]
@@ -3183,10 +3538,8 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
-                "│                                                          │",
+                "│ Findings ▾                                               │",
                 "│ Open                                                     │",
                 "│   ✗ src/config.rs:41 -1 still parses                     │",
                 "│     cargo test negative fails                            │",
@@ -3203,8 +3556,10 @@ mod tests {
                 "│   ○ src/config.rs:40 rename it                           │",
                 "│     reason: matches the API                              │",
                 "│                                                          │",
+                "│                                                          │",
+                "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " j/k finding  r uphold  x waive  tab pane  1-6 tabs  ? help ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k finding  r uphold",
             ]
         );
     }
@@ -3366,7 +3721,6 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ PR preview ──────────────────────────────────────────────╮",
                 "│ feat(config): reject negative max_delay                  │",
                 "│ ✗ expected `type(scope): description [TICKET-1]`         │",
@@ -3374,8 +3728,9 @@ mod tests {
                 "│ max_delay below zero now fails at parse time.            │",
                 "│                                                          │",
                 "│ - adds a check                                           │",
+                "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " enter push and open PR  g regenerate  e edit  esc back     ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   enter push and open P",
             ]
         );
     }
@@ -3412,7 +3767,7 @@ mod tests {
     #[test]
     fn main_screen() {
         let (app, now) = app();
-        let mut term = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
         assert_eq!(
@@ -3432,10 +3787,64 @@ mod tests {
                 "│ Queued                                    ││                                                     │",
                 "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
                 "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
                 " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR  r reply  x discard  ? help  q quit  c ",
             ]
         );
+    }
+
+    #[test]
+    fn compact_layout_below_24_rows() {
+        let (mut app, now) = app();
+        app.tab = 1;
+        app.activity = vec![
+            ("Read".into(), "src/config.rs".into()),
+            ("Bash".into(), "cargo test -p ledger".into()),
+        ];
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "│ ▌ ✓ Reject negative max_delay          4m ││ Activity ▾                                          │",
+                "│   ✗ Bump sqlx to 0.9                   1h ││ read    src/config.rs                               │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ run     cargo test -p ledger                        │",
+                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR  ",
+            ]
+        );
+
+        // a click selects the row it lands on; the wheel over the detail pane scrolls it
+        let at = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let failed = screen(&term)
+            .iter()
+            .position(|r| r.contains("Bump sqlx"))
+            .unwrap();
+        app.mouse(at(failed as u16));
+        assert_eq!(app.task().unwrap().0.id, "t2");
+        app.mouse(at(0)); // the border: nothing
+        assert_eq!(app.task().unwrap().0.id, "t2");
     }
 
     #[test]
@@ -3448,14 +3857,14 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  + 1  x 1  | 1  o 1                        ",
                 "╭ Tasks ───────────────────────────────────────────────────╮",
+                "│   + Reject negative max_delay                         4m │",
                 "│   x Bump sqlx to 0.9                                  1h │",
-                "│                                                          │",
-                "│ Running                                                  │",
                 "│ > / Retry webhook sends                    working · 12m │",
+                "│   o Split the ledger reconciliation job into per-acc~ 2m │",
+                "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  x discard  ? help",
+                " yogan · fuse-os  + 1  x 1  | 1  o 1   n new task  j/k move ",
             ]
         );
     }

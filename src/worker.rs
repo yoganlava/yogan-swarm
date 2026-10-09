@@ -777,7 +777,17 @@ fn lifecycle(
         }
     }
     task.status = Status::Review;
-    task.save(state)
+    task.save(state)?;
+    let notify = &cfg.notify.on_review_ready;
+    if pr.is_none() && !notify.is_empty() {
+        let mut sh = Command::new("sh");
+        sh.args(["-c", notify])
+            .current_dir(repo)
+            .env("YOGAN_TASK_ID", &task.id)
+            .env("YOGAN_TASK_TITLE", &task.title);
+        let _ = detach(sh); // a broken notifier never fails the task
+    }
+    Ok(())
 }
 
 fn conflict(base: &str) -> String {

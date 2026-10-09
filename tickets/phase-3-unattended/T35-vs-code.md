@@ -1,4 +1,4 @@
-- [ ] **T35 VS Code**
+- [x] **T35 VS Code**
 
 Plan: Running in VS Code; TUI › Screens › 11. Compact layout in VS Code.
 
