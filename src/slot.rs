@@ -10,6 +10,7 @@ use crate::config::Ports;
 use crate::git;
 use crate::redact::redact;
 use crate::task::Task;
+use crate::worker;
 
 /// Lowest slot in `1..=count` that no task holds and no process has locked.
 /// The slot stays locked until the returned file is dropped.
@@ -126,6 +127,48 @@ pub fn run_script(cmd: &str, slot: &Path, env: &[(&str, String)], log: &Path) ->
         log.display()
     );
     Ok(())
+}
+
+/// Starts `[scripts] run` for task `id` detached in the slot; output goes to `logs/<id>.run.log`.
+pub fn start_run(
+    state: &Path,
+    id: &str,
+    cmd: &str,
+    slot: &Path,
+    env: &[(&str, String)],
+) -> Result<u32> {
+    ensure!(
+        running(state, id).is_none(),
+        "the run script is already running"
+    );
+    let logs = state.join("logs");
+    fs::create_dir_all(&logs)?;
+    let mut sh = Command::new("sh");
+    sh.arg("-c")
+        .arg(format!("exec >\"$0\" 2>&1\n{cmd}"))
+        .arg(logs.join(format!("{id}.run.log")))
+        .current_dir(slot)
+        .envs(env.iter().cloned());
+    let pid = worker::detach(sh)?;
+    fs::write(logs.join(format!("{id}.run.pid")), pid.to_string())?;
+    Ok(pid)
+}
+
+/// SIGTERMs the run script's process group and removes its pid file; the log stays.
+pub fn stop_run(state: &Path, id: &str) -> Result<()> {
+    if let Some(pid) = running(state, id) {
+        worker::stop(pid)?;
+    }
+    match fs::remove_file(state.join(format!("logs/{id}.run.pid"))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// The run script's pid while it is alive.
+pub fn running(state: &Path, id: &str) -> Option<u32> {
+    let pid = fs::read_to_string(state.join(format!("logs/{id}.run.pid"))).ok()?;
+    pid.trim().parse().ok().filter(|p| worker::alive(*p))
 }
 
 /// Cargo repos only: clones the main checkout's target dir into `<slot>/target` without
@@ -361,6 +404,59 @@ mod tests {
         // no [scripts]: nothing runs, the last log stays as it was
         setup(&repo, &slot, &env, None, &log).unwrap();
         assert_eq!(fs::read_to_string(&log).unwrap(), "db down\n");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn run_script_starts_and_stops_as_a_group() {
+        use std::time::{Duration, Instant};
+        let root = std::env::temp_dir().join(format!("yogan-run-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (state, slot) = (root.join("state"), root.join("slot"));
+        fs::create_dir_all(&slot).unwrap();
+        let task = Task {
+            id: "t9".into(),
+            ..Default::default()
+        };
+        let env = env(&root, &slot, 3, &task, None);
+        let (log, pid_file) = (state.join("logs/t9.run.log"), state.join("logs/t9.run.pid"));
+        fs::create_dir_all(state.join("logs")).unwrap();
+        fs::write(&log, "previous run\n").unwrap();
+        let wait_for = |done: &dyn Fn() -> bool| {
+            let start = Instant::now();
+            while !done() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let script = "echo \"$YOGAN_TASK_ID $YOGAN_SLOT $(pwd -P)\"\necho oops >&2\n\
+                      sleep 30 & echo $! > child.pid\nwait";
+        let pid = start_run(&state, "t9", script, &slot, &env).unwrap();
+        assert_eq!(fs::read_to_string(&pid_file).unwrap(), pid.to_string());
+        assert_eq!(running(&state, "t9"), Some(pid));
+        let child = slot.join("child.pid");
+        wait_for(&|| fs::read_to_string(&child).is_ok_and(|s| s.ends_with('\n')));
+        let slot_dir = slot.canonicalize().unwrap();
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            format!("t9 3 {}\noops\n", slot_dir.display())
+        );
+        let child: u32 = fs::read_to_string(&child).unwrap().trim().parse().unwrap();
+
+        stop_run(&state, "t9").unwrap();
+        assert!(!pid_file.exists());
+        assert!(log.exists());
+        assert_eq!(running(&state, "t9"), None);
+        wait_for(&|| !worker::alive(child) && !worker::alive(pid));
+
+        // a script that exits on its own is no longer running though its pid file remains
+        let pid = start_run(&state, "t9", "true", &slot, &env).unwrap();
+        wait_for(&|| !worker::alive(pid));
+        assert!(pid_file.exists());
+        assert_eq!(running(&state, "t9"), None);
+        assert_eq!(fs::read_to_string(&log).unwrap(), "");
 
         fs::remove_dir_all(&root).unwrap();
     }

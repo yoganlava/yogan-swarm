@@ -158,6 +158,7 @@ pub struct Ports {
 pub struct Scripts {
     pub setup: Option<String>,
     pub teardown: Option<String>,
+    pub run: Option<String>,
 }
 
 /// Defaults, then `~/.config/yogan/config.toml`, then the project file for `checkout`.
@@ -265,6 +266,16 @@ mod tests {
         assert_eq!(cfg.watch.stall_after, Duration::from_secs(15 * 60));
         let bad = table("[watch]\nstall_after = \"15 min\"");
         assert!(layered(bad, None).is_err());
+    }
+
+    #[test]
+    fn run_script() {
+        let project = table("[scripts]\nrun = \"npm run dev\"");
+        let cfg = layered(Table::new(), Some(project)).unwrap();
+        assert_eq!(cfg.scripts.unwrap().run.as_deref(), Some("npm run dev"));
+        let project = table("[scripts]\nsetup = \"make db\"");
+        let cfg = layered(Table::new(), Some(project)).unwrap();
+        assert!(cfg.scripts.unwrap().run.is_none());
     }
 
     #[test]
