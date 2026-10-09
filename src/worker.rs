@@ -85,7 +85,14 @@ pub fn run(repo: &Path, id: &str, pr: Option<&str>) -> Result<()> {
         .find(|t| t.id == id)
         .with_context(|| format!("no task {id}"))?;
     let res = lifecycle(repo, &state, &mut task, pr);
-    if let Err(e) = &res {
+    if let Err(e) = &res
+        && pr.is_some()
+        && task.status == Status::Review
+    {
+        // the work is intact: only the draft failed, or another worker holds the slot
+        fs::create_dir_all(state.join("logs"))?;
+        fs::write(state.join(format!("logs/{id}.pr.log")), format!("{e:#}\n"))?;
+    } else if let Err(e) = &res {
         task.status = Status::Failed;
         task.summary = Some(format!("{e:#}"));
         task.save(&state)?;
@@ -314,6 +321,9 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
                 Some(false) => task.gate.iter().flatten().all(|c| c.passed),
             };
             if passed {
+                // saved first, so a failed draft leaves the task in Review (see `run`)
+                task.status = Status::Review;
+                task.save(state)?;
                 let instruction = Some(instruction).filter(|i| !i.is_empty());
                 task.pr_draft = Some(pr::draft(task, &dir, base, &cfg.pr, instruction)?);
             }

@@ -149,8 +149,9 @@ struct App {
     pager: Option<PathBuf>,
     /// Showing the selected task's PR draft.
     preview: bool,
-    /// A task being drafted, with the draft it had, to preview once a new one lands.
-    awaiting: Option<(String, Option<pr::Draft>)>,
+    /// A task being drafted, with the draft it had and the drafting worker's pid, to preview
+    /// once a new one lands.
+    awaiting: Option<(String, Option<pr::Draft>, u32)>,
     /// The instruction for `g` in the preview, while it's being typed.
     instruction: Option<TextArea<'static>>,
     /// Edit the PR draft in `$EDITOR` once the TUI is suspended.
@@ -215,9 +216,11 @@ pub fn run(repo: &Path) -> Result<()> {
     let start = Instant::now();
     let res = (|| -> Result<()> {
         loop {
+            // checked before the reload, so an exited worker's last save is already loaded
+            let exited = app.awaiting.as_ref().is_some_and(|a| !alive(a.2));
             app.reload(&state)?;
             app.load_tab();
-            app.check_awaiting();
+            app.check_awaiting(exited);
             let tick = (start.elapsed().as_millis() / 125) as usize; // spinner at 8 Hz
             // ratatui only writes cells that changed, so an idle screen draws nothing
             terminal.draw(|f| draw(f, &app, &theme, tick, SystemTime::now()))?;
@@ -262,15 +265,16 @@ pub fn run(repo: &Path) -> Result<()> {
     res
 }
 
+fn alive(pid: u32) -> bool {
+    Pid::from_raw(pid as i32).is_some_and(|p| test_kill_process(p) != Err(Errno::SRCH))
+}
+
 fn running(t: &Task) -> bool {
     matches!(t.status, Status::Running | Status::Checking)
 }
 
 /// A worker that died without recording an outcome (a crash, a reboot) fails its task.
 fn reap(state: &Path) -> Result<()> {
-    let alive = |pid: u32| {
-        Pid::from_raw(pid as i32).is_some_and(|p| test_kill_process(p) != Err(Errno::SRCH))
-    };
     for mut t in task::load_all(state)? {
         if running(&t) && !t.pid.is_some_and(alive) {
             t.status = Status::Failed;
@@ -460,6 +464,7 @@ impl App {
     /// `m`: previews the PR draft if it matches the branch, else has a worker rebase, re-gate
     /// and draft it (following `instruction` when regenerating); the preview opens when it lands.
     fn draft(&mut self, instruction: Option<&str>) -> Result<()> {
+        ensure!(self.awaiting.is_none(), "a PR draft is on its way");
         let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
         ensure!(
             t.status == Status::Review && gate_passed(t),
@@ -475,18 +480,21 @@ impl App {
         if let Some(text) = instruction {
             args.extend(["--instruction", text]);
         }
-        worker::spawn(&self.repo, &t.id, &args)?;
-        self.awaiting = Some((t.id.clone(), t.pr_draft.clone()));
+        let _ = fs::remove_file(self.state.join(format!("logs/{}.pr.log", t.id))); // may not exist
+        let pid = worker::spawn(&self.repo, &t.id, &args)?;
+        self.awaiting = Some((t.id.clone(), t.pr_draft.clone(), pid));
         self.preview = false;
         Ok(())
     }
 
-    /// Opens the preview once the awaited task has a new draft; gives up if it can't get one.
-    fn check_awaiting(&mut self) {
-        let Some((id, old)) = &self.awaiting else {
+    /// Opens the preview once the awaited task has a new draft; gives up if it can't get one
+    /// or its worker `exited` without one.
+    fn check_awaiting(&mut self, exited: bool) {
+        let Some((id, old, _)) = &self.awaiting else {
             return;
         };
         let Some(i) = self.tasks.iter().position(|(t, _)| &t.id == id) else {
+            self.awaiting = None; // discarded meanwhile
             return;
         };
         let t = &self.tasks[i].0;
@@ -494,6 +502,11 @@ impl App {
             (self.selected, self.preview, self.awaiting) = (i, true, None);
         } else if t.status == Status::Failed || (t.status == Status::Review && !gate_passed(t)) {
             self.notice = Some("no PR draft: see the task's Summary and Gate tabs".into());
+            self.awaiting = None;
+        } else if exited {
+            let log = self.state.join(format!("logs/{id}.pr.log"));
+            let why = fs::read_to_string(log).unwrap_or("the worker exited".into());
+            self.notice = Some(format!("no PR draft: {}", why.trim()));
             self.awaiting = None;
         }
     }
@@ -552,16 +565,10 @@ impl App {
         let (title, body) = request.split_once('\n').unwrap_or((request, ""));
         let ticket = c.ticket.lines().join("").trim().to_string();
         let cfg = config::load(&self.repo)?;
-        let tasks = task::load_all(&self.state)?;
-        let task = task::new_task(
-            title,
-            body,
-            &ticket,
-            &cfg.branch_prefix,
-            &tasks,
-            task::now_id(),
-        )?;
-        task.save(&self.state)?;
+        task::file_new(&self.state, |tasks| {
+            let prefix = &cfg.branch_prefix;
+            task::new_task(title, body, &ticket, prefix, tasks, task::now_id())
+        })?;
         self.compose = None;
         sched::run(&self.repo)
     }
@@ -1276,6 +1283,54 @@ mod tests {
                 " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR",
             ]
         );
+    }
+
+    #[test]
+    fn awaiting_a_pr_draft() {
+        let (mut app, _) = app();
+        let draft = pr::Draft {
+            title: "feat: x [CC-1]".into(),
+            body: String::new(),
+            head: "abc".into(),
+            problem: None,
+        };
+        app.awaiting = Some(("t1".into(), None, 1));
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_some() && !app.preview, "still drafting");
+        let err = app.draft(None).unwrap_err().to_string();
+        assert_eq!(err, "a PR draft is on its way");
+
+        // a new draft opens the preview on its task
+        app.selected = 2;
+        app.tasks[0].0.pr_draft = Some(draft.clone());
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_none() && app.preview && app.selected == 0);
+
+        // the worker exited without a new draft: its error is shown
+        let state = std::env::temp_dir().join(format!("yogan-awaiting-{}", std::process::id()));
+        fs::create_dir_all(state.join("logs")).unwrap();
+        fs::write(state.join("logs/t1.pr.log"), "claude exited with 1\n").unwrap();
+        app.state = state.clone();
+        app.awaiting = Some(("t1".into(), Some(draft.clone()), 1));
+        app.check_awaiting(true);
+        assert!(app.awaiting.is_none());
+        assert_eq!(
+            app.notice.take().as_deref(),
+            Some("no PR draft: claude exited with 1")
+        );
+        fs::remove_dir_all(&state).unwrap();
+
+        // a failed task or gate gives up; so does a task that's gone
+        app.awaiting = Some(("t2".into(), None, 1));
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_none() && app.notice.take().is_some());
+        app.tasks[0].0.gate.as_mut().unwrap()[0].passed = false;
+        app.awaiting = Some(("t1".into(), Some(draft), 1));
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_none() && app.notice.take().is_some());
+        app.awaiting = Some(("gone".into(), None, 1));
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_none() && app.notice.is_none());
     }
 
     #[test]

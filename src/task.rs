@@ -151,22 +151,33 @@ pub fn propose(
         accept.iter().all(|a| !a.trim().is_empty()),
         "an --accept criterion is empty"
     );
-    let tasks = load_all(dir)?;
-    if let Some(p) = &parent {
-        ensure!(
-            tasks.iter().any(|t| &t.id == p),
-            "no task {p} to use as --parent"
-        );
-    }
-    let task = Task {
-        status: Status::Proposed,
-        acceptance: accept.iter().map(|a| a.trim().into()).collect(),
-        parent,
-        crates,
-        ..new_task(title, body, "", prefix, &tasks, now_id())?
-    };
-    task.save(dir)?;
+    let task = file_new(dir, |tasks| {
+        if let Some(p) = &parent {
+            ensure!(
+                tasks.iter().any(|t| &t.id == p),
+                "no task {p} to use as --parent"
+            );
+        }
+        Ok(Task {
+            status: Status::Proposed,
+            acceptance: accept.iter().map(|a| a.trim().into()).collect(),
+            parent,
+            crates,
+            ..new_task(title, body, "", prefix, tasks, now_id())?
+        })
+    })?;
     Ok(task.id)
+}
+
+/// Builds a task from the current ones and saves it under `tasks.lock`, so concurrent
+/// filers can't pick the same id or branch.
+pub fn file_new(dir: &Path, build: impl FnOnce(&[Task]) -> Result<Task>) -> Result<Task> {
+    fs::create_dir_all(dir)?;
+    let lock = fs::File::create(dir.join("tasks.lock"))?;
+    lock.lock()?;
+    let task = build(&load_all(dir)?)?;
+    task.save(dir)?;
+    Ok(task)
 }
 
 /// `Reject negative max_delay!` → `reject-negative-max-delay`, at most 40 chars.

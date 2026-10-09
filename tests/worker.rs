@@ -10,9 +10,10 @@ use yogan_swarm::task::{self, Status, Task};
 
 /// Stand-in for Claude: records its args, cwd, effort env and the task's status, then emits an
 /// init with `$MCP` as its server, a leaked token, and a result denying `$DENIED`. Resumed, it
-/// commits. Asked for JSON, it's the PR drafter.
+/// commits. Asked for JSON, it's the PR drafter, which fails while `$HOME/draft.fail` exists.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 case "$*" in *"--output-format json"*)
+  [ -e "$HOME/draft.fail" ] && exit 1
   printf '%s\n' '{"result":"feat: do it [NO-TICKET]\n\nWhat and why \u2014 briefly."}'; exit 0 ;; esac
 out="$YOGAN_ROOT/.."
 grep '^status' "$YOGAN_DIR/tasks/$YOGAN_TASK_ID.toml" >> "$out/claude.status"
@@ -239,6 +240,35 @@ fn worker_runs_setup_then_claude() {
     assert_eq!(draft.title, "feat: do it [NO-TICKET]");
     assert_eq!(draft.body, "What and why, briefly."); // no em dash
     assert_eq!(draft.head.len(), 40);
+
+    // m with origin unchanged: no session and no gate; a failed draft leaves the task in Review
+    // with its error for the TUI
+    git(&slot1, &["rebase", "-q", "-X", "theirs", "origin/main"]); // the fake didn't resolve it
+    fs::remove_file(root.join("claude.status")).unwrap();
+    fs::remove_file(state.join("logs/t1.gate.log")).unwrap();
+    fs::write(home.join("draft.fail"), "").unwrap();
+    let (ok, t1) = yogan(&["worker", "t1", "--pr"], "graft", "");
+    assert!(!ok);
+    assert_eq!(t1.status, Status::Review);
+    let err = fs::read_to_string(state.join("logs/t1.pr.log")).unwrap();
+    assert!(err.contains("claude exited"), "{err}");
+    assert!(!root.join("claude.status").exists(), "no session ran");
+    assert!(!state.join("logs/t1.gate.log").exists(), "no gate ran");
+
+    // m after a clean upstream change: rebased, re-gated and drafted for the new head
+    fs::remove_file(home.join("draft.fail")).unwrap();
+    fs::write(repo.join("b.txt"), "b").unwrap();
+    git(&repo, &["add", "b.txt"]);
+    git(&repo, &["commit", "-qm", "upstream adds b.txt"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let (ok, t1) = yogan(&["worker", "t1", "--pr"], "graft", "");
+    assert!(ok);
+    assert_eq!(t1.status, Status::Review);
+    assert!(
+        state.join("logs/t1.gate.log").exists(),
+        "the moved branch was re-gated"
+    );
+    assert_ne!(t1.pr_draft.unwrap().head, draft.head);
 
     // queued tasks drain one at a time (concurrency 1), each worker starting the next on exit
     for id in ["t6", "t7"] {
