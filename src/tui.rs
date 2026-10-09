@@ -252,6 +252,8 @@ pub struct Theme {
     queued: &'static str,
     bar: &'static str,
     ellipsis: &'static str,
+    /// Before the agent's text in Activity.
+    gutter: &'static str,
     /// Before a child task, under its parent.
     tree: &'static str,
     /// Pipeline links up to the current stage and after it, the current stage's mark, a passed
@@ -300,6 +302,7 @@ impl Theme {
             queued: glyphs("○", "o"),
             bar: glyphs("▌", ">"),
             ellipsis: glyphs("…", "~"),
+            gutter: glyphs("│", "|"),
             tree: glyphs("└ ", "- "),
             done: glyphs("━", "="),
             todo: glyphs("┄", "-"),
@@ -368,8 +371,8 @@ struct App {
     /// Push and open the previewed PR once the "pushing" toast has been drawn.
     opening: bool,
     tab: usize,
-    /// The selected task's tool calls as (tool, target), newest last.
-    activity: Vec<(String, String)>,
+    /// The selected task's Activity lines, newest last.
+    activity: Vec<Act>,
     gate_log: String,
     /// The selected task's changed files as (path, added, deleted).
     diff: Vec<(String, u64, u64)>,
@@ -973,8 +976,9 @@ impl App {
                 let log = state.join(format!("logs/{}.jsonl", t.id));
                 let quiet = fs::metadata(&log).and_then(|m| m.modified()).ok()?;
                 let slot = t.slot.map(|n| state.join("slots").join(n.to_string()));
-                let call = activity(&log, &slot.unwrap_or_default()).pop()?;
-                Some((t.id.clone(), call, quiet))
+                let acts = activity(&log, &slot.unwrap_or_default());
+                let call = acts.into_iter().rfind(|a| a.tool != TEXT)?;
+                Some((t.id.clone(), (call.tool, call.target), quiet))
             })
             .collect();
         Ok(())
@@ -1954,9 +1958,25 @@ const NUDGE: &str = "↻";
 /// The Activity tab's tool name for a worker's handoff to a fresh session.
 const HANDOFF: &str = "⇢";
 
-/// Tool calls, nudges and handoffs from the tail of a Claude stream log, as (tool, target), with `slot/`
-/// paths made relative.
-fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
+/// The Activity tab's tool name for the agent's text.
+const TEXT: &str = "│";
+
+/// An Activity line: a tool call, the agent's text, a nudge or a handoff.
+#[derive(Debug, Default, PartialEq)]
+struct Act {
+    tool: String,
+    target: String,
+    /// Lines added and removed, for an `Edit`.
+    edit: Option<(usize, usize)>,
+    /// Whether the call's result wasn't an error, once it has one.
+    ok: Option<bool>,
+    /// A failed shell call's exit code.
+    exit: Option<i64>,
+}
+
+/// Tool calls with their results, the agent's text, nudges and handoffs from the tail of a
+/// Claude stream log, with `slot/` paths made relative.
+fn activity(log: &Path, slot: &Path) -> Vec<Act> {
     // ponytail: only the last 256 KiB, so redrawing a long session stays cheap
     let bytes = tail(log, 256 << 10);
     let prefix = format!("{}/", slot.display());
@@ -1964,33 +1984,61 @@ fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
     let events = text
         .lines()
         .filter_map(|l| serde_json::from_str::<stream::Event>(l).ok());
-    let line = |c| match c {
-        Content::ToolUse { name, input, .. } => {
-            let key = match name.as_str() {
-                "Bash" => "command",
-                "Grep" | "Glob" => "pattern",
-                _ => "file_path",
-            };
-            let target = input[key]
-                .as_str()
-                .unwrap_or("")
-                .lines()
-                .next()
-                .unwrap_or("");
-            Some((name, target.replace(&prefix, "")))
-        }
-        _ => None,
+    let note = |tool: &str, target: String| Act {
+        tool: tool.into(),
+        target,
+        ..Default::default()
     };
-    events
-        .flat_map(|e| match e {
+    let (mut acts, mut calls) = (Vec::new(), std::collections::HashMap::new());
+    for e in events {
+        match e {
             stream::Event::Assistant { message } => {
-                message.content.into_iter().filter_map(line).collect()
+                for c in message.content {
+                    match c {
+                        Content::Text { text } => acts.push(note(TEXT, text)),
+                        Content::ToolUse { id, name, input } => {
+                            let key = match name.as_str() {
+                                "Bash" => "command",
+                                "Grep" | "Glob" => "pattern",
+                                _ => "file_path",
+                            };
+                            let target = input[key].as_str().unwrap_or("").lines().next();
+                            let target = target.unwrap_or("").replace(&prefix, "");
+                            let lines =
+                                |k: &str| input[k].as_str().map_or(0, |s| s.lines().count());
+                            let edit = (name == "Edit")
+                                .then(|| (lines("new_string"), lines("old_string")));
+                            calls.insert(id, acts.len());
+                            acts.push(Act {
+                                edit,
+                                ..note(&name, target)
+                            });
+                        }
+                        Content::Other => {}
+                    }
+                }
             }
-            stream::Event::Nudge { reason } => vec![(NUDGE.into(), reason)],
-            stream::Event::Handoff { reason } => vec![(HANDOFF.into(), reason)],
-            _ => Vec::new(),
-        })
-        .collect()
+            stream::Event::User { message } => {
+                for r in message["content"].as_array().into_iter().flatten() {
+                    let id = r["tool_use_id"].as_str();
+                    let Some(act) = id.and_then(|id| calls.get(id)).map(|&i| &mut acts[i]) else {
+                        continue;
+                    };
+                    let failed = r["is_error"].as_bool().unwrap_or(false);
+                    act.ok = Some(!failed);
+                    // Claude Code starts a failed Bash result with `Exit code N`
+                    act.exit = (r["content"].as_str())
+                        .and_then(|s| s.strip_prefix("Exit code "))
+                        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+                        .filter(|_| failed);
+                }
+            }
+            stream::Event::Nudge { reason } => acts.push(note(NUDGE, reason)),
+            stream::Event::Handoff { reason } => acts.push(note(HANDOFF, reason)),
+            _ => {}
+        }
+    }
+    acts
 }
 
 /// Tokens in context at the latest assistant message in the tail of a Claude stream log.
@@ -3507,35 +3555,74 @@ fn findings_tab(
 }
 
 /// One line per tool call, following the tail: edits in the accent, shell commands in a
-/// second hue, reads dim, nudges amber.
-fn activity_tab(
-    f: &mut Frame,
-    area: Rect,
-    calls: &[(String, String)],
-    theme: &Theme,
-    scroll: &Scroll,
-) {
-    if calls.is_empty() {
+/// second hue, reads dim, nudges amber; edit counts and the result on the right, and the
+/// agent's text wrapped under a dim gutter.
+fn activity_tab(f: &mut Frame, area: Rect, acts: &[Act], theme: &Theme, scroll: &Scroll) {
+    if acts.is_empty() {
         f.render_widget(Line::raw("No tool calls yet.").dim(), area);
         return;
     }
     let width = area.width as usize;
-    let end = calls.len() - from_tail(calls.len(), area, scroll);
-    let shown = &calls[end.saturating_sub(area.height as usize)..end];
-    let lines = shown.iter().map(|(tool, target)| {
-        let (verb, style) = verb(tool, theme);
-        let target = truncate(
-            target,
-            width.saturating_sub(verb.width().max(7) + 1),
-            theme.ellipsis,
-        );
-        let target = match tool.as_str() {
+    let mut lines = Vec::new();
+    for a in acts {
+        if a.tool == TEXT {
+            let gutter = format!("  {} ", theme.gutter);
+            for l in a
+                .target
+                .lines()
+                .flat_map(|l| wrap(l, width.saturating_sub(4)))
+            {
+                let l = truncate(&l, width.saturating_sub(4), theme.ellipsis);
+                lines.push(Line::from(vec![Span::raw(gutter.clone()), Span::raw(l)]).dim());
+            }
+            continue;
+        }
+        let mut right = Vec::new();
+        if let Some((add, del)) = a.edit {
+            right.push(Span::styled(format!(" +{add}"), theme.green));
+            right.push(Span::styled(format!(" -{del}"), theme.red));
+        }
+        match (a.ok, a.exit) {
+            (Some(true), _) => right.push(Span::styled(format!("  {}", theme.pass), theme.green)),
+            (Some(false), Some(n)) => right.push(Span::styled(
+                format!("  {} exit {n}", theme.fail),
+                theme.red,
+            )),
+            (Some(false), None) => right.push(Span::styled(format!("  {}", theme.fail), theme.red)),
+            (None, _) => {}
+        }
+        let right_w: usize = right.iter().map(|s| s.width()).sum();
+        let (verb, style) = verb(&a.tool, theme);
+        let room = width.saturating_sub(verb.width().max(7) + 1 + right_w);
+        let target = truncate(&a.target, room, theme.ellipsis);
+        let pad = " ".repeat(room.saturating_sub(target.width()));
+        let target = match a.tool.as_str() {
             NUDGE => Span::styled(target, style),
             _ => Span::raw(target).dim(),
         };
-        Line::from(vec![Span::styled(format!("{verb:<7} "), style), target])
-    });
-    f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
+        let left = [Span::styled(format!("{verb:<7} "), style), target];
+        lines.push(Line::from([&left[..], &[Span::raw(pad)], &right].concat()));
+    }
+    let end = lines.len() - from_tail(lines.len(), area, scroll);
+    let start = end.saturating_sub(area.height as usize);
+    f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
+}
+
+/// `s` split at spaces into lines of at most `width` columns, where its words fit.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for word in s.split_whitespace() {
+        let last = out.last_mut().expect("starts non-empty");
+        if last.is_empty() {
+            last.push_str(word);
+        } else if last.width() + 1 + word.width() > width {
+            out.push(word.into());
+        } else {
+            last.push(' ');
+            last.push_str(word);
+        }
+    }
+    out
 }
 
 /// The Activity verb and style for a tool call's tool.
@@ -3685,6 +3772,14 @@ mod tests {
     use crate::gate::Check;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn act(tool: &str, target: &str) -> Act {
+        Act {
+            tool: tool.into(),
+            target: target.into(),
+            ..Default::default()
+        }
+    }
 
     fn app() -> (App, SystemTime) {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -3864,9 +3959,7 @@ mod tests {
         // Activity counts from its tail: scrolling up shows older calls
         press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
         assert_eq!(app.scroll.get(), 0, "a new tab starts at the top");
-        app.activity = (1..=30)
-            .map(|i| ("Read".into(), format!("f{i}.rs")))
-            .collect();
+        app.activity = (1..=30).map(|i| act("Read", &format!("f{i}.rs"))).collect();
         let newest = |rows: &[String]| rows.iter().any(|r| r.contains("f30.rs"));
         assert!(newest(&draw_rows(&app)));
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
@@ -3880,7 +3973,7 @@ mod tests {
     #[test]
     fn activity_tab_follows_tail() {
         let (mut app, _) = app();
-        let call = |tool: &str, target: &str| (tool.to_string(), target.to_string());
+        let call = act;
         app.activity = vec![
             call("Read", "src/old.rs"),
             call("Read", "src/config.rs"),
@@ -4809,11 +4902,21 @@ mod tests {
     fn activity_from_stream() {
         let log = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stream.jsonl");
         let calls = activity(&log, Path::new("/tmp/fixture"));
+        let text = "I read `note.txt` (it says \"hello from the fixture\"), but I couldn't create \
+            `out.txt`: the Write tool was denied permission for that path, so you'll need to grant \
+            write access or create the file yourself.";
         assert_eq!(
             calls,
             [
-                ("Read".into(), "note.txt".into()),
-                ("Write".into(), "out.txt".into())
+                Act {
+                    ok: Some(true),
+                    ..act("Read", "note.txt")
+                },
+                Act {
+                    ok: Some(false),
+                    ..act("Write", "out.txt")
+                },
+                act(TEXT, text),
             ]
         );
         let log = std::env::temp_dir().join(format!("yogan-nudge-{}.jsonl", std::process::id()));
@@ -4827,11 +4930,77 @@ mod tests {
         assert_eq!(
             calls,
             [
-                (NUDGE.into(), "stalled for 15m".into()),
-                (HANDOFF.into(), "context at 160000 of 200000 tokens".into())
+                act(NUDGE, "stalled for 15m"),
+                act(HANDOFF, "context at 160000 of 200000 tokens")
             ]
         );
         fs::remove_file(&log).unwrap();
+    }
+
+    #[test]
+    fn activity_timeline() {
+        let (mut app, now) = verdict_app("running");
+        app.tab = 1;
+        let call = |id: &str, name: &str, input: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{id}","usage":{{}},"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+            )
+        };
+        let result = |id: &str, error: bool, content: &str| {
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":{error},"content":"{content}"}}]}}}}"#
+            )
+        };
+        let text = |t: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"t","usage":{{}},"content":[{{"type":"text","text":"{t}"}}]}}}}"#
+            )
+        };
+        let log = std::env::temp_dir().join(format!("yogan-timeline-{}.jsonl", std::process::id()));
+        let lines = [
+            call(
+                "a",
+                "Edit",
+                r#"{"file_path":"/s/src/retry.rs","old_string":"a\nb","new_string":"a\nb\nc"}"#,
+            ),
+            result("a", false, "ok"),
+            call("b", "Bash", r#"{"command":"cargo test -p webhook"}"#),
+            result("b", true, r"Exit code 101\npanicked"),
+            text(
+                "The backoff test expects 3 attempts and the new cap makes it 2. Updating the test.",
+            ),
+            call("c", "Bash", r#"{"command":"cargo test -p webhook"}"#),
+            result("c", false, "ok"),
+            call("d", "Read", r#"{"file_path":"/s/src/mod.rs"}"#),
+        ];
+        fs::write(&log, lines.join("\n")).unwrap();
+        app.activity = activity(&log, Path::new("/s"));
+        fs::remove_file(&log).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &Theme::new(false, false), 0, now))
+            .unwrap();
+        assert_eq!(
+            screen(&term)[1..18],
+            [
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ ⠋ run ┄ check ┄ review ┄ pr               │",
+                "│                                                          │",
+                "│ context ━━━━━━━─ 85%        quiet   8m                   │",
+                "│ slot 2 · opus                                            │",
+                "│ spend   ━━━───── $1.84/$5.00                             │",
+                "│                                                          │",
+                "│ NEXT  Nothing needed yet.                                │",
+                "│                                                          │",
+                "│  Summary  Activity ⠋  Gate  Findings  Diff  Run          │",
+                "│                                                          │",
+                "│ edit    src/retry.rs                            +3 -2  ✓ │",
+                "│ run     cargo test -p webhook                 ✗ exit 101 │",
+                "│   │ The backoff test expects 3 attempts and the new cap  │",
+                "│   │ makes it 2. Updating the test.                       │",
+                "│ run     cargo test -p webhook                          ✓ │",
+                "│ read    src/mod.rs                                       │",
+            ]
+        );
     }
 
     #[test]
@@ -4971,8 +5140,8 @@ mod tests {
         let (mut app, now) = app();
         app.tab = 1;
         app.activity = vec![
-            ("Read".into(), "src/config.rs".into()),
-            ("Bash".into(), "cargo test -p ledger".into()),
+            act("Read", "src/config.rs"),
+            act("Bash", "cargo test -p ledger"),
         ];
         let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
         let theme = Theme::new(false, false);
@@ -5516,9 +5685,7 @@ mod tests {
     #[test]
     fn activity_scrollbar() {
         let (mut app, _) = app();
-        app.activity = (1..=20)
-            .map(|i| ("Read".into(), format!("f{i}.rs")))
-            .collect();
+        app.activity = (1..=20).map(|i| act("Read", &format!("f{i}.rs"))).collect();
         app.detail = true;
         app.tab = 1;
         let theme = Theme::new(false, false);
