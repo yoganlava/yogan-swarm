@@ -1,4 +1,4 @@
-- [ ] **T31 Retry, continue, rewind**
+- [x] **T31 Retry, continue, rewind**
 
 Plan: Unattended safety (Failed task row); Gate, review and PRs (`w` paragraph); TUI › Keys (`c`, `w`).
 
