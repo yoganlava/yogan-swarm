@@ -6,12 +6,20 @@ use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, test_kill_process};
 
+use yogan_swarm::critic::{Finding, Findings, Severity};
 use yogan_swarm::task::{self, Status, Task};
 
 /// Stand-in for Claude: records its args, cwd, effort env and the task's status, then emits an
 /// init with `$MCP` as its server, a leaked token, and a result denying `$DENIED`. Resumed, it
-/// commits. Asked for JSON, it's the PR drafter, which fails while `$HOME/draft.fail` exists.
+/// commits. Asked for JSON, it's the PR drafter, which fails while `$HOME/draft.fail` exists;
+/// given `--json-schema`, the critic, which fails while `$HOME/critic.fail` exists.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
+case "$*" in *--json-schema*)
+  printf '%s\n' "$@" > "$YOGAN_ROOT/../critic.args"
+  [ -e "$HOME/critic.fail" ] && exit 1
+  echo '{"type":"system","subtype":"init","session_id":"s-critic","model":"m","tools":[],"mcp_servers":[]}'
+  echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1,"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1},"permission_denials":[],"structured_output":{"findings":[{"severity":"blocker","location":"a.txt:1","claim":"criterion unmet","evidence":"cargo test fails"},{"severity":"major","location":"b.rs:2","claim":"maybe a bug","evidence":""},{"severity":"minor","location":"c.rs:3","claim":"naming","evidence":""}]}}'
+  exit 0 ;; esac
 case "$*" in *"--output-format json"*)
   [ -e "$HOME/draft.fail" ] && exit 1
   printf '%s\n' '{"result":"feat: do it [NO-TICKET]\n\nWhat and why \u2014 briefly."}'; exit 0 ;; esac
@@ -170,6 +178,31 @@ fn worker_runs_setup_then_claude() {
     assert!(log.contains("\"session_id\":\"s-1\""), "{log}");
     assert!(log.contains("[REDACTED]") && !log.contains("ghp_"), "{log}");
 
+    // the critic reviewed the passing change; an unproven major is only optional
+    let findings = |id: &str| -> Findings {
+        let text = fs::read_to_string(state.join(format!("findings/{id}.toml"))).unwrap();
+        toml::from_str(&text).unwrap()
+    };
+    let review = findings("t1");
+    let severity = |f: &[Finding]| f.iter().map(|f| f.severity).collect::<Vec<_>>();
+    assert_eq!(
+        severity(&review.findings),
+        [Severity::Blocker, Severity::Minor]
+    );
+    assert_eq!(severity(&review.optional), [Severity::Major]);
+    let critic = fs::read_to_string(root.join("critic.args")).unwrap();
+    for want in [
+        "--model\nclaude-fable-5-1\n--effort\nmax\n",
+        "--allowedTools\nRead\nGrep\nGlob\nmcp__graft__find\nBash(cargo check:*)\n\
+         Bash(cargo test:*)\nBash(git diff:*)\nBash(git log:*)\n\
+         --disallowedTools\nEdit\nWrite\nNotebookEdit\n--json-schema\n",
+        "--\nReview this change.\n\nTask: Do it\n",
+        "`git diff origin/main...HEAD`",
+    ] {
+        assert!(critic.contains(want), "{want:?} not in {critic}");
+    }
+    assert!(!critic.contains("--resume"), "the critic starts fresh");
+
     // a failing setup fails the task with its log path, before Claude starts
     let (ok, t2) = worker("t2", "echo db down; exit 3", "graft", "", None);
     assert!(!ok);
@@ -294,9 +327,14 @@ fn worker_runs_setup_then_claude() {
         ..Default::default()
     };
     child.save(&state).unwrap();
+    // a critic that fails leaves a note and the task still reaches Review
+    fs::write(home.join("critic.fail"), "").unwrap();
     let (ok, t9) = yogan(&["worker", "t9"], "graft", "");
+    fs::remove_file(home.join("critic.fail")).unwrap();
     assert!(ok);
     assert_eq!(t9.status, Status::Review);
+    let error = findings("t9").error.unwrap();
+    assert!(error.contains("claude exited"), "{error}");
     let slot9 = state.join(format!("slots/{}", t9.slot.unwrap()));
     let ancestor = |dir: &Path, rev: &str| {
         Command::new("git")

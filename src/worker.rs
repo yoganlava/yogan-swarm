@@ -11,6 +11,7 @@ use rustix::process::{
     Pid, Resource, Rlimit, Signal, getrlimit, kill_process_group, setrlimit, setsid,
 };
 
+use crate::critic::{self, Findings};
 use crate::redact::redact;
 use crate::stream::{Event, System};
 use crate::task::{self, Status, Task};
@@ -332,7 +333,15 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
     match pr {
         None => {
             let prompt = prompt(task);
-            work(task, Some((&prompt, false)))?;
+            if work(task, Some((&prompt, false)))? {
+                // a critic that can't finish leaves a note, not a failed task
+                let review =
+                    critic::run(task, &dir, base, &cfg, &env, &logs).unwrap_or_else(|e| Findings {
+                        error: Some(format!("{e:#}")),
+                        ..Default::default()
+                    });
+                review.save(state, &task.id)?;
+            }
         }
         Some(instruction) => {
             let passed = match rebase(&dir, base)? {

@@ -4,6 +4,7 @@ use std::process::Command;
 use anyhow::{Result, bail};
 
 pub mod config;
+pub mod critic;
 pub mod gate;
 pub mod lead;
 pub mod pr;

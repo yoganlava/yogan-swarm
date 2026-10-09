@@ -78,6 +78,9 @@ pub struct RunResult {
     /// Claude's final message.
     #[serde(default)]
     pub result: String,
+    /// The `--json-schema` answer.
+    #[serde(default)]
+    pub structured_output: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]

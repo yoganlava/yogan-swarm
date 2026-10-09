@@ -1,4 +1,4 @@
-- [ ] **T25 Critic**
+- [x] **T25 Critic**
 
 Plan: Adversarial review › The critic, Findings.
 
