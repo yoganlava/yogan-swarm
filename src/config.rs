@@ -14,12 +14,27 @@ pub struct Config {
     pub pr: Role,
     pub critic: Role,
     pub worker: Role,
+    pub ports: Option<Ports>,
+    pub scripts: Option<Scripts>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Role {
     pub model: String,
     pub effort: String,
+}
+
+/// Slot `n` gets ports `base + n * per_slot` onwards.
+#[derive(Debug, Deserialize)]
+pub struct Ports {
+    pub base: u32,
+    pub per_slot: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Scripts {
+    pub setup: Option<String>,
+    pub teardown: Option<String>,
 }
 
 /// Defaults, then `~/.config/yogan/config.toml`, then the project file for `checkout`.
@@ -113,13 +128,15 @@ mod tests {
     #[test]
     fn precedence() {
         let global = table("[worker]\nmodel = \"global\"\neffort = \"low\"");
-        let project = table("[worker]\nmodel = \"project\"");
+        let project = table("[worker]\nmodel = \"project\"\n[ports]\nbase = 0\nper_slot = 80");
         let cfg = layered(global, Some(project)).unwrap();
         // project beats global key by key; untouched keys keep the global value
         assert_eq!(cfg.worker.model, "project");
         assert_eq!(cfg.worker.effort, "low");
         // other roles keep defaults
         assert_eq!(cfg.lead.model, "claude-opus-5-5");
+        assert_eq!(cfg.ports.map(|p| p.per_slot), Some(80));
+        assert!(cfg.scripts.is_none());
     }
 
     #[test]

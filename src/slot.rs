@@ -6,7 +6,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 
+use crate::config::Ports;
 use crate::git;
+use crate::redact::redact;
 use crate::task::Task;
 
 /// Lowest slot in `1..=count` that no task holds and no process has locked.
@@ -50,6 +52,72 @@ pub fn prepare(repo: &Path, state: &Path, n: u32, branch: &str, base: &str) -> R
         seed(repo, &dir)?;
     }
     Ok(dir)
+}
+
+/// Variables that slot scripts, Claude, the gate and the critic all run with.
+pub fn env(
+    repo: &Path,
+    slot: &Path,
+    n: u32,
+    task: &Task,
+    ports: Option<&Ports>,
+) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("YOGAN_ROOT", repo.display().to_string()),
+        ("YOGAN_SLOT", n.to_string()),
+        ("YOGAN_SLOT_DIR", slot.display().to_string()),
+        ("YOGAN_TASK_ID", task.id.clone()),
+        ("YOGAN_CRATES", task.crates.join(" ")),
+    ];
+    if let Some(p) = ports {
+        env.push(("YOGAN_PORT_BASE", (p.base + n * p.per_slot).to_string()));
+        env.push(("YOGAN_PORT_COUNT", p.per_slot.to_string()));
+    }
+    env
+}
+
+/// Per-task setup: copies `.mcp.json` and `graft/` (both untracked) from the main checkout
+/// when the slot lacks them, then runs `[scripts] setup` if there is one.
+pub fn setup(
+    repo: &Path,
+    slot: &Path,
+    env: &[(&str, String)],
+    script: Option<&str>,
+    log: &Path,
+) -> Result<()> {
+    let missing: Vec<PathBuf> = [".mcp.json", "graft"]
+        .into_iter()
+        .filter(|name| repo.join(name).exists() && !slot.join(name).exists())
+        .map(|name| repo.join(name))
+        .collect();
+    if !missing.is_empty() {
+        clone_into(&missing, slot)?;
+    }
+    match script {
+        Some(cmd) => run_script(cmd, slot, env, log),
+        None => Ok(()),
+    }
+}
+
+/// Runs a `[scripts]` command with `sh` in the slot; stdout and stderr, redacted, go to `log`.
+pub fn run_script(cmd: &str, slot: &Path, env: &[(&str, String)], log: &Path) -> Result<()> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("exec 2>&1\n{cmd}"))
+        .current_dir(slot)
+        .envs(env.iter().cloned())
+        .output()?;
+    if let Some(dir) = log.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(log, redact(&String::from_utf8_lossy(&out.stdout)))?;
+    ensure!(
+        out.status.success(),
+        "`{cmd}` failed ({}), log: {}",
+        out.status,
+        log.display()
+    );
+    Ok(())
 }
 
 /// Cargo repos only: clones the main checkout's target dir into `<slot>/target` without
@@ -109,6 +177,11 @@ fn clone_tree(src: &Path, dst: &Path, depth: u8) -> Result<()> {
     if whole.is_empty() {
         return Ok(());
     }
+    clone_into(&whole, dst)
+}
+
+/// `cp -a`, copy-on-write where the filesystem supports it.
+fn clone_into(srcs: &[PathBuf], dst: &Path) -> Result<()> {
     let clone = if cfg!(target_os = "macos") {
         "-c"
     } else {
@@ -116,7 +189,7 @@ fn clone_tree(src: &Path, dst: &Path, depth: u8) -> Result<()> {
     };
     let status = Command::new("cp")
         .args(["-a", clone])
-        .args(&whole)
+        .args(srcs)
         .arg(dst)
         .status()?;
     ensure!(status.success(), "cloning into {} failed", dst.display());
@@ -256,6 +329,49 @@ mod tests {
             "u/second"
         );
         assert!(!slot.join("junk.txt").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn setup_env_script_and_log() {
+        let root = std::env::temp_dir().join(format!("yogan-scripts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (repo, slot) = (root.join("repo"), root.join("slot"));
+        fs::create_dir_all(repo.join("graft")).unwrap();
+        fs::create_dir_all(&slot).unwrap();
+        fs::write(repo.join(".mcp.json"), "{}").unwrap();
+        fs::write(repo.join("graft/INDEX.md"), "index").unwrap();
+        let task = Task {
+            id: "t7".into(),
+            crates: vec!["ledger".into(), "api".into()],
+            ..Default::default()
+        };
+        let ports = Ports {
+            base: 1000,
+            per_slot: 80,
+        };
+        let env = env(&repo, &slot, 2, &task, Some(&ports));
+        let log = root.join("logs/t7.setup.log");
+
+        let secret = format!("ghp_{}", "aB3".repeat(8));
+        let script = format!(
+            "echo \"$YOGAN_TASK_ID $YOGAN_SLOT $YOGAN_PORT_BASE $YOGAN_PORT_COUNT $YOGAN_CRATES\"\n\
+             echo {secret} >&2"
+        );
+        setup(&repo, &slot, &env, Some(&script), &log).unwrap();
+        let logged = fs::read_to_string(&log).unwrap();
+        assert_eq!(logged, "t7 2 1160 80 ledger api\n[REDACTED]\n");
+        assert!(slot.join(".mcp.json").exists());
+        assert!(slot.join("graft/INDEX.md").exists());
+
+        let err = setup(&repo, &slot, &env, Some("echo db down; exit 3"), &log).unwrap_err();
+        assert!(err.to_string().contains("t7.setup.log"), "{err}");
+        assert_eq!(fs::read_to_string(&log).unwrap(), "db down\n");
+
+        // no [scripts]: nothing runs, the last log stays as it was
+        setup(&repo, &slot, &env, None, &log).unwrap();
+        assert_eq!(fs::read_to_string(&log).unwrap(), "db down\n");
 
         fs::remove_dir_all(&root).unwrap();
     }
