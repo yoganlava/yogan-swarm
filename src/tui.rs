@@ -4091,13 +4091,10 @@ fn activity_tab(f: &mut Frame, area: Rect, acts: &[Act], theme: &Theme, scroll: 
     for a in acts {
         if a.tool == TEXT {
             let gutter = format!("  {} ", theme.gutter);
-            for l in a
-                .target
-                .lines()
-                .flat_map(|l| wrap(l, width.saturating_sub(4)))
-            {
-                let l = truncate(&l, width.saturating_sub(4), theme.ellipsis);
-                lines.push(Line::from(vec![Span::raw(gutter.clone()), Span::raw(l)]).dim());
+            let md = markdown(&a.target, theme);
+            for row in md.iter().flat_map(|l| wrap(l, width.saturating_sub(4))) {
+                let spans = [vec![Span::raw(gutter.clone())], row.spans].concat();
+                lines.push(Line::from(spans).dim());
             }
             continue;
         }
@@ -4132,21 +4129,56 @@ fn activity_tab(f: &mut Frame, area: Rect, acts: &[Act], theme: &Theme, scroll: 
     f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
 }
 
-/// `s` split at spaces into lines of at most `width` columns, where its words fit.
-fn wrap(s: &str, width: usize) -> Vec<String> {
-    let mut out = vec![String::new()];
-    for word in s.split_whitespace() {
-        let last = out.last_mut().expect("starts non-empty");
-        if last.is_empty() {
-            last.push_str(word);
-        } else if last.width() + 1 + word.width() > width {
-            out.push(word.into());
-        } else {
-            last.push(' ');
-            last.push_str(word);
+/// `line` split at spaces into rows of at most `width` columns, each piece keeping its span's
+/// style; leading indentation and inner spacing stay, and a word wider than a row is broken.
+fn wrap(line: &Line, width: usize) -> Vec<Line<'static>> {
+    let cells: Vec<(char, Style)> = (line.spans.iter())
+        .flat_map(|s| {
+            s.content
+                .chars()
+                .map(move |c| (c, line.style.patch(s.style)))
+        })
+        .collect();
+    let cols = |c: char| c.width().unwrap_or(0);
+    let indent = cells.iter().take_while(|(c, _)| c.is_whitespace()).count();
+    let mut rows = vec![cells[..indent].to_vec()];
+    let mut used: usize = cells[..indent].iter().map(|&(c, _)| cols(c)).sum();
+    let (mut fresh, mut gap) = (true, &cells[..0]);
+    for run in cells[indent..].chunk_by(|a, b| a.0.is_whitespace() == b.0.is_whitespace()) {
+        if run[0].0.is_whitespace() {
+            gap = run;
+            continue;
         }
+        let w = |r: &[(char, Style)]| r.iter().map(|&(c, _)| cols(c)).sum::<usize>();
+        if !fresh && used + w(gap) + w(run) > width {
+            rows.push(Vec::new());
+            used = 0;
+        } else if !fresh {
+            rows.last_mut().expect("starts non-empty").extend(gap);
+            used += w(gap);
+        }
+        for &(c, style) in run {
+            if used > 0 && used + cols(c) > width {
+                rows.push(Vec::new());
+                used = 0;
+            }
+            rows.last_mut().expect("starts non-empty").push((c, style));
+            used += cols(c);
+        }
+        fresh = false;
     }
-    out
+    (rows.into_iter())
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (c, style) in row {
+                match spans.last_mut() {
+                    Some(s) if s.style == style => s.content.to_mut().push(c),
+                    _ => spans.push(Span::styled(c.to_string(), style)),
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// The Activity verb and style for a tool call's tool.
@@ -4345,6 +4377,7 @@ mod tests {
     use crate::gate::Check;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     fn act(tool: &str, target: &str) -> Act {
         Act {
@@ -4585,6 +4618,88 @@ mod tests {
                 " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
+    }
+
+    #[test]
+    fn activity_tab_renders_markdown() {
+        let (mut app, _) = app();
+        let long = "word ".repeat(10) + "**a bold phrase** ends it";
+        let fenced = "Fixed:\n```\nfn main() {\n    run();\n}\n```";
+        app.activity = vec![
+            act(TEXT, "Ran **all** tests"),
+            act(TEXT, fenced),
+            act(TEXT, &long),
+        ];
+        app.detail = true;
+        app.tab = 1;
+        let mut term = Terminal::new(TestBackend::new(60, 17)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            tab_screen(app, 1)[5..12],
+            [
+                "│   │ Ran all tests                                        │",
+                "│   │ Fixed:                                               │",
+                "│   │   fn main() {                                        │",
+                "│   │       run();                                         │",
+                "│   │   }                                                  │",
+                "│   │ word word word word word word word word word word a  │",
+                "│   │ bold phrase ends it                                  │",
+            ]
+        );
+        let buf = term.backend().buffer();
+        let cell = |x, y| &buf[(x, y)];
+        assert!(
+            cell(4, 5).modifier.contains(Modifier::DIM),
+            "the gutter is dim"
+        );
+        let ran = cell(10, 5).modifier;
+        assert!(ran.contains(Modifier::BOLD) && ran.contains(Modifier::DIM));
+        assert!(!cell(6, 5).modifier.contains(Modifier::BOLD));
+        assert_eq!(cell(10, 8).fg, theme.shell, "code keeps the shell hue");
+        assert!(
+            cell(56, 10).modifier.contains(Modifier::BOLD),
+            "\"a\" on the first row"
+        );
+        assert!(
+            cell(6, 11).modifier.contains(Modifier::BOLD),
+            "\"bold\" on the next"
+        );
+        assert!(!cell(23, 11).modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn wrap_keeps_styles_and_indentation() {
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let line = Line::from(vec![
+            Span::raw("    let x = "),
+            Span::styled("very_long_name", Style::new().bold()),
+            Span::raw(";  // a"),
+        ]);
+        let rows = wrap(&line, 20);
+        let shown: Vec<String> = rows.iter().map(text).collect();
+        assert_eq!(shown, ["    let x =", "very_long_name;  //", "a"]);
+        assert_eq!(rows[1].spans[0].style, Style::new().bold());
+        assert_eq!(rows[1].spans[1].content, ";  //");
+
+        // the line's own style reaches every piece, and an over-wide word breaks
+        let rows = wrap(&Line::styled("abcdefgh ij", Style::new().italic()), 3);
+        assert_eq!(
+            rows.iter().map(text).collect::<Vec<_>>(),
+            ["abc", "def", "gh", "ij"]
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.spans)
+                .all(|s| s.style == Style::new().italic())
+        );
+        assert_eq!(wrap(&Line::raw(""), 10).len(), 1);
     }
 
     #[test]
