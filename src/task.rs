@@ -39,6 +39,7 @@ pub struct Task {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub summary: Option<String>,
+    pub gate: Option<Vec<crate::gate::Check>>,
 }
 
 /// `$YOGAN_DIR`, else `~/.local/share/yogan/<repo>/`.
@@ -109,6 +110,7 @@ mod tests {
             model: None,
             effort: Some("high".into()),
             summary: None,
+            gate: None,
         };
         task.save(&dir).unwrap();
         task.status = Status::Review;

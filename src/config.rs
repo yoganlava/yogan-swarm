@@ -12,12 +12,35 @@ pub struct Config {
     pub lead: Role,
     pub ask: Role,
     pub pr: Role,
-    pub critic: Role,
+    pub critic: Critic,
     pub worker: Worker,
     pub ports: Option<Ports>,
     pub scripts: Option<Scripts>,
     pub build: Build,
     pub cargo: Option<Cargo>,
+    pub gate: Gate,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Critic {
+    pub model: String,
+    pub effort: String,
+    /// Fix rounds a task gets, shared by gate failures and blocking findings.
+    pub max_rounds: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Gate {
+    pub steps: Vec<Step>,
+}
+
+/// `run` may use `{crates}` (`-p` flags) or `{paths}` (changed top-level dirs).
+#[derive(Debug, Deserialize)]
+pub struct Step {
+    pub name: String,
+    pub run: String,
+    /// Regex; the step runs only when a changed file's path or content matches.
+    pub when_files_contain: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

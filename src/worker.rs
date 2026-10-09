@@ -14,7 +14,7 @@ use rustix::process::{
 use crate::redact::redact;
 use crate::stream::{Event, System};
 use crate::task::{self, Status, Task};
-use crate::{config, shim, slot};
+use crate::{config, gate, shim, slot};
 
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
@@ -119,7 +119,8 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
     task.save(state)?;
 
     // ponytail: always bases on origin/main; T23 bases on the parent's branch
-    let dir = slot::prepare(repo, state, n, &task.branch, "origin/main")?;
+    let base = "origin/main";
+    let dir = slot::prepare(repo, state, n, &task.branch, base)?;
     let mut env = slot::env(repo, &dir, n, task, cfg.ports.as_ref());
     if repo.join("Cargo.toml").exists() {
         let home = std::env::home_dir().context("no home directory")?;
@@ -142,101 +143,127 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
     let w = &cfg.worker;
     let allowed = [&w.allowed_tools[..], &w.read_tools[..]].concat();
     ensure!(!allowed.is_empty(), "[worker] allowed_tools is empty");
-    let mut cmd = Command::new("claude");
-    cmd.args([
-        "-p",
-        &prompt(task),
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ])
-    .args([
-        "--permission-mode",
-        "acceptEdits",
-        "--setting-sources",
-        "project",
-    ])
-    .args([
-        "--model",
-        &model,
-        "--effort",
-        &effort,
-        "--strict-mcp-config",
-    ]);
     let servers = match &w.mcp_config {
-        Some(file) => {
-            cmd.args(["--mcp-config", file]);
-            mcp_servers(&dir.join(file))?
-        }
+        Some(file) => mcp_servers(&dir.join(file))?,
         None => Vec::new(),
     };
-    let mut claude = cmd
-        .arg("--allowedTools")
-        .args(&allowed)
-        .arg("--disallowedTools")
-        .args(DENY)
-        .args(&w.deny)
-        .args(["--append-system-prompt", RULES])
-        .current_dir(&dir)
-        .env_remove("CLAUDE_CODE_EFFORT_LEVEL") // it would override --effort
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("starting claude")?;
     fs::create_dir_all(&logs)?;
-    let stderr = claude.stderr.take().context("claude stderr")?;
-    let mut err_log = File::create(logs.join(format!("{}.stderr.log", task.id)))?;
-    let stderr = std::thread::spawn(move || -> std::io::Result<()> {
-        for line in BufReader::new(stderr).lines() {
-            writeln!(err_log, "{}", redact(&line?))?;
+    let append = |name: &str| {
+        let path = logs.join(format!("{}.{name}", task.id));
+        File::options().create(true).append(true).open(path)
+    };
+    let (mut log, err_log) = (append("jsonl")?, append("stderr.log")?);
+
+    // one Claude run in the slot; `resume` continues the task's last session
+    let mut session = |task: &mut Task, prompt: &str, resume: bool| -> Result<()> {
+        let mut cmd = Command::new("claude");
+        cmd.args(["-p", prompt, "--output-format", "stream-json", "--verbose"])
+            .args([
+                "--permission-mode",
+                "acceptEdits",
+                "--setting-sources",
+                "project",
+            ])
+            .args([
+                "--model",
+                &model,
+                "--effort",
+                &effort,
+                "--strict-mcp-config",
+            ]);
+        if let Some(file) = &w.mcp_config {
+            cmd.args(["--mcp-config", file]);
         }
-        Ok(())
-    });
-    let mut log = File::create(logs.join(format!("{}.jsonl", task.id)))?;
-    let stdout = claude.stdout.take().context("claude stdout")?;
-    let mut denied = Vec::new();
-    for line in BufReader::new(stdout).lines() {
-        let line = line?;
-        writeln!(log, "{}", redact(&line))?;
-        match serde_json::from_str(&line) {
-            Ok(Event::System(System::Init {
-                session_id,
-                mcp_servers,
-                ..
-            })) => {
-                task.sessions.push(session_id);
-                task.save(state)?;
-                let extra: Vec<_> = mcp_servers
-                    .into_iter()
-                    .filter(|s| !servers.contains(&s.name))
-                    .map(|s| s.name)
-                    .collect();
-                if !extra.is_empty() {
-                    claude.kill()?;
-                    bail!("unexpected MCP servers: {}", extra.join(", "));
+        if resume {
+            cmd.args([
+                "--resume",
+                task.sessions.last().context("no session to resume")?,
+            ]);
+        }
+        let mut claude = cmd
+            .arg("--allowedTools")
+            .args(&allowed)
+            .arg("--disallowedTools")
+            .args(DENY)
+            .args(&w.deny)
+            .args(["--append-system-prompt", RULES])
+            .current_dir(&dir)
+            .env_remove("CLAUDE_CODE_EFFORT_LEVEL") // it would override --effort
+            .envs(env.iter().cloned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("starting claude")?;
+        let stderr = claude.stderr.take().context("claude stderr")?;
+        let mut err_log = err_log.try_clone()?;
+        let stderr = std::thread::spawn(move || -> std::io::Result<()> {
+            for line in BufReader::new(stderr).lines() {
+                writeln!(err_log, "{}", redact(&line?))?;
+            }
+            Ok(())
+        });
+        let stdout = claude.stdout.take().context("claude stdout")?;
+        let mut denied = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            let line = line?;
+            writeln!(log, "{}", redact(&line))?;
+            match serde_json::from_str(&line) {
+                Ok(Event::System(System::Init {
+                    session_id,
+                    mcp_servers,
+                    ..
+                })) => {
+                    if !task.sessions.contains(&session_id) {
+                        task.sessions.push(session_id);
+                        task.save(state)?;
+                    }
+                    let extra: Vec<_> = mcp_servers
+                        .into_iter()
+                        .filter(|s| !servers.contains(&s.name))
+                        .map(|s| s.name)
+                        .collect();
+                    if !extra.is_empty() {
+                        claude.kill()?;
+                        bail!("unexpected MCP servers: {}", extra.join(", "));
+                    }
                 }
+                Ok(Event::Result(r)) => {
+                    denied = r
+                        .permission_denials
+                        .into_iter()
+                        .map(|d| d.tool_name)
+                        .collect();
+                }
+                _ => {}
             }
-            Ok(Event::Result(r)) => {
-                denied = r
-                    .permission_denials
-                    .into_iter()
-                    .map(|d| d.tool_name)
-                    .collect();
-            }
-            _ => {}
         }
+        let status = claude.wait()?;
+        let _ = stderr.join();
+        ensure!(status.success(), "claude exited with {status}");
+        ensure!(
+            denied.is_empty(),
+            "incomplete: permission denied for {}",
+            denied.join(", ")
+        );
+        Ok(())
+    };
+
+    session(task, &prompt(task), false)?;
+    let gate_log = logs.join(format!("{}.gate.log", task.id));
+    for round in 0.. {
+        task.status = Status::Checking;
+        task.save(state)?;
+        let (checks, failures) = gate::run(&dir, base, &cfg.gate.steps, &env, &gate_log)?;
+        task.gate = Some(checks);
+        if failures.is_empty() || round == cfg.critic.max_rounds {
+            break;
+        }
+        task.status = Status::Running;
+        task.save(state)?;
+        let fix = format!("The gate failed. Fix the failures below, then commit.\n\n{failures}");
+        session(task, &fix, true)?;
     }
-    let status = claude.wait()?;
-    let _ = stderr.join();
-    ensure!(status.success(), "claude exited with {status}");
-    ensure!(
-        denied.is_empty(),
-        "incomplete: permission denied for {}",
-        denied.join(", ")
-    );
-    // ponytail: straight to Review until the gate (T12) adds Checking
     task.status = Status::Review;
     task.save(state)
 }

@@ -1,4 +1,4 @@
-- [ ] **T12 Gate**
+- [x] **T12 Gate**
 
 Plan: Gate, review and PRs (gate steps); Workers › Slot scripts and ports (`[gate] steps`, `when_files_contain`); Task lifecycle (`max_rounds`).
 

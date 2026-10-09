@@ -6,7 +6,7 @@ use std::process::Command;
 use yogan_swarm::task::{self, Status, Task};
 
 /// Stand-in for Claude: records its args, cwd and effort env, then emits an init with
-/// `$MCP` as its server, a leaked token, and a result denying `$DENIED`.
+/// `$MCP` as its server, a leaked token, and a result denying `$DENIED`. Resumed, it commits.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 out="$YOGAN_ROOT/.."
 printf '%s\n' "$@" > "$out/claude.args"
@@ -17,6 +17,9 @@ echo 'warning: token ghp_aB3aB3aB3aB3aB3aB3aB3aB3 expired' >&2
 echo '{"type":"system","subtype":"init","session_id":"s-1","model":"m","tools":[],"mcp_servers":[{"name":"'"$MCP"'"}]}'
 echo '{"type":"assistant","text":"ghp_aB3aB3aB3aB3aB3aB3aB3aB3"}'
 echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1,"usage":{},"permission_denials":['"$DENIED"']}'
+# only a gate fix round commits, so the first gate fails on "new commits"
+case "$*" in *--resume*) git -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+  commit -q --allow-empty -m fix ;; esac
 "#;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -111,6 +114,11 @@ fn worker_runs_setup_then_claude() {
     let (ok, t1) = worker("t1", "echo ready", "graft", "", None);
     assert!(ok);
     assert_eq!(t1.status, Status::Review);
+    // the first gate found no commits; the fix round resumed the same session and committed
+    let gate = t1.gate.as_ref().unwrap();
+    assert!(gate.iter().all(|c| c.passed), "{gate:?}");
+    let gate_log = fs::read_to_string(state.join("logs/t1.gate.log")).unwrap();
+    assert!(gate_log.contains("== new commits: ok"), "{gate_log}");
     // the task's model beats config; effort falls back to the [worker] default
     assert_eq!(t1.model.as_deref(), Some("opus-x"));
     assert_eq!(t1.effort.as_deref(), Some("high"));
@@ -119,7 +127,7 @@ fn worker_runs_setup_then_claude() {
         "--model\nopus-x\n--effort\nhigh\n",
         "--setting-sources\nproject\n",
         "--strict-mcp-config\n",
-        "--mcp-config\n.mcp.json\n",
+        "--mcp-config\n.mcp.json\n--resume\ns-1\n",
         "--allowedTools\nRead\nmcp__graft__find\n--disallowedTools\nBash(git push *)\n",
         "WebFetch\nBash(curl *)\n--append-system-prompt\n",
     ] {
@@ -131,7 +139,7 @@ fn worker_runs_setup_then_claude() {
     assert_eq!(nofile, "777\n");
     assert_eq!(
         fs::read_to_string(state.join("logs/t1.stderr.log")).unwrap(),
-        "warning: token [REDACTED] expired\n"
+        "warning: token [REDACTED] expired\n".repeat(2) // first run and the fix round
     );
     assert_eq!((t1.slot, t1.sessions), (Some(1), vec!["s-1".to_string()]));
     assert!(t1.pid.is_some());

@@ -39,6 +39,13 @@ max_handoffs = 2
 [build]
 max_cargo = 2
 
+[gate]  # a step whose {crates} or {paths} is empty is skipped, so these only run in cargo repos
+steps = [
+  { name = "fmt",    run = "cargo fmt {crates} -- --check" },
+  { name = "clippy", run = "cargo clippy {crates} --all-targets -- -D warnings" },
+  { name = "test",   run = "cargo test {crates}" },
+]
+
 [disk]
 max_target_gb = 60
 min_free_gb   = 100
