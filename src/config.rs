@@ -85,7 +85,7 @@ fn find_project<'a>(
     })
 }
 
-fn origin_name(checkout: &Path) -> Option<String> {
+pub(crate) fn origin_name(checkout: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(checkout)

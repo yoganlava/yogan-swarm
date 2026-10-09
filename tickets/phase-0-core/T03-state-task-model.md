@@ -1,4 +1,4 @@
-- [ ] **T03 State + task model**
+- [x] **T03 State + task model**
 
 Plan: Architecture (state directory layout); Task lifecycle (state diagram, `Task` struct, `Status` enum); Open questions and assumptions › Assumptions (state location).
 
