@@ -1,4 +1,4 @@
-- [ ] **T05 Stream parser**
+- [x] **T05 Stream parser**
 
 Plan: Workers ("The stream is parsed loosely with serde"); Unattended safety › Nudges and handoffs › Handoff (usage fields).
 
