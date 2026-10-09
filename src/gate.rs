@@ -30,9 +30,6 @@ pub fn run(
     env: &[(&str, String)],
     log: &Path,
 ) -> Result<(Vec<Check>, String)> {
-    if let Some(dir) = log.parent() {
-        fs::create_dir_all(dir)?;
-    }
     let mut log = File::create(log)?;
     let (mut checks, mut failures) = (Vec::new(), String::new());
     let mut record = |name: &str, passed: bool, output: &str| -> Result<()> {
@@ -72,8 +69,8 @@ pub fn run(
         Vec::new()
     };
     let crates: Vec<String> = crates.iter().map(|c| format!("-p {c}")).collect();
-    let paths: BTreeSet<&str> = files.iter().filter_map(|f| f.split('/').next()).collect();
-    let paths: Vec<&str> = paths.into_iter().collect();
+    let paths = files.iter().filter_map(|f| f.split('/').next());
+    let paths: Vec<&str> = paths.collect::<BTreeSet<_>>().into_iter().collect();
     let base_sha = git(slot, &["merge-base", base, "HEAD"])?;
     let head_sha = git(slot, &["rev-parse", "HEAD"])?;
 
@@ -255,13 +252,8 @@ mod tests {
 
         // nothing committed yet
         let (checks, failures) = run();
-        let names = |checks: &[Check]| -> Vec<(String, bool)> {
-            checks.iter().map(|c| (c.name.clone(), c.passed)).collect()
-        };
-        assert_eq!(
-            names(&checks),
-            [("clean tree".into(), true), ("new commits".into(), false)]
-        );
+        let passed: Vec<bool> = checks.iter().map(|c| c.passed).collect();
+        assert_eq!(passed, [true, false]); // clean tree, new commits
         assert!(failures.contains("## new commits"), "{failures}");
 
         // a change to crate b runs only on b; the sqlx step waits for a query
