@@ -12,6 +12,8 @@ out="$YOGAN_ROOT/.."
 printf '%s\n' "$@" > "$out/claude.args"
 pwd > "$out/claude.cwd"
 echo "${CLAUDE_CODE_EFFORT_LEVEL-unset}" > "$out/claude.effort"
+ulimit -n > "$out/claude.nofile"
+echo 'warning: token ghp_aB3aB3aB3aB3aB3aB3aB3aB3 expired' >&2
 echo '{"type":"system","subtype":"init","session_id":"s-1","model":"m","tools":[],"mcp_servers":[{"name":"'"$MCP"'"}]}'
 echo '{"type":"assistant","text":"ghp_aB3aB3aB3aB3aB3aB3aB3aB3"}'
 echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1,"usage":{},"permission_denials":['"$DENIED"']}'
@@ -78,7 +80,7 @@ fn worker_runs_setup_then_claude() {
     let worker = |id: &str, setup: &str, mcp: &str, denied: &str| {
         let worker_cfg = "[worker]\nmcp_config = \".mcp.json\"\nallowed_tools = [\"Read\"]\n\
                           read_tools = [\"mcp__graft__find\"]\ndeny = [\"Bash(curl *)\"]\n";
-        let scripts = format!("[scripts]\nsetup = \"{setup}\"\n");
+        let scripts = format!("[scripts]\nsetup = \"{setup}\"\n[cargo]\nnofile = 777\n");
         fs::write(&project, format!("{worker_cfg}{scripts}")).unwrap();
         let task = Task {
             id: id.into(),
@@ -124,6 +126,12 @@ fn worker_runs_setup_then_claude() {
     }
     let effort_env = fs::read_to_string(root.join("claude.effort")).unwrap();
     assert_eq!(effort_env, "unset\n");
+    let nofile = fs::read_to_string(root.join("claude.nofile")).unwrap();
+    assert_eq!(nofile, "777\n");
+    assert_eq!(
+        fs::read_to_string(state.join("logs/t1.stderr.log")).unwrap(),
+        "warning: token [REDACTED] expired\n"
+    );
     assert_eq!((t1.slot, t1.sessions), (Some(1), vec!["s-1".to_string()]));
     assert!(t1.pid.is_some());
     let slot = state.join("slots/1");

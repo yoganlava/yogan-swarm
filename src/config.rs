@@ -45,6 +45,8 @@ pub struct Build {
 pub struct Cargo {
     /// Runs in place of cargo for builds, e.g. `./scripts/cargo-worktree.sh`.
     pub wrapper: Option<String>,
+    /// Open-file limit for everything a worker runs; launchd's default is 256.
+    pub nofile: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

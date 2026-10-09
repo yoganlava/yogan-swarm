@@ -1,4 +1,4 @@
-- [ ] **T11b Worker launch limits and stderr**
+- [x] **T11b Worker launch limits and stderr**
 
 Plan: Workers (launch command: `pre_exec` setrlimit, `.stderr(err_file)`); Workers › Slot scripts and ports (`[cargo] nofile`).
 

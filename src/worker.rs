@@ -7,7 +7,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
-use rustix::process::{Pid, Signal, kill_process_group, setsid};
+use rustix::process::{
+    Pid, Resource, Rlimit, Signal, getrlimit, kill_process_group, setrlimit, setsid,
+};
 
 use crate::redact::redact;
 use crate::stream::{Event, System};
@@ -89,6 +91,14 @@ pub fn run(repo: &Path, id: &str) -> Result<()> {
 
 fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
     let cfg = config::load(repo)?;
+    if let Some(nofile) = cfg.cargo.as_ref().and_then(|c| c.nofile) {
+        let hard = getrlimit(Resource::Nofile).maximum;
+        let limit = Rlimit {
+            current: Some(nofile),
+            maximum: hard,
+        };
+        setrlimit(Resource::Nofile, limit).context("[cargo] nofile")?;
+    }
     let tasks = task::load_all(state)?;
     let (n, _lock) = slot::claim(state, &tasks, cfg.worker.slots)?.context("no free slot")?;
     let model = task.model.clone().unwrap_or(cfg.worker.model.clone());
@@ -164,9 +174,18 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
         .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("starting claude")?;
     fs::create_dir_all(&logs)?;
+    let stderr = claude.stderr.take().context("claude stderr")?;
+    let mut err_log = File::create(logs.join(format!("{}.stderr.log", task.id)))?;
+    let stderr = std::thread::spawn(move || -> std::io::Result<()> {
+        for line in BufReader::new(stderr).lines() {
+            writeln!(err_log, "{}", redact(&line?))?;
+        }
+        Ok(())
+    });
     let mut log = File::create(logs.join(format!("{}.jsonl", task.id)))?;
     let stdout = claude.stdout.take().context("claude stdout")?;
     let mut denied = Vec::new();
@@ -202,6 +221,7 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
         }
     }
     let status = claude.wait()?;
+    let _ = stderr.join();
     ensure!(status.success(), "claude exited with {status}");
     ensure!(
         denied.is_empty(),
