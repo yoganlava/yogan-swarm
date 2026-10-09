@@ -1,10 +1,10 @@
 //! The `cargo` first on every slot's PATH: a symlink to yogan, which acts as the shim when
 //! run as `cargo`. Builds hold one of `max_cargo` machine-wide permits while they compile.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, TryLockError};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
@@ -50,12 +50,14 @@ pub fn env(
     let cores = std::thread::available_parallelism().map_or(1, |c| c.get() as u32);
     let path = std::env::var("PATH").unwrap_or_default();
     let lock = state.join(format!("slots/{n}.build"));
+    let queue = queue(state, n);
     let mut env = vec![
         ("PATH", format!("{}:{path}", bin.display())),
         ("YOGAN_SHIM_DIR", bin.display().to_string()),
         ("YOGAN_PERMITS", permits.display().to_string()),
         ("YOGAN_MAX_CARGO", max_cargo.to_string()),
         ("YOGAN_BUILD_LOCK", lock.display().to_string()),
+        ("YOGAN_QUEUE", queue.display().to_string()),
         (
             "CARGO_BUILD_JOBS",
             (cores / max_cargo.max(1)).max(1).to_string(),
@@ -65,6 +67,11 @@ pub fn env(
         env.push(("YOGAN_CARGO_WRAPPER", w.display().to_string()));
     }
     Ok(env)
+}
+
+/// Held shared by slot `n`'s builds while they wait for a permit, so the wait isn't a stall.
+pub(crate) fn queue(state: &Path, n: u32) -> PathBuf {
+    state.join(format!("slots/{n}.queue"))
 }
 
 /// The shim's main: returns cargo's exit code, or execs into it.
@@ -107,7 +114,8 @@ pub fn run(args: Vec<OsString>) -> Result<i32> {
         None => None,
     };
     let max: u32 = var("YOGAN_MAX_CARGO")?.to_string_lossy().parse()?;
-    let permit = permit(Path::new(&var("YOGAN_PERMITS")?), max)?;
+    let queue = std::env::var_os("YOGAN_QUEUE");
+    let permit = permit(Path::new(&var("YOGAN_PERMITS")?), max, queue.as_deref())?;
 
     let i = sub.unwrap_or_default();
     if args[i] == "test" && !args.iter().any(|a| a == "--no-run") {
@@ -125,8 +133,9 @@ pub fn run(args: Vec<OsString>) -> Result<i32> {
 }
 
 // ponytail: polls every 200 ms, no FIFO order; add a queue file if builds starve
-fn permit(dir: &Path, max: u32) -> Result<File> {
+fn permit(dir: &Path, max: u32, queue: Option<&OsStr>) -> Result<File> {
     let mut told = false;
+    let mut _queued = None;
     loop {
         for k in 0..max {
             let f = File::create(dir.join(format!("{k}.lock")))?;
@@ -139,6 +148,11 @@ fn permit(dir: &Path, max: u32) -> Result<File> {
         if !told {
             eprintln!("⧗ waiting for build slot");
             told = true;
+            if let Some(q) = queue {
+                let f = File::create(q)?;
+                f.lock_shared()?;
+                _queued = Some(f);
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
     }

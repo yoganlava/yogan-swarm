@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -22,6 +23,7 @@ pub struct Config {
     pub build: Build,
     pub cargo: Option<Cargo>,
     pub gate: Gate,
+    pub watch: Watch,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +81,35 @@ pub struct Worker {
     /// Added to the built-in deny list.
     #[serde(default)]
     pub deny: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Watch {
+    /// How long a silent stream and an idle process tree last before a nudge, e.g. `15m`.
+    #[serde(deserialize_with = "duration")]
+    pub stall_after: Duration,
+    /// Nudges a task gets before a stall or loop fails it.
+    pub nudges: u8,
+    /// The same tool call this many times in a row is a loop.
+    pub loop_repeats: u32,
+}
+
+/// `90s`, `15m` or `1h`.
+fn duration<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+    let s = String::deserialize(d)?;
+    let (n, unit) = s.split_at(s.len().saturating_sub(1));
+    let secs = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => 0,
+    };
+    match n.parse::<u64>() {
+        Ok(n) if secs > 0 => Ok(Duration::from_secs(n * secs)),
+        _ => Err(serde::de::Error::custom(format!(
+            "bad duration {s:?}, expected e.g. 90s, 15m or 1h"
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +253,9 @@ mod tests {
         assert_eq!(cfg.ports.map(|p| p.per_slot), Some(80));
         assert!(cfg.scripts.is_none());
         assert_eq!(cfg.build.max_cargo, 2);
+        assert_eq!(cfg.watch.stall_after, Duration::from_secs(15 * 60));
+        let bad = table("[watch]\nstall_after = \"15 min\"");
+        assert!(layered(bad, None).is_err());
     }
 
     #[test]

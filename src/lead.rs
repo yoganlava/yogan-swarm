@@ -355,7 +355,7 @@ fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Re
         .env("YOGAN_DIR", state)
         .env("YOGAN_REQUEST", &req.id);
     let prompt = reply.map_or_else(|| req.text.clone(), String::from);
-    worker::claude(&mut cmd, &prompt, &mut log, &err_log, |event| {
+    worker::claude(&mut cmd, &prompt, &mut log, &err_log, None, |event| {
         match event {
             Event::System(System::Init { session_id, .. }) => {
                 req.session = Some(session_id);

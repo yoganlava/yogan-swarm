@@ -996,8 +996,11 @@ impl App {
     }
 }
 
-/// Tool calls from the tail of a Claude stream log, as (tool, target), with `slot/` paths
-/// made relative.
+/// The Activity tab's tool name for a worker's nudge.
+const NUDGE: &str = "↻";
+
+/// Tool calls and nudges from the tail of a Claude stream log, as (tool, target), with `slot/`
+/// paths made relative.
 fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
     let Ok(mut file) = File::open(log) else {
         return Vec::new();
@@ -1017,27 +1020,30 @@ fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
     let events = text
         .lines()
         .filter_map(|l| serde_json::from_str::<stream::Event>(l).ok());
-    let content = events.flat_map(|e| match e {
-        stream::Event::Assistant { message } => message.content,
-        _ => Vec::new(),
-    });
-    content
-        .filter_map(|c| match c {
-            Content::ToolUse { name, input, .. } => {
-                let key = match name.as_str() {
-                    "Bash" => "command",
-                    "Grep" | "Glob" => "pattern",
-                    _ => "file_path",
-                };
-                let target = input[key]
-                    .as_str()
-                    .unwrap_or("")
-                    .lines()
-                    .next()
-                    .unwrap_or("");
-                Some((name, target.replace(&prefix, "")))
+    let line = |c| match c {
+        Content::ToolUse { name, input, .. } => {
+            let key = match name.as_str() {
+                "Bash" => "command",
+                "Grep" | "Glob" => "pattern",
+                _ => "file_path",
+            };
+            let target = input[key]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("");
+            Some((name, target.replace(&prefix, "")))
+        }
+        _ => None,
+    };
+    events
+        .flat_map(|e| match e {
+            stream::Event::Assistant { message } => {
+                message.content.into_iter().filter_map(line).collect()
             }
-            _ => None,
+            stream::Event::Nudge { reason } => vec![(NUDGE.into(), reason)],
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -1662,7 +1668,7 @@ fn findings_tab(f: &mut Frame, area: Rect, fs: &Findings, cursor: Option<usize>,
 }
 
 /// One line per tool call, following the tail: edits in the accent, shell commands in a
-/// second hue, reads dim.
+/// second hue, reads dim, nudges amber.
 fn activity_tab(f: &mut Frame, area: Rect, calls: &[(String, String)], theme: &Theme) {
     if calls.is_empty() {
         f.render_widget(Line::raw("No tool calls yet.").dim(), area);
@@ -1677,13 +1683,19 @@ fn activity_tab(f: &mut Frame, area: Rect, calls: &[(String, String)], theme: &T
             "Bash" => ("run", Style::new().fg(theme.shell)),
             "Read" => ("read", Style::new().dim()),
             "Grep" | "Glob" => ("search", Style::new().dim()),
+            NUDGE => ("↻ nudged", Style::new().fg(theme.amber)),
             other => (other, Style::new()),
         };
-        let target = truncate(target, width.saturating_sub(8), theme.ellipsis);
-        Line::from(vec![
-            Span::styled(format!("{verb:<7} "), style),
-            Span::raw(target).dim(),
-        ])
+        let target = truncate(
+            target,
+            width.saturating_sub(verb.width().max(7) + 1),
+            theme.ellipsis,
+        );
+        let target = match tool.as_str() {
+            NUDGE => Span::styled(target, style),
+            _ => Span::raw(target).dim(),
+        };
+        Line::from(vec![Span::styled(format!("{verb:<7} "), style), target])
     });
     f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
 }
@@ -2528,6 +2540,15 @@ mod tests {
                 ("Write".into(), "out.txt".into())
             ]
         );
+        let log = std::env::temp_dir().join(format!("yogan-nudge-{}.jsonl", std::process::id()));
+        fs::write(
+            &log,
+            "{\"type\":\"nudge\",\"reason\":\"stalled for 15m\"}\n",
+        )
+        .unwrap();
+        let calls = activity(&log, Path::new("/tmp"));
+        assert_eq!(calls, [(NUDGE.into(), "stalled for 15m".into())]);
+        fs::remove_file(&log).unwrap();
     }
 
     #[test]

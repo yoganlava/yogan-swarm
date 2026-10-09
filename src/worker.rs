@@ -1,21 +1,26 @@
 //! `yogan worker <id>`: one task's whole lifecycle, run detached in its own session.
 
-use std::fs::{self, File};
+use std::collections::HashMap;
+use std::fs::{self, File, TryLockError};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use rustix::process::{
-    Pid, Resource, Rlimit, Signal, getrlimit, kill_process_group, setrlimit, setsid,
+    Pid, Resource, Rlimit, Signal, getrlimit, kill_process, kill_process_group, setrlimit, setsid,
 };
-
 use serde_json::Value;
+use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
 use crate::critic::{self, Findings};
 use crate::redact::redact;
-use crate::stream::{Event, System};
+use crate::stream::{self, Content, Event};
 use crate::task::{self, Status, Task};
 use crate::{config, gate, git, pr, shim, slot};
 
@@ -62,12 +67,14 @@ pub fn spawn(repo: &Path, id: &str, extra: &[&str]) -> Result<u32> {
 /// Runs `cmd`, a `claude` with its role's flags, as `claude -p` on `prompt`, which goes last
 /// after `--` so one starting with `-` isn't read as an option. The event stream goes redacted
 /// to `log` and parsed to `on_event`, whose error kills claude; stderr goes redacted to
-/// `err_log`.
+/// `err_log`. With `watch` (the thresholds and the slot's permit queue), a stall or loop kills
+/// it with a `Nudge` error.
 pub(crate) fn claude(
     cmd: &mut Command,
     prompt: &str,
     log: &mut File,
     err_log: &File,
+    watch: Option<(&config::Watch, &Path)>,
     mut on_event: impl FnMut(Event) -> Result<()>,
 ) -> Result<()> {
     let mut claude = cmd
@@ -80,6 +87,7 @@ pub(crate) fn claude(
         .stderr(Stdio::piped())
         .spawn()
         .context("starting claude")?;
+    let pid = claude.id();
     let stderr = claude.stderr.take().context("claude stderr")?;
     let mut err_log = err_log.try_clone()?;
     let stderr = std::thread::spawn(move || -> std::io::Result<()> {
@@ -88,21 +96,258 @@ pub(crate) fn claude(
         }
         Ok(())
     });
+
+    let idle = Arc::new(Mutex::new(Idle::new(Instant::now())));
+    let stalled = Arc::new(AtomicBool::new(false));
+    let (done, ticks) = mpsc::channel::<()>();
+    let watcher = watch.map(|(w, queue)| {
+        let (after, queue) = (w.stall_after, queue.to_path_buf());
+        let (idle, stalled) = (idle.clone(), stalled.clone());
+        std::thread::spawn(move || {
+            let mut sys = System::new();
+            while ticks.recv_timeout(TICK) == Err(RecvTimeoutError::Timeout) {
+                refresh(&mut sys);
+                let cpu = tree(&sys, pid)
+                    .iter()
+                    .filter_map(|p| sys.process(*p))
+                    .map(|p| p.accumulated_cpu_time())
+                    .sum();
+                let tick = idle
+                    .lock()
+                    .unwrap()
+                    .tick(Instant::now(), cpu, queued(&queue));
+                if tick >= after {
+                    stalled.store(true, Ordering::SeqCst);
+                    kill_tree(pid);
+                    return;
+                }
+            }
+        })
+    });
+
+    let (mut repeats, mut last_call, mut last_result) = (Repeats::default(), None, None);
+    let mut looped = None;
     let stdout = claude.stdout.take().context("claude stdout")?;
     for line in BufReader::new(stdout).lines() {
         let line = line?;
+        idle.lock().unwrap().event(Instant::now());
         writeln!(log, "{}", redact(&line))?;
-        if let Ok(event) = serde_json::from_str(&line)
-            && let Err(e) = on_event(event)
-        {
-            claude.kill()?;
+        let Ok(event) = serde_json::from_str::<Event>(&line) else {
+            continue;
+        };
+        match &event {
+            Event::Assistant { message } => {
+                for c in &message.content {
+                    if let Content::ToolUse { name, input, .. } = c {
+                        last_call = Some(call(name, input));
+                        last_result = None;
+                        let n = repeats.see(name, input);
+                        if let Some((w, _)) = watch
+                            && n >= w.loop_repeats
+                        {
+                            looped = Some(n);
+                        }
+                    }
+                }
+            }
+            Event::User { message } => last_result = tool_result(message).or(last_result),
+            _ => {}
+        }
+        let res = on_event(event);
+        if let (Ok(()), Some(n)) = (&res, looped) {
+            let call = last_call.unwrap_or_default();
+            kill_tree(pid);
+            let _ = claude.wait();
+            return Err(Nudge {
+                reason: format!("repeated `{call}` {n} times"),
+                prompt: format!(
+                    "yogan stopped you: you made the same call `{call}` with the same input {n} \
+                     times in a row. State a hypothesis for why it keeps giving the same result, \
+                     then try a different approach."
+                ),
+            }
+            .into());
+        }
+        if let Err(e) = res {
+            kill_tree(pid);
+            let _ = claude.wait();
             return Err(e);
         }
     }
     let status = claude.wait()?;
+    drop(done);
+    if let Some(w) = watcher {
+        let _ = w.join();
+    }
     let _ = stderr.join();
+    if stalled.load(Ordering::SeqCst) {
+        let mins = watch.map_or(0, |(w, _)| w.stall_after.as_secs() / 60);
+        let last = match (&last_call, &last_result) {
+            (Some(call), Some(result)) => {
+                format!("Your last call was `{call}`, which returned:\n{result}")
+            }
+            (Some(call), None) => format!("Your last call was `{call}`, which never returned."),
+            _ => "You hadn't made a tool call yet.".into(),
+        };
+        return Err(Nudge {
+            reason: format!("stalled for {mins}m"),
+            prompt: format!(
+                "yogan stopped you: there was no output and no running work for {mins} minutes. \
+                 {last}\n\nName the next concrete step and take it, or stop with a clear reason \
+                 why you can't go on."
+            ),
+        }
+        .into());
+    }
     ensure!(status.success(), "claude exited with {status}");
     Ok(())
+}
+
+/// A watched run stopped for a stall or loop; `prompt` resumes it.
+#[derive(Debug)]
+pub(crate) struct Nudge {
+    pub reason: String,
+    pub prompt: String,
+}
+
+impl std::fmt::Display for Nudge {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Nudge {}
+
+const TICK: Duration = Duration::from_secs(10);
+// ponytail: a fixed floor of 1% of a core per tick; claude idling on its own timers stays under
+// it, so a run spinning just above it never stalls; measure claude's idle CPU if that bites
+const BUSY_MS: u64 = 100;
+const GRACE: Duration = Duration::from_secs(5);
+
+/// How long the stream and the process tree have both been idle.
+struct Idle {
+    since: Instant,
+    cpu_ms: u64,
+}
+
+impl Idle {
+    fn new(now: Instant) -> Self {
+        Idle {
+            since: now,
+            cpu_ms: 0,
+        }
+    }
+
+    fn event(&mut self, now: Instant) {
+        self.since = now;
+    }
+
+    /// `cpu_ms` is the tree's total CPU time; a build `queued` for a permit counts as busy.
+    fn tick(&mut self, now: Instant, cpu_ms: u64, queued: bool) -> Duration {
+        if queued || cpu_ms > self.cpu_ms + BUSY_MS {
+            self.since = now;
+        }
+        self.cpu_ms = cpu_ms;
+        now - self.since
+    }
+}
+
+/// Counts the same tool call with the same input in a row.
+#[derive(Default)]
+struct Repeats {
+    last: Option<(String, Value)>,
+    n: u32,
+}
+
+impl Repeats {
+    fn see(&mut self, name: &str, input: &Value) -> u32 {
+        if self.last.as_ref() == Some(&(name.to_string(), input.clone())) {
+            self.n += 1;
+        } else {
+            self.last = Some((name.to_string(), input.clone()));
+            self.n = 1;
+        }
+        self.n
+    }
+}
+
+/// A tool call as `Tool target`, for a nudge.
+fn call(name: &str, input: &Value) -> String {
+    let target = ["command", "file_path", "pattern"]
+        .iter()
+        .find_map(|k| input[k].as_str())
+        .map_or_else(|| input.to_string(), str::to_string);
+    format!("{name} {target}").chars().take(200).collect()
+}
+
+/// The tail of the first tool result in a user message.
+fn tool_result(message: &Value) -> Option<String> {
+    let blocks = message["content"].as_array()?;
+    let block = blocks.iter().find(|b| b["type"] == "tool_result")?;
+    let text = match &block["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => {
+            let parts: Vec<_> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+            parts.join("\n")
+        }
+        _ => String::new(),
+    };
+    let skip = text.chars().count().saturating_sub(2000);
+    Some(text.chars().skip(skip).collect())
+}
+
+/// Whether a build holds the permit queue, i.e. waits for a permit.
+fn queued(queue: &Path) -> bool {
+    File::open(queue).is_ok_and(|f| matches!(f.try_lock(), Err(TryLockError::WouldBlock)))
+}
+
+fn refresh(sys: &mut System) {
+    let kind = ProcessRefreshKind::nothing().with_cpu();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+}
+
+/// `root` and its descendants.
+fn tree(sys: &System, root: u32) -> Vec<sysinfo::Pid> {
+    let mut kids: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
+    for (pid, p) in sys.processes() {
+        if let Some(parent) = p.parent() {
+            kids.entry(parent).or_default().push(*pid);
+        }
+    }
+    let mut out = vec![sysinfo::Pid::from_u32(root)];
+    let mut i = 0;
+    while i < out.len() {
+        out.extend(kids.get(&out[i]).cloned().unwrap_or_default());
+        i += 1;
+    }
+    out
+}
+
+/// SIGTERMs `root` and its descendants, then SIGKILLs any left after a grace period. Walks the
+/// tree, not a process group, since claude shares the worker's group.
+fn kill_tree(root: u32) {
+    let mut sys = System::new();
+    refresh(&mut sys);
+    let pids = tree(&sys, root);
+    let signal = |s| {
+        for p in pids.iter().filter_map(|p| Pid::from_raw(p.as_u32() as i32)) {
+            let _ = kill_process(p, s);
+        }
+    };
+    signal(Signal::TERM);
+    let start = Instant::now();
+    while start.elapsed() < GRACE {
+        std::thread::sleep(Duration::from_millis(100));
+        refresh(&mut sys);
+        let gone = |p| {
+            sys.process(p)
+                .is_none_or(|p| p.status() == ProcessStatus::Zombie)
+        };
+        if pids.iter().all(|p| gone(*p)) {
+            return;
+        }
+    }
+    signal(Signal::KILL);
 }
 
 /// Claude only warns on an unknown effort and runs on its default, so yogan fails instead.
@@ -250,7 +495,9 @@ fn lifecycle(
     let (mut log, err_log) = (append("jsonl")?, append("stderr.log")?);
 
     // one Claude run in the slot; `resume` continues the task's last session, and a `schema`
-    // asks for a structured reply, which it returns
+    // asks for a structured reply, which it returns. A stall or loop resumes it with a nudge,
+    // up to [watch] nudges per task
+    let queue = shim::queue(state, n);
     let mut session = |task: &mut Task,
                        prompt: &str,
                        resume: bool,
@@ -260,75 +507,96 @@ fn lifecycle(
         task.status = Status::Running;
         task.pr_draft = None;
         task.save(state)?;
-        let mut cmd = Command::new("claude");
-        cmd.args(["--permission-mode", "acceptEdits"])
-            .args(["--model", &model, "--effort", &effort]);
-        if let Some(file) = &w.mcp_config {
-            cmd.args(["--mcp-config", file]);
-        }
-        if resume {
-            cmd.args([
-                "--resume",
-                task.sessions.last().context("no session to resume")?,
-            ]);
-        }
-        if let Some(schema) = schema {
-            cmd.args(["--json-schema", schema]);
-        }
-        cmd.arg("--allowedTools")
-            .args(&allowed)
-            .arg("--disallowedTools")
-            .args(DENY)
-            .args(&w.deny)
-            .args(["--append-system-prompt", RULES])
-            .current_dir(&dir)
-            .env("GIT_EDITOR", "true") // `rebase --continue` must not wait on an editor
-            .envs(env.iter().cloned());
-        let (mut denied, mut reply) = (Vec::new(), None);
-        claude(&mut cmd, prompt, &mut log, &err_log, |event| {
-            match event {
-                Event::System(System::Init {
-                    session_id,
-                    mcp_servers,
-                    ..
-                }) => {
-                    if !task.sessions.contains(&session_id) {
-                        task.sessions.push(session_id);
-                        task.save(state)?;
-                    }
-                    let extra: Vec<_> = mcp_servers
-                        .into_iter()
-                        .filter(|s| !servers.contains(&s.name))
-                        .map(|s| s.name)
-                        .collect();
-                    ensure!(
-                        extra.is_empty(),
-                        "unexpected MCP servers: {}",
-                        extra.join(", ")
-                    );
-                }
-                Event::Result(r) => {
-                    // a structured reply isn't a summary, so the last one stands
-                    if schema.is_none() {
-                        task.summary = Some(r.result).filter(|s| !s.is_empty());
-                    }
-                    reply = r.structured_output;
-                    denied = r
-                        .permission_denials
-                        .into_iter()
-                        .map(|d| d.tool_name)
-                        .collect();
-                }
-                _ => {}
+        let (mut prompt, mut resume) = (prompt.to_string(), resume);
+        loop {
+            let mut cmd = Command::new("claude");
+            cmd.args(["--permission-mode", "acceptEdits"])
+                .args(["--model", &model, "--effort", &effort]);
+            if let Some(file) = &w.mcp_config {
+                cmd.args(["--mcp-config", file]);
             }
-            Ok(())
-        })?;
-        ensure!(
-            denied.is_empty(),
-            "incomplete: permission denied for {}",
-            denied.join(", ")
-        );
-        Ok(reply)
+            if resume {
+                cmd.args([
+                    "--resume",
+                    task.sessions.last().context("no session to resume")?,
+                ]);
+            }
+            if let Some(schema) = schema {
+                cmd.args(["--json-schema", schema]);
+            }
+            cmd.arg("--allowedTools")
+                .args(&allowed)
+                .arg("--disallowedTools")
+                .args(DENY)
+                .args(&w.deny)
+                .args(["--append-system-prompt", RULES])
+                .current_dir(&dir)
+                .env("GIT_EDITOR", "true") // `rebase --continue` must not wait on an editor
+                .envs(env.iter().cloned());
+            let (mut denied, mut reply) = (Vec::new(), None);
+            let watch = Some((&cfg.watch, queue.as_path()));
+            let res = claude(&mut cmd, &prompt, &mut log, &err_log, watch, |event| {
+                match event {
+                    Event::System(stream::System::Init {
+                        session_id,
+                        mcp_servers,
+                        ..
+                    }) => {
+                        if !task.sessions.contains(&session_id) {
+                            task.sessions.push(session_id);
+                            task.save(state)?;
+                        }
+                        let extra: Vec<_> = mcp_servers
+                            .into_iter()
+                            .filter(|s| !servers.contains(&s.name))
+                            .map(|s| s.name)
+                            .collect();
+                        ensure!(
+                            extra.is_empty(),
+                            "unexpected MCP servers: {}",
+                            extra.join(", ")
+                        );
+                    }
+                    Event::Result(r) => {
+                        // a structured reply isn't a summary, so the last one stands
+                        if schema.is_none() {
+                            task.summary = Some(r.result).filter(|s| !s.is_empty());
+                        }
+                        reply = r.structured_output;
+                        denied = r
+                            .permission_denials
+                            .into_iter()
+                            .map(|d| d.tool_name)
+                            .collect();
+                    }
+                    _ => {}
+                }
+                Ok(())
+            });
+            if let Err(e) = &res
+                && let Some(nudge) = e.downcast_ref::<Nudge>()
+            {
+                ensure!(
+                    task.nudges < cfg.watch.nudges,
+                    "{} after {} nudge(s)",
+                    nudge.reason,
+                    task.nudges
+                );
+                task.nudges += 1;
+                task.save(state)?;
+                let line = serde_json::json!({"type": "nudge", "reason": nudge.reason});
+                writeln!(log, "{}", redact(&line.to_string()))?;
+                (prompt, resume) = (nudge.prompt.clone(), true);
+                continue;
+            }
+            res?;
+            ensure!(
+                denied.is_empty(),
+                "incomplete: permission denied for {}",
+                denied.join(", ")
+            );
+            return Ok(reply);
+        }
     };
 
     // an optional Claude run, then the gate and, with `review`, the critic. A failing gate or an
@@ -453,6 +721,97 @@ mod tests {
     use super::*;
     use rustix::process::{getsid, test_kill_process};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn loop_detector_counts_identical_calls_in_a_row() {
+        let mut r = Repeats::default();
+        let test = serde_json::json!({"command": "cargo test -p a"});
+        assert_eq!(r.see("Bash", &test), 1);
+        assert_eq!(r.see("Bash", &test), 2);
+        // a different input or tool breaks the run
+        assert_eq!(r.see("Bash", &serde_json::json!({"command": "ls"})), 1);
+        assert_eq!(r.see("Bash", &test), 1);
+        assert_eq!(r.see("Read", &test), 1);
+        assert_eq!(r.see("Read", &test), 2);
+    }
+
+    #[test]
+    fn stall_detector_needs_silence_and_an_idle_tree() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut idle = Idle::new(t0);
+        assert_eq!(idle.tick(at(10), 5_000, false), Duration::ZERO); // first sample: busy
+        assert_eq!(idle.tick(at(20), 5_050, false), Duration::from_secs(10));
+        // a build burning CPU without a stream event isn't a stall
+        assert_eq!(idle.tick(at(30), 9_000, false), Duration::ZERO);
+        assert_eq!(idle.tick(at(40), 9_000, false), Duration::from_secs(10));
+        // nor is a build queued for a permit
+        assert_eq!(idle.tick(at(50), 9_000, true), Duration::ZERO);
+        // a child exiting drops the total, which isn't work
+        assert_eq!(idle.tick(at(60), 1_000, false), Duration::from_secs(10));
+        idle.event(at(65));
+        assert_eq!(idle.tick(at(70), 1_000, false), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_held_queue_counts_as_queued() {
+        let queue = std::env::temp_dir().join(format!("yogan-queue-{}", std::process::id()));
+        assert!(!queued(&queue)); // no file: no build ever queued
+        let f = File::create(&queue).unwrap();
+        assert!(!queued(&queue));
+        f.lock_shared().unwrap();
+        assert!(queued(&queue));
+        drop(f);
+        // a test forking meanwhile holds the fd until it execs
+        let start = Instant::now();
+        while queued(&queue) {
+            assert!(start.elapsed() < Duration::from_secs(5), "still queued");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fs::remove_file(&queue).unwrap();
+    }
+
+    #[test]
+    fn a_loop_kills_the_run_and_names_the_call() {
+        let log = std::env::temp_dir().join(format!("yogan-loop-{}", std::process::id()));
+        let call = r#"{"type":"assistant","message":{"id":"m","usage":{},"content":[{"type":"tool_use","id":"t","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let mut cmd = Command::new("sh");
+        // a child that outlives the stream, as a test run would
+        let script = format!(
+            "sleep 30 & echo $! > {0}.pid; for i in 1 2 3; do echo '{call}'; done; wait",
+            log.display()
+        );
+        cmd.args(["-c", &script, "sh"]);
+        let watch = config::Watch {
+            stall_after: Duration::from_secs(3600),
+            nudges: 1,
+            loop_repeats: 3,
+        };
+        let (mut out, err) = (
+            File::create(&log).unwrap(),
+            File::create("/dev/null").unwrap(),
+        );
+        let start = Instant::now();
+        let e = claude(&mut cmd, "go", &mut out, &err, Some((&watch, &log)), |_| {
+            Ok(())
+        })
+        .unwrap_err();
+        let nudge = e.downcast_ref::<Nudge>().expect("a nudge");
+        assert_eq!(nudge.reason, "repeated `Bash cargo test` 3 times");
+        assert!(nudge.prompt.contains("hypothesis"), "{}", nudge.prompt);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        let sleep: i32 = fs::read_to_string(log.with_extension("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            test_kill_process(Pid::from_raw(sleep).unwrap()).is_err(),
+            "child survived"
+        );
+        let _ = fs::remove_file(log.with_extension("pid"));
+        fs::remove_file(&log).unwrap();
+    }
 
     #[test]
     fn detached_in_own_session_and_stopped_as_a_group() {

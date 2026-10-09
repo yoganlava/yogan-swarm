@@ -221,7 +221,7 @@ pub fn run(
         .envs(env.iter().cloned());
     let mut report = None;
     let prompt = prompt(task, base, previous);
-    worker::claude(&mut cmd, &prompt, &mut log, &err_log, |event| {
+    worker::claude(&mut cmd, &prompt, &mut log, &err_log, None, |event| {
         if let Event::Result(r) = event {
             report = r.structured_output;
         }

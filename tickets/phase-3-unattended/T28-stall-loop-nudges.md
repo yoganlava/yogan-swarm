@@ -1,4 +1,4 @@
-- [ ] **T28 Stall + loop nudges**
+- [x] **T28 Stall + loop nudges**
 
 Plan: Unattended safety (Stall, Loop rows); Unattended safety › Nudges and handoffs; TUI › Screens › 3. Running.
 

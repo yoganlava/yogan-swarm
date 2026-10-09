@@ -11,9 +11,17 @@ pub enum Event {
     Assistant {
         message: Message,
     },
-    User,
+    /// Carries tool results.
+    User {
+        #[serde(default)]
+        message: Value,
+    },
     RateLimitEvent,
     Result(RunResult),
+    /// Not Claude's: the line the worker logs when it nudges a stalled or looping run.
+    Nudge {
+        reason: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -134,7 +142,7 @@ mod tests {
                 .any(|e| matches!(e, Event::System(System::Other)))
         );
         assert!(events.iter().any(|e| matches!(e, Event::RateLimitEvent)));
-        assert!(events.iter().any(|e| matches!(e, Event::User)));
+        assert!(events.iter().any(|e| matches!(e, Event::User { .. })));
 
         let Some(Event::Result(r)) = events.last() else {
             panic!("last event is result");
