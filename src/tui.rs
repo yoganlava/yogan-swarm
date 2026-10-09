@@ -436,6 +436,8 @@ struct App {
     open_at: Option<(PathBuf, Option<u32>)>,
     /// The cursor over the Diff tab's files.
     diff_file: usize,
+    /// The cursor file moved or folded, so the Diff tab scrolls it into view once.
+    follow: Cell<bool>,
     /// The detail pane has the full width.
     zoom: bool,
     /// The last row click, to spot a double-click.
@@ -642,6 +644,7 @@ pub fn run(repo: &Path) -> Result<()> {
         editing: None,
         open_at: None,
         diff_file: 0,
+        follow: Cell::new(false),
         zoom: false,
         last_click: None,
         split: 45,
@@ -676,6 +679,10 @@ pub fn run(repo: &Path) -> Result<()> {
             }
             in_review = Some(review);
             app.expire(Instant::now());
+            // compact draws no headings to unfold a group with
+            if terminal.size()?.height < COMPACT {
+                app.folded = [false; 3];
+            }
             let tick = (start.elapsed().as_millis() / 125) as usize; // spinner at 8 Hz
             // ratatui only writes cells that changed, so an idle screen draws nothing
             terminal.draw(|f| draw(f, &app, &theme, tick, SystemTime::now()))?;
@@ -973,6 +980,14 @@ impl App {
         let same = id.and_then(|id| ids.position(|i| *i == id));
         let rows = self.requests.len() + self.tasks.len();
         self.selected = same.unwrap_or(self.selected.min(rows.saturating_sub(1)));
+        // the selected row is never hidden in a folded group
+        if let Some(g) = self
+            .groups()
+            .iter()
+            .position(|g| g.contains(&self.selected))
+        {
+            self.folded[g] = false;
+        }
         let review = self
             .tasks
             .iter()
@@ -1082,6 +1097,12 @@ impl App {
 
     /// Returns false to quit.
     fn key(&mut self, key: KeyEvent) -> bool {
+        self.press(key, false)
+    }
+
+    /// `action` runs the key as the task action the menu and palette label it, so the Findings
+    /// and Diff tabs' own `x`, `r`, `o`, `j/k` and `enter` don't take it.
+    fn press(&mut self, key: KeyEvent, action: bool) -> bool {
         let ctrl =
             |c| key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c);
         if ctrl('c') {
@@ -1234,7 +1255,7 @@ impl App {
         let failed = self.request().is_some_and(|r| r.status == Phase::Failed);
         let status = self.task().map(|(t, _)| t.status);
         let answered = self.request().is_some_and(|r| r.status == Phase::Done);
-        if self.on_findings() {
+        if !action && self.on_findings() {
             let n = self.findings.actionable().count();
             let disputed = self.findings.is_disputed(self.finding);
             match key.code {
@@ -1259,21 +1280,24 @@ impl App {
                 _ => {}
             }
         }
-        if self.on_diff() {
+        if !action && self.on_diff() {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     let n = self.diff.len();
                     self.diff_file = (self.diff_file + 1).min(n.saturating_sub(1));
+                    self.follow.set(true);
                     return true;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.diff_file = self.diff_file.saturating_sub(1);
+                    self.follow.set(true);
                     return true;
                 }
                 KeyCode::Enter => {
                     if !self.unfolded.remove(&self.diff_file) {
                         self.unfolded.insert(self.diff_file);
                     }
+                    self.follow.set(true);
                     return true;
                 }
                 KeyCode::Char('o') => {
@@ -1769,10 +1793,13 @@ impl App {
 
     /// Closes the palette and runs its `i`th row. Returns false to quit.
     fn command(&mut self, i: usize) -> bool {
-        let target = self.commands().get(i).map(|c| c.3);
+        let commands = self.commands();
+        let target = commands
+            .get(i.min(commands.len().saturating_sub(1)))
+            .map(|c| c.3);
         self.palette = None;
         match target {
-            Some(Target::Key(key)) => return self.key(key),
+            Some(Target::Key(key)) => return self.press(key, true),
             Some(Target::Row(i)) if i != self.selected => {
                 self.selected = i;
                 self.scroll.set(0);
@@ -1824,7 +1851,8 @@ impl App {
             if let MouseEventKind::Down(_) = m.kind {
                 self.menu = None;
                 if let Some(Target::Key(key)) = hit {
-                    return self.key(key);
+                    self.last_click = Some((at, Instant::now()));
+                    return self.press(key, true);
                 }
             }
             return true;
@@ -1840,11 +1868,18 @@ impl App {
             }
             (MouseEventKind::Up(MouseButton::Left), _) => self.dragging = false,
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Command(i))) => {
+                self.last_click = Some((at, Instant::now()));
                 return self.command(i);
             }
             (MouseEventKind::Down(_), _) if self.palette.is_some() && !in_palette => {
                 self.palette = None;
             }
+            // the second half of a double-click that opened the confirm doesn't answer it
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Key(_)))
+                if self.confirm
+                    && self.last_click.is_some_and(|(p, t)| {
+                        p == at && t.elapsed() < Duration::from_millis(400)
+                    }) => {}
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Key(key))) => {
                 return self.key(key);
             }
@@ -1857,9 +1892,10 @@ impl App {
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Row(i))) if !modal => {
                 // crossterm doesn't report double-clicks: two Downs on one cell within 400 ms
                 let now = Instant::now();
-                let double = self.last_click.is_some_and(|(p, t)| {
-                    p == at && now.duration_since(t) < Duration::from_millis(400)
-                });
+                let double = i == self.selected
+                    && self.last_click.is_some_and(|(p, t)| {
+                        p == at && now.duration_since(t) < Duration::from_millis(400)
+                    });
                 self.zoom |= double;
                 self.last_click = (!double).then_some((at, now));
                 self.selected = i;
@@ -1878,6 +1914,9 @@ impl App {
             }
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Fold(g))) if !modal => {
                 self.folded[g] = !self.folded[g];
+                if self.folded[g] && self.groups()[g].contains(&self.selected) {
+                    self.move_by(true);
+                }
             }
             (MouseEventKind::Down(MouseButton::Left), Some(Target::File(i))) if !modal => {
                 (self.detail, self.diff_file) = (true, i);
@@ -2262,7 +2301,8 @@ fn scrollbar(f: &mut Frame, track: Rect, max: usize, top: usize) -> Vec<(Rect, u
 
 /// `git diff --numstat` against the base, as (path, added, deleted); binaries count 0.
 fn diffstat(slot: &Path, base: &str) -> Vec<(String, u64, u64)> {
-    let out = git(slot, &["diff", "--numstat", &format!("{base}...HEAD")]).unwrap_or_default();
+    let range = format!("{base}...HEAD");
+    let out = git(slot, &["diff", "--numstat", "--no-renames", &range]).unwrap_or_default();
     out.lines()
         .filter_map(|l| {
             let mut parts = l.splitn(3, '\t');
@@ -2278,15 +2318,20 @@ fn diffstat(slot: &Path, base: &str) -> Vec<(String, u64, u64)> {
 
 /// Each file's lines from its first `@@` in `git diff` against the base, in `diffstat`'s order.
 fn hunks(slot: &Path, base: &str) -> Vec<Vec<String>> {
-    let out = git(slot, &["diff", &format!("{base}...HEAD")]).unwrap_or_default();
+    let out = git(slot, &["diff", "--no-renames", &format!("{base}...HEAD")]).unwrap_or_default();
     let out = format!("\n{out}");
-    let files = out.split("\ndiff --git ").skip(1);
-    files
-        .map(|f| {
-            let lines = f.lines().skip_while(|l| !l.starts_with("@@"));
-            lines.map(|l| l.replace('\t', "    ")).collect()
-        })
-        .collect()
+    // a type change (file to symlink) is two sections under one header but one numstat line
+    let mut files: Vec<(&str, Vec<String>)> = Vec::new();
+    for f in out.split("\ndiff --git ").skip(1) {
+        let head = f.lines().next().unwrap_or_default();
+        let lines = f.lines().skip_while(|l| !l.starts_with("@@"));
+        let lines = lines.map(|l| l.replace('\t', "    "));
+        match files.last_mut() {
+            Some((h, l)) if *h == head => l.extend(lines),
+            _ => files.push((head, lines.collect())),
+        }
+    }
+    files.into_iter().map(|(_, l)| l).collect()
 }
 
 /// Below this many rows, the header and footer share one line, the list drops its group headings
@@ -2350,6 +2395,11 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         vec![("tab", "field"), ("ctrl-s", "submit"), ("esc", "cancel")]
     } else if app.reply.is_some() {
         vec![("ctrl-s", "send"), ("esc", "cancel")]
+    } else if app.instruction.is_some() {
+        vec![("enter", "redraft"), ("esc", "cancel")]
+    } else if app.preview {
+        let push = ("enter", "push and open PR");
+        vec![push, ("g", "regenerate"), ("e", "edit"), ("esc", "back")]
     } else if app.on_findings() {
         let mut keys = vec![("j/k", "finding")];
         let disputed = app.findings.is_disputed(app.finding);
@@ -2374,11 +2424,6 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             &[("tab", "pane"), ("1-6", "tabs"), ("?", "more")],
         ]
         .concat()
-    } else if app.instruction.is_some() {
-        vec![("enter", "redraft"), ("esc", "cancel")]
-    } else if app.preview {
-        let push = ("enter", "push and open PR");
-        vec![push, ("g", "regenerate"), ("e", "edit"), ("esc", "back")]
     } else {
         // up to six keys that do something for the selection, the one that moves it on first
         let global = ["n", "1-6", "j/k", "tab", "q"]
@@ -2898,10 +2943,13 @@ fn header_line(app: &App, theme: &Theme, area: Rect, compact: bool) -> Line<'sta
     let rect = Rect::new(x, area.y, chip.width() as u16, 1).intersection(area);
     let key = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE);
     let hint = "] · next needing you".into();
-    app.hits
-        .borrow_mut()
-        .targets
-        .push((rect, Target::Key(key), hint));
+    let typing = app.compose.is_some() || app.settings.is_some() || app.instruction.is_some();
+    if !typing && !app.preview {
+        app.hits
+            .borrow_mut()
+            .targets
+            .push((rect, Target::Key(key), hint));
+    }
     spans.push(chip);
     if compact {
         spans.push(Span::raw("  "));
@@ -4092,7 +4140,7 @@ fn diff_tab(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     lines.push(Line::raw(""));
     let total = format!("{} files changed, +{added} -{deleted}", files.len());
     lines.push(Line::raw(total).dim());
-    if cursor.is_some() {
+    if cursor.is_some() && app.follow.take() {
         let (first, last) = section;
         let lo = (first + 1).saturating_sub(area.height as usize);
         let top = (app.scroll.get() as usize).max(lo).min(last);
@@ -4232,6 +4280,7 @@ mod tests {
             editing: None,
             open_at: None,
             diff_file: 0,
+            follow: Cell::new(false),
             zoom: false,
             last_click: None,
             split: 45,
@@ -5130,6 +5179,100 @@ mod tests {
     }
 
     #[test]
+    fn menu_and_preview_clicks_do_what_they_say() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut send = |app: &mut App, kind, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows.iter().enumerate().find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let x = row[..row.find(text).unwrap()].chars().count();
+            let m = MouseEvent {
+                kind,
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.mouse(m);
+            rows
+        };
+        let left = MouseEventKind::Down(MouseButton::Left);
+
+        // on Findings, the menu's discard opens the confirm, and a double-click doesn't answer it
+        (app.findings, app.tab) = (sample_findings(), FINDINGS);
+        send(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Right),
+            "Reject negative",
+        );
+        send(&mut app, left, "x   discard task");
+        assert!(app.confirm && app.reply_for.is_none());
+        let m = app.last_click.unwrap().0;
+        app.mouse(MouseEvent {
+            kind: left,
+            column: m.x,
+            row: m.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.confirm);
+
+        // the preview's footer is the preview's, even on the Diff tab
+        app.confirm = false;
+        app.tasks[0].0.pr_draft = Some(pr::Draft {
+            title: "feat(config): reject negative max_delay".into(),
+            body: "max_delay below zero now fails at parse time.".into(),
+            head: "abc".into(),
+            problem: None,
+        });
+        (app.preview, app.detail, app.tab) = (true, true, DIFF);
+        let rows = send(&mut app, left, "PR preview");
+        assert!(rows[29].contains("enter  push and open PR"), "{}", rows[29]);
+    }
+
+    #[test]
+    fn diff_hunks_line_up_with_numstat() {
+        let repo = std::env::temp_dir().join(format!("yogan-hunks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        fs::write(repo.join("r.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        fs::write(repo.join("z.txt"), "z\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        // a rename with an edit, a file turned symlink, and an edit after both
+        git(&["mv", "r.txt", "s.txt"]);
+        fs::write(repo.join("s.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        fs::remove_file(repo.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink("z.txt", repo.join("a.txt")).unwrap();
+        fs::write(repo.join("z.txt"), "zz\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "change"]);
+
+        let stat = diffstat(&repo, "HEAD~1");
+        let hunks = hunks(&repo, "HEAD~1");
+        assert_eq!(stat.len(), hunks.len(), "{stat:?}");
+        assert!(stat.iter().all(|(p, ..)| !p.contains("=>")), "{stat:?}");
+        let z = stat.iter().position(|(p, ..)| p == "z.txt").unwrap();
+        assert!(hunks[z].iter().any(|l| l == "+zz"), "{:?}", hunks[z]);
+        fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
     fn rewind_picks_a_worker_commit_and_retry_asks_for_a_model() {
         let (mut app, now) = app();
         let state = std::env::temp_dir().join(format!("yogan-rewind-{}", std::process::id()));
@@ -5516,6 +5659,8 @@ mod tests {
         let rows = click(&mut app, "NEEDS YOU", 0);
         assert!(rows.iter().any(|r| r.contains("▸ NEEDS YOU 2")));
         assert!(!rows.iter().any(|r| r.contains("Bump sqlx")));
+        // folding the selection's group moves the selection to a shown row
+        assert!(!app.groups()[0].contains(&app.selected));
         // k skips the folded group
         app.selected = 2;
         app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
