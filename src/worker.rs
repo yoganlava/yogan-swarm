@@ -233,6 +233,7 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
                     }
                 }
                 Ok(Event::Result(r)) => {
+                    task.summary = Some(r.result).filter(|s| !s.is_empty());
                     denied = r
                         .permission_denials
                         .into_iter()

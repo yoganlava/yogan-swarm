@@ -75,6 +75,9 @@ pub struct RunResult {
     pub total_cost_usd: f64,
     pub usage: Usage,
     pub permission_denials: Vec<Denial>,
+    /// Claude's final message.
+    #[serde(default)]
+    pub result: String,
 }
 
 #[derive(Debug, Deserialize)]

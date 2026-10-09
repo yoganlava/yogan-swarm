@@ -1,4 +1,4 @@
-- [ ] **T16 Detail tabs**
+- [x] **T16 Detail tabs**
 
 Plan: TUI › Widgets; TUI › Screens › 3. Running, 5. Review with a failed gate; TUI › Keys (`d`, `x`).
 
