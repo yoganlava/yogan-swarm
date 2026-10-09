@@ -1,6 +1,7 @@
 //! The TUI: tasks grouped by status on the left, the selected task on the right. It only reads
 //! the state directory; workers run detached, so closing it changes nothing.
 
+use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -41,8 +42,10 @@ const GROUPS: [(Status, &str); 7] = [
 
 const TABS: [&str; 5] = ["Summary", "Activity", "Gate", "Findings", "Diff"];
 const FINDINGS: usize = 3;
+/// Lines a scroll key moves the detail pane.
+const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 18] = [
+const KEYS: [(&str, &str); 19] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -61,6 +64,7 @@ const KEYS: [(&str, &str); 18] = [
     ("q", "quit"),
     ("c", "continue"),
     ("w", "rewind"),
+    ("pgup/pgdn", "scroll"),
 ];
 
 /// Every color and glyph, so a light-terminal or ASCII variant is one swap. Nothing paints a
@@ -185,6 +189,9 @@ struct App {
     commit: usize,
     /// A slot and session to continue in `claude` once the TUI is suspended.
     interactive: Option<(PathBuf, String)>,
+    /// How far the detail pane is scrolled: down from the top, or up from the tail in Activity
+    /// and the Gate output. Drawing clamps it.
+    scroll: Cell<u16>,
     /// The selected task's findings, and the cursor over their actionable ones.
     findings: Findings,
     finding: usize,
@@ -264,6 +271,7 @@ pub fn run(repo: &Path) -> Result<()> {
         commits: Vec::new(),
         commit: 0,
         interactive: None,
+        scroll: Cell::new(0),
         findings: Findings::default(),
         finding: 0,
         disputed: Vec::new(),
@@ -663,7 +671,10 @@ impl App {
                 _ => {}
             }
         }
+        let before = (self.selected, self.tab);
         match key.code {
+            // before `d`, which would take ctrl-d too
+            _ if ctrl('d') || ctrl('u') => self.scroll_by(ctrl('d')),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('n') => self.compose = Some(Compose::new(Mode::Auto, "")),
             KeyCode::Char('p') if answered => {
@@ -733,13 +744,28 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
             KeyCode::Tab => self.detail = !self.detail,
+            KeyCode::PageDown | KeyCode::PageUp => self.scroll_by(key.code == KeyCode::PageDown),
             _ => {}
+        }
+        if (self.selected, self.tab) != before {
+            self.scroll.set(0);
         }
         true
     }
 }
 
 impl App {
+    /// Scrolls the detail pane a step toward the end of its text (`down`) or back; Activity and
+    /// the Gate output count from their tail, so down there means newer.
+    fn scroll_by(&mut self, down: bool) {
+        let tail = self.task().is_some() && (self.tab == 1 || self.tab == 2);
+        let s = self.scroll.get();
+        self.scroll.set(match down != tail {
+            true => s.saturating_add(SCROLL),
+            false => s.saturating_sub(SCROLL),
+        });
+    }
+
     fn slot_dir(&self) -> Option<PathBuf> {
         let (t, _) = self.task()?;
         Some(self.state.join("slots").join(t.slot?.to_string()))
@@ -1175,6 +1201,23 @@ fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Draws `p` scrolled down by the detail pane's offset, clamped to its last page.
+fn scrolled(f: &mut Frame, area: Rect, p: Paragraph, scroll: &Cell<u16>) {
+    let max = p
+        .line_count(area.width)
+        .saturating_sub(area.height as usize);
+    scroll.set(scroll.get().min(max as u16));
+    f.render_widget(p.scroll((scroll.get(), 0)), area);
+}
+
+/// For a view that follows its tail: how many of `len` lines to hide below, clamped so a full
+/// page of `height` stays in view.
+fn from_tail(len: usize, height: u16, scroll: &Cell<u16>) -> usize {
+    let max = len.saturating_sub(height as usize);
+    scroll.set(scroll.get().min(max as u16));
+    scroll.get() as usize
+}
+
 /// `git diff --numstat` against the base, as (path, added, deleted); binaries count 0.
 fn diffstat(slot: &Path, base: &str) -> Vec<(String, u64, u64)> {
     let out = git(slot, &["diff", "--numstat", &format!("{base}...HEAD")]).unwrap_or_default();
@@ -1576,7 +1619,7 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     f.render_widget(block, area);
     let Some((t, _)) = app.task() else {
         match app.request() {
-            Some(r) => request(f, inner, r, app.answer.as_ref(), theme),
+            Some(r) => request(f, inner, r, app.answer.as_ref(), theme, &app.scroll),
             None => f.render_widget(Line::raw("No tasks yet.").dim(), inner),
         }
         return;
@@ -1602,20 +1645,27 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
                 let shown = app.tasks.iter().find(|(o, _)| &o.id == p);
                 shown.map_or(p.clone(), |(o, _)| o.title.clone())
             });
-            summary(f, body, t, parent, app.sessions)
+            summary(f, body, t, parent, app.sessions, &app.scroll)
         }
-        1 => activity_tab(f, body, &app.activity, theme),
-        2 => gate_tab(f, body, t, &app.gate_log, theme),
+        1 => activity_tab(f, body, &app.activity, theme, &app.scroll),
+        2 => gate_tab(f, body, t, &app.gate_log, theme, &app.scroll),
         FINDINGS => {
             let cursor = app.on_findings().then_some(app.finding);
-            findings_tab(f, body, &app.findings, cursor, theme)
+            findings_tab(f, body, &app.findings, cursor, theme, &app.scroll)
         }
-        _ => diff_tab(f, body, &app.diff, theme),
+        _ => diff_tab(f, body, &app.diff, theme, &app.scroll),
     }
 }
 
 /// `parent` is the parent task's title; `sessions` the most a task gets, shown once it hands off.
-fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>, sessions: u32) {
+fn summary(
+    f: &mut Frame,
+    area: Rect,
+    t: &Task,
+    parent: Option<String>,
+    sessions: u32,
+    scroll: &Cell<u16>,
+) {
     let label = GROUPS
         .iter()
         .find(|(s, _)| *s == t.status)
@@ -1648,7 +1698,12 @@ fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>, sessions
         lines.extend([Line::raw(""), Line::raw("Done when").bold()]);
         lines.extend(t.acceptance.iter().map(|a| Line::raw(format!("- {a}"))));
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    scrolled(
+        f,
+        area,
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        scroll,
+    );
 }
 
 /// A request: its first line, status and ticket, why its lead failed, then the full request;
@@ -1659,6 +1714,7 @@ fn request(
     r: &Request,
     answer: Option<&(String, String, Vec<String>)>,
     theme: &Theme,
+    scroll: &Cell<u16>,
 ) {
     let failed = r.status == Phase::Failed;
     let status = match r.status {
@@ -1687,7 +1743,12 @@ fn request(
         }
         None => lines.extend(r.text.lines().map(|l| Line::raw(l.to_string()).dim())),
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    scrolled(
+        f,
+        area,
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        scroll,
+    );
 }
 
 /// Markdown, lightly: headings bold, fenced code in the shell hue, the rest as written.
@@ -1769,7 +1830,14 @@ fn base64(bytes: &[u8]) -> String {
 
 /// The critic's findings by what became of them, each with its evidence and the worker's or the
 /// human's reply; `cursor` marks the selected one of the actionable (open, disputed, optional).
-fn findings_tab(f: &mut Frame, area: Rect, fs: &Findings, cursor: Option<usize>, theme: &Theme) {
+fn findings_tab(
+    f: &mut Frame,
+    area: Rect,
+    fs: &Findings,
+    cursor: Option<usize>,
+    theme: &Theme,
+    scroll: &Cell<u16>,
+) {
     let mut lines = Vec::new();
     if let Some(e) = &fs.error {
         lines.push(Line::styled(
@@ -1820,18 +1888,30 @@ fn findings_tab(f: &mut Frame, area: Rect, fs: &Findings, cursor: Option<usize>,
     if lines.is_empty() {
         lines.push(Line::raw("No findings yet.").dim());
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    scrolled(
+        f,
+        area,
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        scroll,
+    );
 }
 
 /// One line per tool call, following the tail: edits in the accent, shell commands in a
 /// second hue, reads dim, nudges amber.
-fn activity_tab(f: &mut Frame, area: Rect, calls: &[(String, String)], theme: &Theme) {
+fn activity_tab(
+    f: &mut Frame,
+    area: Rect,
+    calls: &[(String, String)],
+    theme: &Theme,
+    scroll: &Cell<u16>,
+) {
     if calls.is_empty() {
         f.render_widget(Line::raw("No tool calls yet.").dim(), area);
         return;
     }
     let width = area.width as usize;
-    let shown = &calls[calls.len().saturating_sub(area.height as usize)..];
+    let end = calls.len() - from_tail(calls.len(), area.height, scroll);
+    let shown = &calls[end.saturating_sub(area.height as usize)..end];
     let lines = shown.iter().map(|(tool, target)| {
         let (verb, style) = match tool.as_str() {
             "Edit" | "NotebookEdit" => ("edit", Style::new().fg(theme.accent)),
@@ -1858,7 +1938,7 @@ fn activity_tab(f: &mut Frame, area: Rect, calls: &[(String, String)], theme: &T
 }
 
 /// The checks as a table, then the tail of each failing step's output from the gate log.
-fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme) {
+fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scroll: &Cell<u16>) {
     let Some(checks) = &t.gate else {
         f.render_widget(Line::raw("The gate hasn't run yet.").dim(), area);
         return;
@@ -1889,12 +1969,19 @@ fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme) {
             lines.extend(body.lines().map(|l| Line::raw(l.to_string())));
         }
     }
+    lines.truncate(lines.len() - from_tail(lines.len(), output.height, scroll));
     let skip = lines.len().saturating_sub(output.height as usize);
     f.render_widget(Paragraph::new(lines.split_off(skip)), output);
 }
 
 /// git-style `+`/`-` counts with bars scaled to the largest change.
-fn diff_tab(f: &mut Frame, area: Rect, files: &[(String, u64, u64)], theme: &Theme) {
+fn diff_tab(
+    f: &mut Frame,
+    area: Rect,
+    files: &[(String, u64, u64)],
+    theme: &Theme,
+    scroll: &Cell<u16>,
+) {
     if files.is_empty() {
         f.render_widget(Line::raw("No changes yet.").dim(), area);
         return;
@@ -1920,7 +2007,7 @@ fn diff_tab(f: &mut Frame, area: Rect, files: &[(String, u64, u64)], theme: &The
     lines.push(Line::raw(""));
     let total = format!("{} files changed, +{added} -{deleted}", files.len());
     lines.push(Line::raw(total).dim());
-    f.render_widget(Paragraph::new(lines), area);
+    scrolled(f, area, Paragraph::new(lines), scroll);
 }
 
 fn help(f: &mut Frame, theme: &Theme) {
@@ -2031,6 +2118,7 @@ mod tests {
             commits: Vec::new(),
             commit: 0,
             interactive: None,
+            scroll: Cell::new(0),
             findings: Findings::default(),
             finding: 0,
             disputed: Vec::new(),
@@ -2082,6 +2170,56 @@ mod tests {
                 "╰──────────────────────────────────────────────────────────╯",
                 " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR",
             ]
+        );
+    }
+
+    #[test]
+    fn scrolling_the_detail_pane() {
+        let (mut app, _) = app();
+        let body: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        app.tasks[0].0.summary = Some(body.join("\n"));
+        app.detail = true;
+        let draw_rows = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+            let theme = Theme::new(false, false);
+            term.draw(|f| draw(f, app, &theme, 0, SystemTime::UNIX_EPOCH))
+                .unwrap();
+            screen(&term)
+        };
+        let shows =
+            |rows: &[String], text: &str| rows.iter().any(|r| r.contains(&format!("│ {text} ")));
+        let press = |app: &mut App, code, mods| app.key(KeyEvent::new(code, mods));
+        assert!(shows(&draw_rows(&app), "line 1"));
+
+        // page down, then far past the end: the last page stays in view
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        let rows = draw_rows(&app);
+        assert!(
+            !shows(&rows, "line 1") && shows(&rows, "line 10"),
+            "{rows:#?}"
+        );
+        for _ in 0..9 {
+            press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        }
+        let rows = draw_rows(&app);
+        assert!(shows(&rows, "line 30"), "{rows:#?}");
+        // clamped, so one step back moves at once
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(!shows(&draw_rows(&app), "line 30"));
+
+        // Activity counts from its tail: scrolling up shows older calls
+        press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(app.scroll.get(), 0, "a new tab starts at the top");
+        app.activity = (1..=30)
+            .map(|i| ("Read".into(), format!("f{i}.rs")))
+            .collect();
+        let newest = |rows: &[String]| rows.iter().any(|r| r.contains("f30.rs"));
+        assert!(newest(&draw_rows(&app)));
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        let rows = draw_rows(&app);
+        assert!(
+            !newest(&rows) && rows.iter().any(|r| r.contains("f20.rs")),
+            "{rows:#?}"
         );
     }
 
@@ -2401,7 +2539,7 @@ mod tests {
                 "│                                           ││ It panics in the retry loop.                        │",
                 "│ Failed                                    ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  t retry  x discard  ? help  q quit                                 ",
+                " n new task  j/k move  tab pane  t retry  x discard  ? help  q quit  pgup/pgdn scroll               ",
             ]
         );
         assert!(app.task().is_none());
@@ -2464,7 +2602,7 @@ mod tests {
                 "│                                           ││ - src/task.rs:72                                    │",
                 "│ Running                                   ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  r reply  p plan it  y copy  x discard  ? help  q quit              ",
+                " n new task  j/k move  tab pane  r reply  p plan it  y copy  x discard  ? help  q quit  pgup/pgdn sc",
             ]
         );
 
