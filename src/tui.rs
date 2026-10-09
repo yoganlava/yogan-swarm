@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -205,12 +205,14 @@ impl Settings {
     }
 }
 
-/// Every color and glyph, so a light-terminal or ASCII variant is one swap. Only key chips paint
-/// a background: elsewhere the terminal's own theme shows through.
+/// Every color and glyph, so a light-terminal or ASCII variant is one swap. Only key chips and the
+/// hovered target paint a background: elsewhere the terminal's own theme shows through.
 pub struct Theme {
     accent: Color,
     /// Behind a footer key.
     key: Color,
+    /// Behind the target under the mouse.
+    hover: Color,
     /// Shell commands in Activity.
     shell: Color,
     green: Color,
@@ -244,6 +246,7 @@ impl Theme {
         Theme {
             accent: rgb(122, 162, 247, Color::Blue),
             key: rgb(42, 47, 69, Color::Black),
+            hover: rgb(59, 66, 97, Color::DarkGray),
             shell: rgb(125, 207, 255, Color::Cyan),
             green: rgb(158, 206, 106, Color::Green),
             amber: rgb(224, 175, 104, Color::Yellow),
@@ -369,17 +372,27 @@ struct App {
     last_click: Option<(Position, Instant)>,
     /// Where the last frame drew things, for the mouse.
     hits: RefCell<Hits>,
+    /// The mouse's cell, whose target gets a tint and its hint in its pane's bottom border.
+    hover: Option<Position>,
 }
 
 /// A file `e` edits, as (task id, whether it's the PR draft, path).
 type Edit = (String, bool, PathBuf);
 
-/// The list and detail panes, for the wheel, and each clickable rect in drawing order.
+/// The list and detail panes, for the wheel, and each clickable rect with its hover hint, in
+/// drawing order.
 #[derive(Default)]
 struct Hits {
     list: Rect,
     detail: Rect,
-    targets: Vec<(Rect, Target)>,
+    targets: Vec<(Rect, Target, String)>,
+}
+
+impl Hits {
+    /// The topmost target at `p`.
+    fn at(&self, p: Position) -> Option<&(Rect, Target, String)> {
+        self.targets.iter().rev().find(|(r, ..)| r.contains(p))
+    }
 }
 
 /// What a click does: press a key, or select a list row or dismiss the info toast, which have
@@ -508,6 +521,7 @@ pub fn run(repo: &Path) -> Result<()> {
         zoom: false,
         last_click: None,
         hits: RefCell::default(),
+        hover: None,
     };
     let theme = Theme::detect();
     let mouse = config::load(repo).is_ok_and(|c| c.tui.mouse);
@@ -543,14 +557,22 @@ pub fn run(repo: &Path) -> Result<()> {
             }
             let running = app.tasks.iter().any(|(t, _)| running(t));
             let wait = Duration::from_millis(if running { 125 } else { 250 });
-            if event::poll(wait)? {
+            let until = Instant::now() + wait;
+            while event::poll(until.saturating_duration_since(Instant::now()))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press && !app.key(key) => {
                         return Ok(());
                     }
+                    // a move that keeps the same hovered target doesn't redraw
+                    Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                        if !app.hover(Position::new(m.column, m.row)) {
+                            continue;
+                        }
+                    }
                     Event::Mouse(m) if !app.mouse(m) => return Ok(()),
                     _ => {}
                 }
+                break;
             }
             if let Some((dir, base, path)) = app.pager.take() {
                 restore(mouse);
@@ -1504,6 +1526,16 @@ impl App {
         ])
     }
 
+    /// Moves the hover to `at`; true when that changes the hovered target, which needs a redraw.
+    fn hover(&mut self, at: Position) -> bool {
+        let hits = self.hits.borrow();
+        let rect = |p: Option<Position>| p.and_then(|p| hits.at(p)).map(|(r, ..)| *r);
+        let changed = rect(self.hover) != rect(Some(at));
+        drop(hits);
+        self.hover = Some(at);
+        changed
+    }
+
     /// A click presses the key of the target under it or selects its row; the wheel scrolls the
     /// detail pane or moves through the list. Returns false to quit.
     fn mouse(&mut self, m: MouseEvent) -> bool {
@@ -1513,11 +1545,10 @@ impl App {
         let at = Position::new(m.column, m.row);
         let (in_list, in_detail, hit) = {
             let hits = self.hits.borrow();
-            let hit = hits.targets.iter().rev().find(|(r, _)| r.contains(at));
             (
                 hits.list.contains(at),
                 hits.detail.contains(at),
-                hit.map(|(_, t)| *t),
+                hits.at(at).map(|(_, t, _)| *t),
             )
         };
         let before = self.selected;
@@ -2011,7 +2042,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             for k in &keys {
                 let w = Line::from(chip(k).to_vec()).width() as u16;
                 let rect = Rect::new(x, footer.y, w, 1).intersection(footer);
-                let target = key_of(k.0).map(|key| (rect, Target::Key(key)));
+                let hint = format!("{} · {}", k.0, k.1);
+                let target = key_of(k.0).map(|key| (rect, Target::Key(key), hint));
                 app.hits.borrow_mut().targets.extend(target);
                 x = x.saturating_add(w);
             }
@@ -2068,8 +2100,12 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             ];
             let w = Line::from(button[..2].to_vec()).width() as u16;
             let rect = Rect::new(x, buttons.y, w, 1).intersection(buttons);
+            let hint = format!("{key} · {label}");
             let key = KeyEvent::new(code, KeyModifiers::NONE);
-            app.hits.borrow_mut().targets.push((rect, Target::Key(key)));
+            app.hits
+                .borrow_mut()
+                .targets
+                .push((rect, Target::Key(key), hint));
             x = x.saturating_add(w + 3);
             row.extend(button);
         }
@@ -2132,11 +2168,29 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             .padding(Padding::horizontal(1));
         f.render_widget(Clear, area);
         f.render_widget(para.block(block), area);
-        let target = match err {
-            true => Target::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            false => Target::Info,
+        let (target, hint) = match err {
+            true => (
+                Target::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                "esc",
+            ),
+            false => (Target::Info, "click"),
         };
-        app.hits.borrow_mut().targets.push((area, target));
+        let hint = format!("{hint} · dismiss");
+        app.hits.borrow_mut().targets.push((area, target, hint));
+    }
+    // the hovered target gets a tint, and its hint in the bottom border of its pane
+    let hits = app.hits.borrow();
+    if let Some(at) = app.hover
+        && let Some((rect, _, hint)) = hits.at(at)
+    {
+        f.buffer_mut()
+            .set_style(*rect, Style::new().bg(theme.hover));
+        let pane = [hits.list, hits.detail]
+            .into_iter()
+            .find(|p| p.contains(at));
+        let hint = Line::styled(format!(" {hint} "), theme.accent).right_aligned();
+        let area = pane.unwrap_or(body).inner(Margin::new(1, 0));
+        f.render_widget(Block::new().title_bottom(hint), area);
     }
 }
 
@@ -2398,9 +2452,10 @@ fn list(
             Rect {
                 y,
                 height: 1,
-                ..area
+                ..inner
             },
             Target::Row(i?),
+            "click select · double-click zoom".into(),
         ))
     });
     hits.targets.extend(rows);
@@ -2490,9 +2545,9 @@ fn row_line(
 fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     app.hits.borrow_mut().detail = area;
     let compact = f.area().height < COMPACT;
-    let (label, key) = match app.zoom {
-        true => (" esc unzoom ", KeyCode::Esc),
-        false => (" z zoom ", KeyCode::Char('z')),
+    let (label, key, hint) = match app.zoom {
+        true => (" esc unzoom ", KeyCode::Esc, "esc · unzoom"),
+        false => (" z zoom ", KeyCode::Char('z'), "z · zoom"),
     };
     let block = pane("Task", focused, theme).title(Line::raw(label).dim().right_aligned());
     let inner = block.inner(area);
@@ -2500,7 +2555,10 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     let w = label.width() as u16;
     let rect = Rect::new(area.right().saturating_sub(w + 1), area.y, w, 1).intersection(area);
     let target = Target::Key(KeyEvent::new(key, KeyModifiers::NONE));
-    app.hits.borrow_mut().targets.push((rect, target));
+    app.hits
+        .borrow_mut()
+        .targets
+        .push((rect, target, hint.into()));
     let Some((t, _)) = app.task() else {
         match app.request() {
             Some(r) => request(f, inner, r, app.answer.as_ref(), theme, &app.scroll),
@@ -2528,10 +2586,8 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     };
     // each tab's name presses its digit; compact's one name presses the next tab's
     let digit = |i: usize| {
-        Target::Key(KeyEvent::new(
-            KeyCode::Char((b'1' + i as u8) as char),
-            KeyModifiers::NONE,
-        ))
+        let key = KeyEvent::new(KeyCode::Char((b'1' + i as u8) as char), KeyModifiers::NONE);
+        (Target::Key(key), format!("{} · {}", i + 1, TABS[i]))
     };
     let mut hits = app.hits.borrow_mut();
     if compact {
@@ -2540,13 +2596,15 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
             ..tabs
         }
         .intersection(tabs);
-        hits.targets.push((rect, digit((app.tab + 1) % TABS.len())));
+        let (target, hint) = digit((app.tab + 1) % TABS.len());
+        hits.targets.push((rect, target, hint));
     } else {
         let mut x = tabs.x;
         for (i, name) in TABS.iter().enumerate() {
             let w = name.width() as u16;
-            hits.targets
-                .push((Rect::new(x, tabs.y, w, 1).intersection(tabs), digit(i)));
+            let (target, hint) = digit(i);
+            let rect = Rect::new(x, tabs.y, w, 1).intersection(tabs);
+            hits.targets.push((rect, target, hint));
             x = x.saturating_add(w + 2);
         }
     }
@@ -3123,6 +3181,7 @@ mod tests {
             zoom: false,
             last_click: None,
             hits: RefCell::default(),
+            hover: None,
         };
         (app, now)
     }
@@ -4333,6 +4392,78 @@ mod tests {
         assert!(click(&mut app, " y  Dismiss") && !app.confirm && app.notice.is_none());
         assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Dismissed);
         fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn hover_shows_the_key() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let at = |term: &Terminal<TestBackend>, text: &str| {
+            let rows = screen(term);
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(text))
+                .unwrap();
+            Position::new(
+                row[..row.find(text).unwrap()].chars().count() as u16,
+                y as u16,
+            )
+        };
+        let border = |term: &Terminal<TestBackend>| screen(term)[22].clone();
+
+        // a move over a tab sets the hint, one within it changes nothing, empty space clears it
+        let gate = at(&term, "Gate  Findings");
+        assert!(app.hover(gate));
+        assert!(!app.hover(Position {
+            x: gate.x + 1,
+            ..gate
+        }));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(border(&term).ends_with("─ 3 · Gate ╯"), "{}", border(&term));
+        assert!(app.hover(Position::new(70, 8)));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(!border(&term).contains('·'));
+
+        // a footer key: tinted, and named in the bottom border above it
+        let m = at(&term, " m  open PR");
+        assert!(app.hover(m));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff  Run        │",
+                "│ ▌ ✓ Reject negative max_delay          4m ││                                                     │",
+                "│                                           ││ Reject negative max_delay                           │",
+                "│ Failed                                    ││ Review · u/reject-negative · slot 1 · opus/high     │",
+                "│   ✗ Bump sqlx to 0.9                   1h ││                                                     │",
+                "│                                           ││ max_delay below zero now fails at parse time.       │",
+                "│ Running                                   ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││                                                     │",
+                "│                                           ││                                                     │",
+                "│ Queued                                    ││                                                     │",
+                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰──────────────────────────────────────── m · open PR ╯",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+            ]
+        );
+        let buf = term.backend().buffer();
+        assert_eq!(buf[m].bg, theme.hover);
+        assert_eq!(buf[(m.x + 11, m.y)].bg, theme.hover);
+        assert_ne!(buf[(m.x + 12, m.y)].bg, theme.hover);
     }
 
     #[test]
