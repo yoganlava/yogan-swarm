@@ -261,6 +261,7 @@ mod tests {
         assert_eq!(cfg.ports.map(|p| p.per_slot), Some(80));
         assert!(cfg.scripts.is_none());
         assert_eq!(cfg.build.max_cargo, 2);
+        assert!(cfg.worker.allowed_tools.contains(&"Edit".to_string()));
         assert_eq!(cfg.watch.stall_after, Duration::from_secs(15 * 60));
         let bad = table("[watch]\nstall_after = \"15 min\"");
         assert!(layered(bad, None).is_err());
