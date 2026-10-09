@@ -13,7 +13,7 @@ pub struct Config {
     #[serde(default)]
     pub branch_prefix: String,
     pub lead: Role,
-    pub ask: Role,
+    pub ask: Ask,
     pub pr: Pr,
     pub critic: Critic,
     pub worker: Worker,
@@ -98,6 +98,14 @@ pub struct Cargo {
 pub struct Role {
     pub model: String,
     pub effort: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Ask {
+    pub model: String,
+    pub effort: String,
+    /// Questions answering at once; they take no slot.
+    pub concurrency: u32,
 }
 
 /// Slot `n` gets ports `base + n * per_slot` onwards.

@@ -2,7 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, ensure};
@@ -24,11 +24,23 @@ pub enum Phase {
     Dismissed,
 }
 
+/// Auto lets the lead plan or answer; Plan always plans; Ask always answers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Auto,
+    Plan,
+    Ask,
+}
+
 /// One compose submission, saved as `requests/<id>.toml`.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub mode: Mode,
     /// Carried to every task the lead files for it.
     pub ticket: Option<String>,
     pub status: Phase,
@@ -53,6 +65,14 @@ observable behaviour (\"a negative max_delay is rejected at parse time\", not \"
 config\"). It prints the new task's id.
 - End with a short summary of the plan.";
 
+const AUTO: &str = "\
+- If the request asks for information rather than a change, answer it instead: file no tasks, \
+and write the answer in Markdown, citing the files it relies on as path:line.";
+
+const ASK: &str = "\
+You are yogan's lead, answering a question about this repo; never edit code. Answer in \
+Markdown, citing the files you rely on as path:line.";
+
 impl Request {
     pub fn save(&self, dir: &Path) -> Result<()> {
         task::write_toml(&dir.join("requests"), &self.id, self)
@@ -70,7 +90,16 @@ pub fn load(dir: &Path, id: &str) -> Result<Request> {
 }
 
 /// Saves `text` as a new request and starts `yogan lead <id>` detached in `repo`.
-pub fn submit(repo: &Path, state: &Path, text: &str, ticket: Option<String>) -> Result<Request> {
+pub fn submit(
+    repo: &Path,
+    state: &Path,
+    text: &str,
+    ticket: Option<String>,
+    mode: Mode,
+) -> Result<Request> {
+    if mode == Mode::Ask {
+        check_room(repo, state)?;
+    }
     let mut id = task::now_id("r");
     while state.join(format!("requests/{id}.toml")).exists() {
         id.push('a'); // two submits in one second
@@ -79,6 +108,7 @@ pub fn submit(repo: &Path, state: &Path, text: &str, ticket: Option<String>) -> 
         id,
         text: text.into(),
         ticket,
+        mode,
         ..Default::default()
     };
     req.save(state)?;
@@ -133,6 +163,41 @@ pub fn reply(state: &Path, id: &str, feedback: &str) -> Result<String> {
     Ok(prompt)
 }
 
+/// Errs when `[ask] concurrency` questions are already being answered.
+fn check_room(repo: &Path, state: &Path) -> Result<()> {
+    room(
+        &load_all(state)?,
+        config::load(repo)?.ask.concurrency as usize,
+    )
+}
+
+fn room(requests: &[Request], limit: usize) -> Result<()> {
+    let asking = requests
+        .iter()
+        .filter(|r| r.mode == Mode::Ask && r.status == Phase::Planning)
+        .count();
+    ensure!(
+        asking < limit,
+        "{asking} questions are being answered already ([ask] concurrency); try again shortly"
+    );
+    Ok(())
+}
+
+/// Readies answered request `id` to take a follow-up, which resumes its session.
+pub fn follow_up(repo: &Path, state: &Path, id: &str) -> Result<()> {
+    let mut req = load(state, id)?;
+    ensure!(
+        req.status == Phase::Done && req.session.is_some(),
+        "only an answered question takes a follow-up"
+    );
+    if req.mode == Mode::Ask {
+        check_room(repo, state)?;
+    }
+    req.status = Phase::Planning;
+    (req.summary, req.pid) = (None, None);
+    req.save(state)
+}
+
 /// Readies failed request `id` for another run. Returns the prompt that resumes its session,
 /// or `None` to plan afresh when it never got one.
 pub fn retry(state: &Path, id: &str) -> Result<Option<String>> {
@@ -145,7 +210,8 @@ pub fn retry(state: &Path, id: &str) -> Result<Option<String>> {
     req.status = Phase::Planning;
     req.pid = None;
     req.save(state)?;
-    if req.session.is_none() {
+    // a question just asks again; the resume prompt is about filing tasks
+    if req.session.is_none() || req.mode == Mode::Ask {
         return Ok(None);
     }
     let filed: Vec<_> = task::load_all(state)?
@@ -183,16 +249,56 @@ pub fn run(repo: &Path, id: &str, reply: Option<&str>) -> Result<()> {
         req.summary = Some(format!("{e:#}"));
     }
     req.save(&state)?;
-    res
+    res?;
+    save_answer(&state, &req, reply)
+}
+
+pub fn answer_path(state: &Path, id: &str) -> PathBuf {
+    state.join(format!("answers/{id}.md"))
+}
+
+/// Saves the lead's final message to `answers/<id>.md` when it answered rather than planned;
+/// a follow-up's answer goes under its question.
+fn save_answer(state: &Path, req: &Request, reply: Option<&str>) -> Result<()> {
+    let planned = task::load_all(state)?.iter().any(|t| t.plan == req.id);
+    let (Some(answer), false) = (&req.summary, planned || req.mode == Mode::Plan) else {
+        return Ok(());
+    };
+    let path = answer_path(state, &req.id);
+    fs::create_dir_all(state.join("answers"))?;
+    match reply {
+        Some(question) if path.exists() => {
+            let mut file = File::options().append(true).open(&path)?;
+            write!(file, "\n---\n\n**{}**\n\n{answer}\n", question.trim())?;
+        }
+        _ => fs::write(&path, format!("{answer}\n"))?,
+    }
+    Ok(())
 }
 
 fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Result<()> {
     let cfg = config::load(repo)?;
-    let (lead, w) = (&cfg.lead, &cfg.worker);
-    worker::check_effort(&lead.effort)?;
+    let w = &cfg.worker;
+    let ask = req.mode == Mode::Ask;
+    let (model, effort) = match ask {
+        true => (&cfg.ask.model, &cfg.ask.effort),
+        false => (&cfg.lead.model, &cfg.lead.effort),
+    };
+    worker::check_effort(effort)?;
     let read = ["Read", "Grep", "Glob"].map(String::from);
-    let propose = ["Bash(yogan task propose:*)".to_string()];
-    let allowed = [&read[..], &w.read_tools[..], &propose].concat();
+    // a question researches instead of filing tasks
+    let extra = match ask {
+        true => vec!["WebSearch".to_string(), "WebFetch".to_string()],
+        false => vec!["Bash(yogan task propose:*)".to_string()],
+    };
+    let allowed = [&read[..], &w.read_tools[..], &extra].concat();
+    let mut deny = vec!["Edit", "Write", "NotebookEdit"];
+    deny.extend(ask.then_some("Bash"));
+    let rules = match req.mode {
+        Mode::Ask => ASK.to_string(),
+        Mode::Plan => RULES.to_string(),
+        Mode::Auto => format!("{RULES}\n{AUTO}"),
+    };
     // the lead calls this binary as `yogan`
     let exe = std::env::current_exe()?;
     let bin = exe.parent().context("yogan has no directory")?;
@@ -211,7 +317,7 @@ fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Re
     let prompt = reply.unwrap_or(&req.text);
     cmd.args(["-p", prompt, "--output-format", "stream-json", "--verbose"])
         .args(["--setting-sources", "project", "--strict-mcp-config"])
-        .args(["--model", &lead.model, "--effort", &lead.effort]);
+        .args(["--model", model, "--effort", effort]);
     if let Some(file) = &w.mcp_config {
         cmd.args(["--mcp-config", file]);
     }
@@ -224,8 +330,9 @@ fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Re
     let mut claude = cmd
         .arg("--allowedTools")
         .args(&allowed)
-        .args(["--disallowedTools", "Edit", "Write", "NotebookEdit"])
-        .args(["--append-system-prompt", RULES])
+        .arg("--disallowedTools")
+        .args(&deny)
+        .args(["--append-system-prompt", &rules])
         .current_dir(repo)
         .env_remove("CLAUDE_CODE_EFFORT_LEVEL") // it would override --effort
         .env("PATH", path)
@@ -260,4 +367,27 @@ fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Re
     let _ = stderr.join();
     ensure!(status.success(), "claude exited with {status}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn questions_have_their_own_limit() {
+        let req = |mode, status| Request {
+            mode,
+            status,
+            ..Default::default()
+        };
+        let mut requests = vec![
+            req(Mode::Ask, Phase::Planning),
+            req(Mode::Ask, Phase::Done),
+            req(Mode::Plan, Phase::Planning),
+        ];
+        assert!(room(&requests, 2).is_ok());
+        requests.push(req(Mode::Ask, Phase::Planning));
+        let err = room(&requests, 2).unwrap_err().to_string();
+        assert!(err.contains("[ask] concurrency"), "{err}");
+    }
 }

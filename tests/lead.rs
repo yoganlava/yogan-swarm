@@ -2,17 +2,22 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use yogan_swarm::lead::{self, Phase, Request};
+use yogan_swarm::lead::{self, Mode, Phase, Request};
 use yogan_swarm::task::{self, Status};
 
 /// Stand-in for Claude: records its args, then files one task through `yogan` on its PATH, a
 /// revised one when resumed. A request of `fail` exits 1, and `die` exits 1 after starting its
-/// session.
+/// session. Asked a question (it has WebSearch), it answers and files nothing.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$YOGAN_DIR/claude.args"
 [ "$2" = fail ] && exit 1
 echo '{"type":"system","subtype":"init","session_id":"s-lead","model":"m","tools":[],"mcp_servers":[]}'
 [ "$2" = die ] && exit 1
+answer="See src/lib.rs:1 for it."
+case "$*" in *--resume*) answer="Because." ;; esac
+case "$*" in *WebSearch*)
+  echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1,"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1},"permission_denials":[],"result":"'"$answer"'"}'
+  exit 0 ;; esac
 title="Reject negative max_delay"
 case "$*" in *--resume*) title="Reject negative max_delay and min_delay" ;; esac
 id=$(yogan task propose --title "$title" --crates ledger \
@@ -53,18 +58,19 @@ fn lead_files_proposals() {
             .success();
         (ok, lead::load(&state, args[0]).unwrap())
     };
-    let lead = |id: &str, text: &str| {
+    let lead = |id: &str, text: &str, mode| {
         let req = Request {
             id: id.into(),
             text: text.into(),
             ticket: Some("CC-687".into()),
+            mode,
             ..Default::default()
         };
         req.save(&state).unwrap();
         yogan(&[id])
     };
 
-    let (ok, r1) = lead("r1", "Reject a negative max_delay");
+    let (ok, r1) = lead("r1", "Reject a negative max_delay", Mode::Auto);
     assert!(ok);
     assert_eq!(r1.status, Phase::Done);
     assert_eq!(r1.session.as_deref(), Some("s-lead"));
@@ -79,6 +85,10 @@ fn lead_files_proposals() {
     );
     assert_eq!(t.crates, ["ledger"]);
     assert_eq!(t.branch, "reject-negative-max-delay");
+    assert!(
+        !lead::answer_path(&state, "r1").exists(),
+        "it planned, so no answer"
+    );
 
     let args = fs::read_to_string(state.join("claude.args")).unwrap();
     for want in [
@@ -109,7 +119,7 @@ fn lead_files_proposals() {
         Status::Proposed
     );
 
-    let (ok, r2) = lead("r2", "fail");
+    let (ok, r2) = lead("r2", "fail", Mode::Plan);
     assert!(!ok);
     assert_eq!(r2.status, Phase::Failed);
     assert!(r2.summary.unwrap().contains("claude exited"));
@@ -121,7 +131,7 @@ fn lead_files_proposals() {
     assert_eq!(again.to_string(), "only a failed request can be retried");
 
     // one that died mid-session resumes it, told why it stopped, and files its proposals
-    let (ok, r3) = lead("r3", "die");
+    let (ok, r3) = lead("r3", "die", Mode::Plan);
     assert!(!ok);
     assert_eq!(
         (r3.status, r3.session.as_deref()),
@@ -140,6 +150,37 @@ fn lead_files_proposals() {
         filed
             .iter()
             .any(|t| t.plan == "r3" && t.status == Status::Proposed)
+    );
+
+    // Ask: the [ask] model researches, can't run Bash or file tasks, and its answer is kept
+    let (ok, r4) = lead("r4", "How are tasks saved?", Mode::Ask);
+    assert!(ok);
+    assert_eq!(r4.status, Phase::Done);
+    let answer = || fs::read_to_string(lead::answer_path(&state, "r4")).unwrap();
+    assert_eq!(answer(), "See src/lib.rs:1 for it.\n");
+    let tasks = task::load_all(&state).unwrap();
+    assert!(
+        !tasks.iter().any(|t| t.plan == "r4"),
+        "a question files no tasks"
+    );
+    let args = fs::read_to_string(state.join("claude.args")).unwrap();
+    for want in [
+        "--model\nclaude-opus-5-5\n--effort\nhigh\n",
+        "--allowedTools\nRead\nGrep\nGlob\nWebSearch\nWebFetch\n",
+        "--disallowedTools\nEdit\nWrite\nNotebookEdit\nBash\n",
+    ] {
+        assert!(args.contains(want), "{want:?} not in {args}");
+    }
+    assert!(!args.contains("yogan task propose"), "{args}");
+
+    // r: a follow-up resumes the session, and its answer goes under the question
+    lead::follow_up(&repo, &state, "r4").unwrap();
+    let (ok, r4) = yogan(&["r4", "--reply", "- and why?"]);
+    assert!(ok);
+    assert_eq!(r4.status, Phase::Done);
+    assert_eq!(
+        answer(),
+        "See src/lib.rs:1 for it.\n\n---\n\n**- and why?**\n\nBecause.\n"
     );
 
     fs::remove_dir_all(&root).unwrap();

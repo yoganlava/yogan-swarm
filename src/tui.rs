@@ -2,9 +2,9 @@
 //! the state directory; workers run detached, so closing it changes nothing.
 
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -16,12 +16,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
+use regex::Regex;
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::lead::{self, Phase, Request};
+use crate::lead::{self, Mode, Phase, Request};
 use crate::stream::{self, Content};
 use crate::task::{self, Status, Task};
 use crate::{config, git, pr, sched, slot, worker};
@@ -39,7 +40,7 @@ const GROUPS: [(Status, &str); 7] = [
 
 const TABS: [&str; 4] = ["Summary", "Activity", "Gate", "Diff"];
 
-const KEYS: [(&str, &str); 14] = [
+const KEYS: [(&str, &str); 16] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -51,6 +52,8 @@ const KEYS: [(&str, &str); 14] = [
     ("e", "edit"),
     ("r", "reply"),
     ("t", "retry"),
+    ("p", "plan it"),
+    ("y", "copy"),
     ("x", "discard"),
     ("?", "help"),
     ("q", "quit"),
@@ -168,14 +171,24 @@ struct App {
     edit: bool,
     /// The reply to the selected proposal's lead, while it's being typed.
     reply: Option<TextArea<'static>>,
+    /// The selected question's id, answer and the repo files the answer cites.
+    answer: Option<(String, String, Vec<String>)>,
 }
 
 /// The `n` screen: a request for the lead, and an optional ticket.
 struct Compose {
     request: TextArea<'static>,
     ticket: TextArea<'static>,
-    on_ticket: bool,
+    mode: Mode,
+    /// The focused field: request, ticket, then mode.
+    focus: usize,
 }
+
+const MODES: [(Mode, &str); 3] = [
+    (Mode::Auto, "Auto"),
+    (Mode::Plan, "Plan"),
+    (Mode::Ask, "Ask"),
+];
 
 /// An empty input with a placeholder and no cursor-line underline.
 fn field(placeholder: &str) -> TextArea<'static> {
@@ -186,11 +199,14 @@ fn field(placeholder: &str) -> TextArea<'static> {
 }
 
 impl Compose {
-    fn new() -> Compose {
+    fn new(mode: Mode, text: &str) -> Compose {
+        let mut request = field("Ask a question, or describe a change for the lead to plan");
+        request.insert_str(text);
         Compose {
-            request: field("What should the lead plan?"),
+            request,
             ticket: field("e.g. CC-687"),
-            on_ticket: false,
+            mode,
+            focus: 0,
         }
     }
 }
@@ -224,6 +240,7 @@ pub fn run(repo: &Path) -> Result<()> {
         instruction: None,
         edit: false,
         reply: None,
+        answer: None,
     };
     let theme = Theme::detect();
     let mut terminal = ratatui::init();
@@ -410,8 +427,14 @@ impl App {
             None => self.task().map(|(t, _)| t.id.clone()),
         };
         let mut requests = lead::load_all(state)?;
-        requests.retain(|r| matches!(r.status, Phase::Planning | Phase::Failed));
-        requests.sort_by(|a, b| a.id.cmp(&b.id));
+        let answered = |r: &Request| lead::answer_path(state, &r.id).exists();
+        requests.retain(|r| match r.status {
+            Phase::Planning | Phase::Failed => true,
+            Phase::Done => answered(r),
+            Phase::Dismissed => false,
+        });
+        // planning and failed first, then the questions
+        requests.sort_by_key(|r| (r.status == Phase::Done, r.id.clone()));
         self.requests = requests;
         let rank = |s: Status| GROUPS.iter().position(|(g, _)| *g == s);
         let tasks: Vec<_> = task::load_all(state)?
@@ -465,14 +488,20 @@ impl App {
         if let Some(c) = &mut self.compose {
             match key.code {
                 KeyCode::Esc => self.compose = None,
-                KeyCode::Tab => c.on_ticket = !c.on_ticket,
+                KeyCode::Tab => c.focus = (c.focus + 1) % 3,
                 _ if ctrl('s') => {
                     if let Err(e) = self.submit() {
                         self.notice = Some(format!("{e:#}"));
                     }
                 }
-                KeyCode::Enter if c.on_ticket => {}
-                _ if c.on_ticket => _ = c.ticket.input(key),
+                KeyCode::Left | KeyCode::Right if c.focus == 2 => {
+                    let i = MODES.iter().position(|(m, _)| *m == c.mode).unwrap_or(0);
+                    let step = if key.code == KeyCode::Right { 1 } else { 2 };
+                    c.mode = MODES[(i + step) % 3].0;
+                }
+                _ if c.focus == 2 => {}
+                KeyCode::Enter if c.focus == 1 => {}
+                _ if c.focus == 1 => _ = c.ticket.input(key),
                 _ => _ = c.request.input(key),
             }
             return true;
@@ -541,15 +570,29 @@ impl App {
             .task()
             .is_some_and(|(t, _)| t.status == Status::Proposed);
         let failed = self.request().is_some_and(|r| r.status == Phase::Failed);
+        let answered = self.request().is_some_and(|r| r.status == Phase::Done);
         match key.code {
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('n') => self.compose = Some(Compose::new()),
+            KeyCode::Char('n') => self.compose = Some(Compose::new(Mode::Auto, "")),
+            KeyCode::Char('p') if answered => {
+                let (r, answer) = (self.request(), self.answer.as_ref());
+                let (question, answer) = (r.map_or("", |r| &r.text), answer.map_or("", |a| &a.1));
+                let text = format!("{question}\n\nThe answer to build on:\n\n{answer}");
+                self.compose = Some(Compose::new(Mode::Plan, &text));
+            }
+            KeyCode::Char('y') if answered => {
+                let answer = self.answer.as_ref().map_or("", |a| &a.1);
+                match copy(answer) {
+                    Ok(()) => self.info = Some("copied the answer".into()),
+                    Err(e) => self.notice = Some(format!("{e:#}")),
+                }
+            }
             KeyCode::Char(c @ '1'..='4') => self.tab = c as usize - '1' as usize,
             KeyCode::Char('d') => match self.slot_dir() {
                 Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default())),
                 None => self.notice = Some("this task has no worktree".into()),
             },
-            KeyCode::Char('x') => self.confirm = self.task().is_some() || failed,
+            KeyCode::Char('x') => self.confirm = self.task().is_some() || failed || answered,
             KeyCode::Char('t') if failed => {
                 if let Err(e) = self.retry() {
                     self.notice = Some(format!("{e:#}"));
@@ -569,6 +612,7 @@ impl App {
             KeyCode::Char('r') if proposed => {
                 self.reply = Some(field("What should the lead change?"));
             }
+            KeyCode::Char('r') if answered => self.reply = Some(field("Ask a follow-up")),
             KeyCode::Down | KeyCode::Char('j') => {
                 let rows = self.requests.len() + self.tasks.len();
                 self.selected = (self.selected + 1).min(rows.saturating_sub(1));
@@ -590,6 +634,16 @@ impl App {
     /// Reads what the current tab shows for the selected task. The gate log and diff are
     /// re-read only when the task's file changes; the activity tail every time.
     fn load_tab(&mut self) {
+        let question = self.request().filter(|r| r.status == Phase::Done);
+        let id = question.map(|r| r.id.clone());
+        if id.is_none() {
+            self.answer = None;
+        } else if self.answer.as_ref().map(|a| &a.0) != id.as_ref() {
+            let id = id.unwrap_or_default();
+            let text = fs::read_to_string(lead::answer_path(&self.state, &id)).unwrap_or_default();
+            let cited = cites(&self.repo, &text);
+            self.answer = Some((id, text, cited));
+        }
         let Some((id, since)) = self.task().map(|(t, since)| (t.id.clone(), *since)) else {
             return;
         };
@@ -800,6 +854,13 @@ impl App {
     /// Sends `text` to the selected proposal's lead, which refiles its revised plan.
     fn send_reply(&mut self, text: &str) -> Result<()> {
         ensure!(!text.trim().is_empty(), "write a reply first");
+        if let Some(r) = self.request() {
+            let id = r.id.clone();
+            lead::follow_up(&self.repo, &self.state, &id)?;
+            lead::spawn(&self.repo, &id, Some(text.trim()))?;
+            self.info = Some("the lead is answering the follow-up".into());
+            return Ok(());
+        }
         let (t, _) = self.task().context("no task selected")?;
         ensure!(
             t.status == Status::Proposed && !t.plan.is_empty(),
@@ -818,9 +879,13 @@ impl App {
         ensure!(!request.trim().is_empty(), "write a request first");
         let ticket = c.ticket.lines().join("").trim().to_string();
         let ticket = (!ticket.is_empty()).then_some(ticket);
-        lead::submit(&self.repo, &self.state, request.trim(), ticket)?;
+        let mode = c.mode;
+        lead::submit(&self.repo, &self.state, request.trim(), ticket, mode)?;
         self.compose = None;
-        self.info = Some("the lead is planning; its proposals will show up here".into());
+        self.info = Some(match mode {
+            Mode::Ask => "the lead is answering".into(),
+            _ => "the lead is on it; proposals or an answer will show up here".into(),
+        });
         Ok(())
     }
 }
@@ -897,6 +962,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     f.render_widget(header_line(app, theme), header);
     let selected = app.task().map(|(t, _)| t);
     let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
+    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
     let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
         compose(f, body, c, theme);
@@ -928,11 +994,13 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         KEYS.into_iter()
             .filter(|(k, _)| match *k {
                 "d" => selected.is_some_and(|t| t.slot.is_some()),
-                "x" => selected.is_some() || failed,
+                "x" => selected.is_some() || failed || answered,
                 "t" => failed,
+                "p" | "y" => answered,
                 "1-4" => selected.is_some(),
                 "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
-                "a" | "e" | "r" => selected.is_some_and(|t| t.status == Status::Proposed),
+                "r" => answered || selected.is_some_and(|t| t.status == Status::Proposed),
+                "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
                 "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
                 _ => true,
             })
@@ -1035,11 +1103,25 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
-    let [request, ticket] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(area);
+    let [mode, request, ticket] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Fill(1),
+        Constraint::Length(3),
+    ])
+    .areas(area);
+    let modes = MODES.iter().flat_map(|(m, name)| {
+        let name = match *m == c.mode {
+            true => Span::styled(*name, theme.accent).bold().underlined(),
+            false => Span::raw(*name).dim(),
+        };
+        [name, Span::raw("  ")]
+    });
+    let block = pane("Mode", c.focus == 2, theme);
+    f.render_widget(Line::from(modes.collect::<Vec<_>>()), block.inner(mode));
+    f.render_widget(block, mode);
     for (field, area, title, focused) in [
-        (&c.request, request, "New task", !c.on_ticket),
-        (&c.ticket, ticket, "Ticket", c.on_ticket),
+        (&c.request, request, "Request", c.focus == 0),
+        (&c.ticket, ticket, "Ticket", c.focus == 1),
     ] {
         let block = pane(title, focused, theme);
         f.render_widget(field, block.inner(area));
@@ -1086,19 +1168,32 @@ fn list(
     let block = pane("Tasks", focused, theme);
     let width = block.inner(area).width as usize;
     let (mut items, mut selected, mut i) = (Vec::new(), None, 0);
-    if !app.requests.is_empty() {
-        items.push(ListItem::new(Line::raw("Planning").dim()));
-    }
+    let mut group = None;
     for r in &app.requests {
+        let question = r.status == Phase::Done;
+        if group != Some(question) {
+            if !items.is_empty() {
+                items.push(ListItem::new(""));
+            }
+            let label = if question { "Questions" } else { "Planning" };
+            items.push(ListItem::new(Line::raw(label).dim()));
+            group = Some(question);
+        }
         let sel = i == app.selected;
         if sel {
             selected = Some(items.len());
         }
         let (glyph, right) = match r.status {
             Phase::Failed => (Span::styled(theme.fail, theme.red), "failed"),
+            Phase::Done => (Span::styled(theme.pass, theme.green), "answered"),
             _ => {
                 let spin = theme.spinner[tick % theme.spinner.len()];
-                (Span::styled(spin, theme.accent), "planning")
+                let doing = if r.mode == Mode::Ask {
+                    "answering"
+                } else {
+                    "planning"
+                };
+                (Span::styled(spin, theme.accent), doing)
             }
         };
         let title = r.text.lines().next().unwrap_or_default();
@@ -1202,7 +1297,7 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     f.render_widget(block, area);
     let Some((t, _)) = app.task() else {
         match app.request() {
-            Some(r) => request(f, inner, r, theme),
+            Some(r) => request(f, inner, r, app.answer.as_ref(), theme),
             None => f.render_widget(Line::raw("No tasks yet.").dim(), inner),
         }
         return;
@@ -1271,9 +1366,22 @@ fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>) {
 }
 
 /// A request: its first line, status and ticket, why its lead failed, then the full request.
-fn request(f: &mut Frame, area: Rect, r: &Request, theme: &Theme) {
+/// A request: its first line, status and ticket, why its lead failed, then the full request;
+/// for a question, the answer and the files it cites instead.
+fn request(
+    f: &mut Frame,
+    area: Rect,
+    r: &Request,
+    answer: Option<&(String, String, Vec<String>)>,
+    theme: &Theme,
+) {
     let failed = r.status == Phase::Failed;
-    let mut meta = vec![if failed { "Failed" } else { "Planning" }.to_string()];
+    let status = match r.status {
+        Phase::Failed => "Failed",
+        Phase::Done => "Question",
+        _ => "Planning",
+    };
+    let mut meta = vec![status.to_string()];
     meta.extend(r.ticket.clone());
     let mut lines = vec![
         Line::raw(r.text.lines().next().unwrap_or_default().to_string()).bold(),
@@ -1284,8 +1392,94 @@ fn request(f: &mut Frame, area: Rect, r: &Request, theme: &Theme) {
         lines.extend(why.lines().map(|l| Line::styled(l.to_string(), theme.red)));
         lines.push(Line::raw(""));
     }
-    lines.extend(r.text.lines().map(|l| Line::raw(l.to_string()).dim()));
+    match answer {
+        Some((_, text, cited)) => {
+            lines.extend(markdown(text, theme));
+            if !cited.is_empty() {
+                lines.extend([Line::raw(""), Line::raw("Cites").bold()]);
+                lines.extend(cited.iter().map(|c| Line::raw(format!("- {c}")).dim()));
+            }
+        }
+        None => lines.extend(r.text.lines().map(|l| Line::raw(l.to_string()).dim())),
+    }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Markdown, lightly: headings bold, fenced code in the shell hue, the rest as written.
+fn markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let mut code = false;
+    let mut lines = Vec::new();
+    for l in text.lines() {
+        if l.trim_start().starts_with("```") {
+            code = !code;
+        } else if code {
+            lines.push(Line::styled(format!("  {l}"), theme.shell));
+        } else if l.starts_with('#') {
+            lines.push(Line::raw(l.trim_start_matches('#').trim().to_string()).bold());
+        } else {
+            lines.push(Line::raw(l.to_string()));
+        }
+    }
+    lines
+}
+
+/// The repo files `text` cites as `path` or `path:line`, once each, in order.
+fn cites(repo: &Path, text: &str) -> Vec<String> {
+    let re = Regex::new(r"[\w./-]+\.\w+(?::\d+(?:-\d+)?)?").expect("valid regex");
+    let mut found: Vec<String> = Vec::new();
+    for m in re.find_iter(text) {
+        let cite = m.as_str().trim_start_matches("./");
+        let path = cite.split(':').next().unwrap_or(cite);
+        if repo.join(path).is_file() && !found.iter().any(|f| f == cite) {
+            found.push(cite.into());
+        }
+    }
+    found
+}
+
+/// Copies `text` with OSC 52, which reaches the local clipboard even over SSH, and with the
+/// native clipboard tool when there is one.
+fn copy(text: &str) -> Result<()> {
+    let mut out = std::io::stdout();
+    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))?;
+    out.flush()?;
+    let tools: [(&str, &[&str]); 3] = [
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+    ];
+    for (tool, args) in tools {
+        let Ok(mut child) = Command::new(tool)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        child
+            .stdin
+            .take()
+            .context("clipboard stdin")?
+            .write_all(text.as_bytes())?;
+        child.wait()?;
+        break;
+    }
+    Ok(())
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = (chunk.iter().enumerate()).fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            let c = ABC[(n >> (18 - 6 * i) & 63) as usize] as char;
+            out.push(if i <= chunk.len() { c } else { '=' });
+        }
+    }
+    out
 }
 
 /// One line per tool call, following the tail: edits in the accent, shell commands in a
@@ -1484,6 +1678,7 @@ mod tests {
             instruction: None,
             edit: false,
             reply: None,
+            answer: None,
         };
         (app, now)
     }
@@ -1874,6 +2069,67 @@ mod tests {
         app.reload(&state).unwrap();
         assert!(app.requests.is_empty());
         fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn question_screen() {
+        let (mut app, now) = app();
+        app.requests = vec![Request {
+            id: "r5".into(),
+            text: "How are tasks saved?".into(),
+            mode: Mode::Ask,
+            status: Phase::Done,
+            ..Default::default()
+        }];
+        let answer = "## Atomically\nA tmp file, then a rename:\n```\nfs::rename(&tmp, &path)\n```";
+        let cited = vec!["src/task.rs:72".to_string()];
+        app.answer = Some(("r5".into(), answer.into(), cited));
+        let mut term = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "│ Questions                                 ││ How are tasks saved?                                │",
+                "│ ▌ ✓ How are tasks saved?         answered ││ Question                                            │",
+                "│                                           ││                                                     │",
+                "│ Review                                    ││ Atomically                                          │",
+                "│   ✓ Reject negative max_delay          4m ││ A tmp file, then a rename:                          │",
+                "│                                           ││   fs::rename(&tmp, &path)                           │",
+                "│ Failed                                    ││                                                     │",
+                "│   ✗ Bump sqlx to 0.9                   1h ││ Cites                                               │",
+                "│                                           ││ - src/task.rs:72                                    │",
+                "│ Running                                   ││                                                     │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " n new task  j/k move  tab pane  r reply  p plan it  y copy  x discard  ? help  q quit              ",
+            ]
+        );
+
+        // p: a plan built on the answer
+        let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        app.key(press('p'));
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!(c.mode, Mode::Plan);
+        let text = c.request.lines().join("\n");
+        assert!(
+            text.starts_with("How are tasks saved?\n\nThe answer to build on:\n\n## Atomically")
+        );
+    }
+
+    #[test]
+    fn cites_and_base64() {
+        let repo = std::env::temp_dir().join(format!("yogan-cites-{}", std::process::id()));
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/lib.rs"), "").unwrap();
+        let text = "See `src/lib.rs:3`, ./src/lib.rs and gone.rs. Also src/lib.rs:3 again.";
+        assert_eq!(cites(&repo, text), ["src/lib.rs:3", "src/lib.rs"]);
+        fs::remove_dir_all(&repo).unwrap();
+        assert_eq!(
+            [base64(b"Man"), base64(b"Ma"), base64(b"M")],
+            ["TWFu", "TWE=", "TQ=="]
+        );
     }
 
     #[test]

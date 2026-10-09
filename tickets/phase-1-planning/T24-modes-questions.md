@@ -1,4 +1,4 @@
-- [ ] **T24 Modes + questions**
+- [x] **T24 Modes + questions**
 
 Plan: Questions; TUI › Screens › 9. Questions; Running in VS Code (Copy row).
 
