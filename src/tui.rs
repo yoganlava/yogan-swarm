@@ -18,8 +18,6 @@ use ratatui::widgets::{
     Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use regex::Regex;
-use rustix::io::Errno;
-use rustix::process::{Pid, test_kill_process};
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -283,7 +281,7 @@ pub fn run(repo: &Path) -> Result<()> {
     let res = (|| -> Result<()> {
         loop {
             // checked before the reload, so an exited worker's last save is already loaded
-            let exited = app.awaiting.as_ref().is_some_and(|a| !alive(a.2));
+            let exited = app.awaiting.as_ref().is_some_and(|a| !worker::alive(a.2));
             app.reload(&state)?;
             app.load_tab();
             app.check_awaiting(exited);
@@ -344,10 +342,6 @@ pub fn run(repo: &Path) -> Result<()> {
     })();
     ratatui::restore();
     res
-}
-
-fn alive(pid: u32) -> bool {
-    Pid::from_raw(pid as i32).is_some_and(|p| test_kill_process(p) != Err(Errno::SRCH))
 }
 
 /// Approves `ids` in `tasks`. Errs when one's parent would stay unapproved; returns a warning
@@ -448,7 +442,7 @@ fn running(t: &Task) -> bool {
 /// A worker that died without recording an outcome (a crash, a reboot) fails its task.
 fn reap(state: &Path) -> Result<()> {
     for mut t in task::load_all(state)? {
-        if running(&t) && !t.pid.is_some_and(alive) {
+        if running(&t) && !t.pid.is_some_and(worker::alive) {
             t.status = Status::Failed;
             t.summary = Some("the worker exited without finishing".into());
             t.save(state)?;
@@ -462,7 +456,9 @@ fn reap(state: &Path) -> Result<()> {
         r.pid.is_none() && age > Duration::from_secs(60)
     };
     for mut r in lead::load_all(state)? {
-        if r.status == Phase::Planning && (r.pid.is_some_and(|p| !alive(p)) || never_started(&r)) {
+        if r.status == Phase::Planning
+            && (r.pid.is_some_and(|p| !worker::alive(p)) || never_started(&r))
+        {
             r.status = Phase::Failed;
             r.summary = Some("the lead exited without finishing".into());
             r.save(state)?;

@@ -12,8 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use rustix::io::Errno;
 use rustix::process::{
     Pid, Resource, Rlimit, Signal, getrlimit, kill_process, kill_process_group, setrlimit, setsid,
+    test_kill_process,
 };
 use serde_json::Value;
 use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
@@ -381,6 +383,10 @@ pub(crate) fn detach(mut cmd: Command) -> Result<u32> {
 pub fn stop(pid: u32) -> Result<()> {
     let pid = Pid::from_raw(pid as i32).context("pid 0")?;
     Ok(kill_process_group(pid, Signal::TERM)?)
+}
+
+pub fn alive(pid: u32) -> bool {
+    Pid::from_raw(pid as i32).is_some_and(|p| test_kill_process(p) != Err(Errno::SRCH))
 }
 
 /// The worker's main. With `pr` (an instruction, or empty), it rebases a task in Review and
@@ -894,7 +900,7 @@ fn prompt(task: &Task) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustix::process::{getsid, test_kill_process};
+    use rustix::process::getsid;
     use std::time::{Duration, Instant};
 
     fn result(json: &str) -> RunResult {
