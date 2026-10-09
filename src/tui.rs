@@ -23,7 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::stream::{self, Content};
 use crate::task::{self, Status, Task};
-use crate::{config, git, pr, sched, slot, worker};
+use crate::{config, git, lead, pr, sched, slot, worker};
 
 /// List order, what needs you first; `Discarded` isn't shown.
 const GROUPS: [(Status, &str); 7] = [
@@ -158,7 +158,7 @@ struct App {
     edit: bool,
 }
 
-/// The `n` screen: a request whose first line is the title, and an optional ticket.
+/// The `n` screen: a request for the lead, and an optional ticket.
 struct Compose {
     request: TextArea<'static>,
     ticket: TextArea<'static>,
@@ -176,7 +176,7 @@ fn field(placeholder: &str) -> TextArea<'static> {
 impl Compose {
     fn new() -> Compose {
         Compose {
-            request: field("What should a worker do? The first line is the title."),
+            request: field("What should the lead plan?"),
             ticket: field("e.g. CC-687"),
             on_ticket: false,
         }
@@ -557,20 +557,17 @@ impl App {
         Ok(url)
     }
 
-    /// Files the composed request as an approved task and starts whatever is ready.
+    /// Hands the composed request to a lead, whose proposals arrive as `Proposed` tasks.
     fn submit(&mut self) -> Result<()> {
         let c = self.compose.as_ref().context("not composing")?;
         let request = c.request.lines().join("\n");
-        let request = request.trim();
-        let (title, body) = request.split_once('\n').unwrap_or((request, ""));
+        ensure!(!request.trim().is_empty(), "write a request first");
         let ticket = c.ticket.lines().join("").trim().to_string();
-        let cfg = config::load(&self.repo)?;
-        task::file_new(&self.state, |tasks| {
-            let prefix = &cfg.branch_prefix;
-            task::new_task(title, body, &ticket, prefix, tasks, task::now_id())
-        })?;
+        let ticket = (!ticket.is_empty()).then_some(ticket);
+        lead::submit(&self.repo, &self.state, request.trim(), ticket)?;
         self.compose = None;
-        sched::run(&self.repo)
+        self.info = Some("the lead is planning; its proposals will show up here".into());
+        Ok(())
     }
 }
 

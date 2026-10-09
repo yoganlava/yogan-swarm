@@ -59,17 +59,21 @@ pub fn state_dir(checkout: &Path) -> Result<PathBuf> {
 }
 
 impl Task {
-    /// Writes `tasks/<id>.toml` atomically: a crash leaves the old file or the new one.
+    /// Writes `tasks/<id>.toml` atomically.
     pub fn save(&self, dir: &Path) -> Result<()> {
-        let tasks = dir.join("tasks");
-        fs::create_dir_all(&tasks)?;
-        let path = tasks.join(format!("{}.toml", self.id));
-        let tmp = tasks.join(format!("{}.{}.tmp", self.id, std::process::id()));
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(toml::to_string(self)?.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&tmp, &path).with_context(|| path.display().to_string())
+        write_toml(&dir.join("tasks"), &self.id, self)
     }
+}
+
+/// Writes `<dir>/<id>.toml` atomically: a crash leaves the old file or the new one.
+pub(crate) fn write_toml(dir: &Path, id: &str, value: &impl Serialize) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{id}.toml"));
+    let tmp = dir.join(format!("{id}.{}.tmp", std::process::id()));
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(toml::to_string(value)?.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&tmp, &path).with_context(|| path.display().to_string())
 }
 
 pub fn load_all(dir: &Path) -> Result<Vec<Task>> {
@@ -88,13 +92,13 @@ pub fn load_all(dir: &Path) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
-/// `t<unix seconds>`, so ids sort by creation.
-pub fn now_id() -> String {
+/// `<prefix><unix seconds>`, so ids sort by creation.
+pub fn now_id(prefix: &str) -> String {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!("t{secs}")
+    format!("{prefix}{secs}")
 }
 
 /// An approved task with a free id and branch `<prefix><slug>`.
@@ -132,16 +136,9 @@ pub fn new_task(
     })
 }
 
-/// Files a lead proposal as `Proposed` and returns its id.
-pub fn propose(
-    dir: &Path,
-    prefix: &str,
-    title: &str,
-    body: &str,
-    parent: Option<String>,
-    crates: Vec<String>,
-    accept: Vec<String>,
-) -> Result<String> {
+/// Files a lead proposal as `Proposed` with a fresh id and branch, and returns its id.
+pub fn propose(dir: &Path, prefix: &str, proposal: Task) -> Result<String> {
+    let accept = &proposal.acceptance;
     ensure!(
         (1..=5).contains(&accept.len()),
         "give 1 to 5 --accept criteria, got {}",
@@ -152,18 +149,32 @@ pub fn propose(
         "an --accept criterion is empty"
     );
     let task = file_new(dir, |tasks| {
-        if let Some(p) = &parent {
+        if let Some(p) = &proposal.parent {
             ensure!(
                 tasks.iter().any(|t| &t.id == p),
                 "no task {p} to use as --parent"
             );
         }
+        let ticket = proposal.ticket.as_deref().unwrap_or_default();
+        let new = new_task(
+            &proposal.title,
+            &proposal.body,
+            ticket,
+            prefix,
+            tasks,
+            now_id("t"),
+        )?;
         Ok(Task {
             status: Status::Proposed,
-            acceptance: accept.iter().map(|a| a.trim().into()).collect(),
-            parent,
-            crates,
-            ..new_task(title, body, "", prefix, tasks, now_id())?
+            acceptance: proposal
+                .acceptance
+                .iter()
+                .map(|a| a.trim().into())
+                .collect(),
+            plan: proposal.plan,
+            parent: proposal.parent,
+            crates: proposal.crates,
+            ..new
         })
     })?;
     Ok(task.id)
@@ -278,16 +289,18 @@ mod tests {
     fn propose_needs_one_to_five_criteria() {
         let dir = std::env::temp_dir().join(format!("yogan-propose-{}", std::process::id()));
         let accept = |n: usize| (0..n).map(|i| format!("criterion {i}")).collect();
-        let propose = |accept, parent| {
-            propose(
-                &dir,
-                "u/",
-                "Reject negative",
-                "b",
+        let propose = |acceptance, parent| {
+            let proposal = Task {
+                title: "Reject negative".into(),
+                body: "b".into(),
+                plan: "r1".into(),
+                ticket: Some("CC-9".into()),
+                crates: vec!["ledger".into()],
+                acceptance,
                 parent,
-                vec!["ledger".into()],
-                accept,
-            )
+                ..Default::default()
+            };
+            propose(&dir, "u/", proposal)
         };
         assert!(propose(accept(0), None).is_err());
         assert!(propose(accept(6), None).is_err());
@@ -302,6 +315,7 @@ mod tests {
         assert_eq!(t.parent.as_deref(), Some(id.as_str()));
         assert_eq!(t.branch, "u/reject-negative-2");
         assert_eq!(t.acceptance, vec!["criterion 0"]);
+        assert_eq!((t.plan.as_str(), t.ticket.as_deref()), ("r1", Some("CC-9")));
         assert_eq!(tasks.len(), 2);
 
         fs::remove_dir_all(&dir).unwrap();

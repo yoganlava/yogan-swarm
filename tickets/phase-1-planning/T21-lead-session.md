@@ -1,4 +1,4 @@
-- [ ] **T21 Lead session**
+- [x] **T21 Lead session**
 
 Plan: Lead agent; Configuration (`[lead]`).
 

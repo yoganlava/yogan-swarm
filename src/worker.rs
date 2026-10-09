@@ -56,7 +56,18 @@ pub fn spawn(repo: &Path, id: &str, extra: &[&str]) -> Result<u32> {
     detach(cmd)
 }
 
-fn detach(mut cmd: Command) -> Result<u32> {
+/// Claude only warns on an unknown effort and runs on its default, so yogan fails instead.
+pub(crate) fn check_effort(effort: &str) -> Result<()> {
+    ensure!(
+        EFFORTS.contains(&effort),
+        "unknown effort {effort:?}, expected one of {}",
+        EFFORTS.join(", ")
+    );
+    Ok(())
+}
+
+/// Runs `cmd` in a new session with no stdio. Returns its pid, which is also its process group.
+pub(crate) fn detach(mut cmd: Command) -> Result<u32> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -123,12 +134,7 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
     };
     let model = task.model.clone().unwrap_or(cfg.worker.model.clone());
     let effort = task.effort.clone().unwrap_or(cfg.worker.effort.clone());
-    // claude only warns on an unknown effort and runs on its default
-    ensure!(
-        EFFORTS.contains(&effort.as_str()),
-        "unknown effort {effort:?}, expected one of {}",
-        EFFORTS.join(", ")
-    );
+    check_effort(&effort)?;
     task.model = Some(model.clone());
     task.effort = Some(effort.clone());
     task.status = if pr.is_some() {

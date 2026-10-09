@@ -23,6 +23,8 @@ enum Command {
         #[arg(long, requires = "pr")]
         instruction: Option<String>,
     },
+    /// Run one request's lead session (internal, spawned detached)
+    Lead { id: String },
     /// Task commands for the lead (internal)
     Task {
         #[command(subcommand)]
@@ -64,6 +66,7 @@ fn main() -> anyhow::Result<()> {
             let pr = pr.then(|| instruction.unwrap_or_default());
             yogan_swarm::worker::run(&std::env::current_dir()?, &id, pr.as_deref())
         }
+        Some(Command::Lead { id }) => yogan_swarm::lead::run(&std::env::current_dir()?, &id),
         Some(Command::Task {
             command:
                 TaskCommand::Propose {
@@ -77,8 +80,22 @@ fn main() -> anyhow::Result<()> {
             let checkout = std::env::current_dir()?;
             let prefix = yogan_swarm::config::load(&checkout)?.branch_prefix;
             let dir = yogan_swarm::task::state_dir(&checkout)?;
-            let id =
-                yogan_swarm::task::propose(&dir, &prefix, &title, &body, parent, crates, accept)?;
+            // the lead's request, which gives its tasks their plan and ticket
+            let (plan, ticket) = match std::env::var("YOGAN_REQUEST") {
+                Ok(id) => (id.clone(), yogan_swarm::lead::load(&dir, &id)?.ticket),
+                Err(_) => (String::new(), None),
+            };
+            let proposal = yogan_swarm::task::Task {
+                title,
+                body,
+                parent,
+                crates,
+                acceptance: accept,
+                plan,
+                ticket,
+                ..Default::default()
+            };
+            let id = yogan_swarm::task::propose(&dir, &prefix, proposal)?;
             println!("{id}");
             Ok(())
         }
