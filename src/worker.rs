@@ -136,17 +136,18 @@ pub fn stop(pid: u32) -> Result<()> {
 }
 
 /// The worker's main. With `pr` (an instruction, or empty), it rebases a task in Review and
-/// drafts its PR instead of starting fresh. Any error marks the task `Failed`, with the error as
-/// its summary. On exit it starts whatever is ready next.
-pub fn run(repo: &Path, id: &str, pr: Option<&str>) -> Result<()> {
+/// drafts its PR instead of starting fresh; with `reply`, it resumes the task's session with it
+/// and runs the gate and critic again. Any error marks the task `Failed`, with the error as its
+/// summary. On exit it starts whatever is ready next.
+pub fn run(repo: &Path, id: &str, pr: Option<&str>, reply: Option<&str>) -> Result<()> {
     let state = task::state_dir(repo)?;
     let mut task = task::load_all(&state)?
         .into_iter()
         .find(|t| t.id == id)
         .with_context(|| format!("no task {id}"))?;
-    let res = lifecycle(repo, &state, &mut task, pr);
+    let res = lifecycle(repo, &state, &mut task, pr, reply);
     if let Err(e) = &res
-        && pr.is_some()
+        && (pr.is_some() || reply.is_some())
         && task.status == Status::Review
     {
         // the work is intact: the fetch, rebase or draft failed, or another worker holds the slot
@@ -163,7 +164,15 @@ pub fn run(repo: &Path, id: &str, pr: Option<&str>) -> Result<()> {
     next
 }
 
-fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Result<()> {
+fn lifecycle(
+    repo: &Path,
+    state: &Path,
+    task: &mut Task,
+    pr: Option<&str>,
+    reply: Option<&str>,
+) -> Result<()> {
+    // a task in Review keeps its slot and worktree
+    let existing = pr.is_some() || reply.is_some();
     let cfg = config::load(repo)?;
     if let Some(nofile) = cfg.cargo.as_ref().and_then(|c| c.nofile) {
         let hard = getrlimit(Resource::Nofile).maximum;
@@ -174,12 +183,12 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
         setrlimit(Resource::Nofile, limit).context("[cargo] nofile")?;
     }
     let tasks = task::load_all(state)?;
-    let (n, _lock) = match pr {
-        Some(_) => {
+    let (n, _lock) = match existing {
+        true => {
             let n = task.slot.context("the task has no slot")?;
             (n, slot::lock(state, n)?)
         }
-        None => slot::claim(state, &tasks, cfg.worker.slots)?.context("no free slot")?,
+        false => slot::claim(state, &tasks, cfg.worker.slots)?.context("no free slot")?,
     };
     let model = task.model.clone().unwrap_or(cfg.worker.model.clone());
     let effort = task.effort.clone().unwrap_or(cfg.worker.effort.clone());
@@ -196,9 +205,9 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
 
     let base = task::base(task, tasks.iter());
     let base = base.as_str();
-    let dir = match pr {
-        Some(_) => state.join("slots").join(n.to_string()),
-        None => slot::prepare(repo, state, n, &task.branch, base)?,
+    let dir = match existing {
+        true => state.join("slots").join(n.to_string()),
+        false => slot::prepare(repo, state, n, &task.branch, base)?,
     };
     let mut env = slot::env(repo, &dir, n, task, cfg.ports.as_ref());
     if repo.join("Cargo.toml").exists() {
@@ -217,7 +226,7 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
     let logs = state.join("logs");
     let script = cfg.scripts.as_ref().and_then(|s| s.setup.as_deref());
     let setup_log = logs.join(format!("{}.setup.log", task.id));
-    if pr.is_none() {
+    if !existing {
         slot::setup(repo, &dir, &env, script, &setup_log)?;
     }
 
@@ -330,7 +339,7 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
         if let Some((prompt, resume)) = first {
             session(task, prompt, resume, None)?;
         }
-        let mut findings = Findings::default();
+        let mut findings = Findings::load(state, &task.id).unwrap_or_default();
         let mut round = 0;
         loop {
             task.status = Status::Checking;
@@ -371,12 +380,13 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
         }
     };
 
-    match pr {
-        None => {
+    match (pr, reply) {
+        (None, None) => {
             let prompt = prompt(task);
             work(task, Some((&prompt, false)), true)?;
         }
-        Some(instruction) => {
+        (None, Some(reply)) => _ = work(task, Some((reply, true)), true)?,
+        (Some(instruction), _) => {
             let passed = match rebase(&dir, base)? {
                 None => work(task, Some((&conflict(base), true)), false)?,
                 Some(true) => work(task, None, false)?,
@@ -387,7 +397,9 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
                 task.status = Status::Review;
                 task.save(state)?;
                 let instruction = Some(instruction).filter(|i| !i.is_empty());
-                task.pr_draft = Some(pr::draft(task, &dir, base, &cfg.pr, instruction)?);
+                let findings = Findings::load(state, &task.id)?;
+                let draft = pr::draft(task, &dir, base, &cfg.pr, instruction, &findings)?;
+                task.pr_draft = Some(draft);
             }
         }
     }

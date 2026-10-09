@@ -1,4 +1,4 @@
-- [ ] **T27 Findings tab + PR body**
+- [x] **T27 Findings tab + PR body**
 
 Plan: Adversarial review › Findings; TUI › Screens › 4. Findings; Lead agent › Acceptance criteria (PR body).
 

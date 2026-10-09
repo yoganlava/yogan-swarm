@@ -9,6 +9,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Pr;
+use crate::critic::Findings;
 use crate::git;
 use crate::task::Task;
 
@@ -22,14 +23,16 @@ pub struct Draft {
     pub problem: Option<String>,
 }
 
-/// Has the `[pr]` model draft a title and body for the task's branch in `slot`. With an
-/// instruction, it redrafts from the same inputs plus the current draft.
+/// Has the `[pr]` model draft a title and body for the task's branch in `slot`, then appends
+/// the review summary from `findings`. With an instruction, it redrafts from the same inputs
+/// plus the current draft.
 pub fn draft(
     task: &Task,
     slot: &Path,
     base: &str,
     cfg: &Pr,
     instruction: Option<&str>,
+    findings: &Findings,
 ) -> Result<Draft> {
     let range = format!("{base}...HEAD");
     let stat = git(slot, &["diff", "--stat", &range])?;
@@ -47,8 +50,22 @@ pub fn draft(
     );
     if !task.acceptance.is_empty() {
         prompt.push_str(&format!(
-            "\nAcceptance criteria:\n- {}\n",
+            "\nAcceptance criteria, which the description lists, each with whether the change \
+             meets it:\n- {}\n",
             task.acceptance.join("\n- ")
+        ));
+    }
+    let open: Vec<_> = (findings.findings.iter())
+        .chain(&findings.optional)
+        .collect();
+    if !open.is_empty() {
+        let open = open
+            .iter()
+            .map(|f| format!("- {}: {}", f.location, f.claim));
+        prompt.push_str(&format!(
+            "\nReview findings still open, which may mean a criterion isn't met:\n{}\n\
+             yogan appends its own review summary, so don't write one.\n",
+            open.collect::<Vec<_>>().join("\n")
         ));
     }
     if let Some(summary) = &task.summary {
@@ -86,7 +103,7 @@ pub fn draft(
         );
         draft = ask(slot, cfg, &retry)?;
     }
-    let (title, body) = (clean(&draft.0), clean(&draft.1));
+    let (title, body) = (clean(&draft.0), clean(&with_review(&draft.1, findings)));
     Ok(Draft {
         problem: check_title(&title, &cfg.types, migration).err(),
         title,
@@ -153,6 +170,42 @@ pub fn check_title(title: &str, types: &[String], migration: bool) -> Result<(),
     Ok(())
 }
 
+/// `body` ending in yogan's Review section, which replaces any the draft carried over: what the
+/// critic found, fixed, disputed and waived, with each dispute's and waiver's reason.
+pub fn with_review(body: &str, f: &Findings) -> String {
+    let body = body.split("**Review**").next().unwrap_or(body).trim_end();
+    let open = f.findings.len() + f.optional.len();
+    let counts = [
+        (f.fixed.len(), "fixed"),
+        (f.disputed.len(), "disputed"),
+        (f.waived.len(), "waived"),
+        (open, "open"),
+    ];
+    let found: usize = counts.iter().map(|(n, _)| n).sum();
+    let mut review = match &f.error {
+        Some(e) => format!("The critic didn't finish: {e}\n"),
+        None if found == 0 => return body.to_string(),
+        None => {
+            let parts = counts.iter().filter(|(n, _)| *n > 0);
+            let parts: Vec<_> = parts.map(|(n, what)| format!("{n} {what}")).collect();
+            format!("The critic found {found}: {}.\n", parts.join(", "))
+        }
+    };
+    for (what, list, who) in [
+        ("Disputed", &f.disputed, "Worker"),
+        ("Waived", &f.waived, "Reason"),
+    ] {
+        for x in list {
+            let why = x.reply.as_deref().unwrap_or("none given");
+            review.push_str(&format!(
+                "\n- {what}: `{}` {} {who}: {why}",
+                x.location, x.claim
+            ));
+        }
+    }
+    format!("{body}\n\n**Review**\n\n{}\n", review.trim_end())
+}
+
 /// Em and en dashes never reach git or gh.
 pub fn clean(text: &str) -> String {
     text.replace(" — ", ", ").replace(['—', '–'], "-")
@@ -185,6 +238,7 @@ pub fn open(task: &Task, slot: &Path, base: &str, as_draft: bool) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::critic::{Finding, Severity};
 
     #[test]
     fn title_check() {
@@ -213,6 +267,29 @@ mod tests {
         assert!(check_title("feat: add limits [CC-3]", &types, true).is_err());
 
         assert!(check_title("anything goes", &[], false).is_ok());
+
+        // the review summary replaces one a redraft carried over
+        let f = |claim: &str, reply: Option<&str>| Finding {
+            severity: Severity::Major,
+            location: "src/a.rs:1".into(),
+            claim: claim.into(),
+            evidence: String::new(),
+            reply: reply.map(Into::into),
+        };
+        let findings = Findings {
+            fixed: vec![f("x", None), f("y", None)],
+            disputed: vec![f("no test", Some("covered by z"))],
+            waived: vec![f("rename", Some("matches the API"))],
+            ..Default::default()
+        };
+        let body = with_review("What and why.\n\n**Review**\n\nstale", &findings);
+        assert_eq!(
+            body,
+            "What and why.\n\n**Review**\n\nThe critic found 4: 2 fixed, 1 disputed, 1 waived.\n\n\
+             - Disputed: `src/a.rs:1` no test Worker: covered by z\n\
+             - Waived: `src/a.rs:1` rename Reason: matches the API\n"
+        );
+        assert_eq!(with_review("Body.", &Findings::default()), "Body.");
         assert_eq!(clean("Fix — retries – fast—now"), "Fix, retries - fast-now");
     }
 }

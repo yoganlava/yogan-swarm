@@ -49,6 +49,9 @@ pub struct Findings {
     /// Sent back and disputed by the worker: for the human, never argued with the critic.
     #[serde(default)]
     pub disputed: Vec<Finding>,
+    /// Set aside by the human, whose reason is the reply; listed in the PR body.
+    #[serde(default)]
+    pub waived: Vec<Finding>,
     /// Why the critic didn't finish, if it didn't.
     pub error: Option<String>,
 }
@@ -56,6 +59,54 @@ pub struct Findings {
 impl Findings {
     pub fn save(&self, state: &Path, id: &str) -> Result<()> {
         task::write_toml(&state.join("findings"), id, self)
+    }
+
+    /// The task's findings, or none if the critic hasn't run.
+    pub fn load(state: &Path, id: &str) -> Result<Findings> {
+        match fs::read_to_string(state.join(format!("findings/{id}.toml"))) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Findings::default()),
+            text => Ok(toml::from_str(&text?)?),
+        }
+    }
+
+    /// What the human can act on, as the Findings tab lists it: open, disputed, then optional.
+    pub fn actionable(&self) -> impl Iterator<Item = &Finding> {
+        (self.findings.iter())
+            .chain(&self.disputed)
+            .chain(&self.optional)
+    }
+
+    /// Takes the `i`th of `actionable` out of its list.
+    fn take(&mut self, i: usize) -> Result<Finding> {
+        let mut i = i;
+        for list in [&mut self.findings, &mut self.disputed, &mut self.optional] {
+            if i < list.len() {
+                return Ok(list.remove(i));
+            }
+            i -= list.len();
+        }
+        anyhow::bail!("no such finding")
+    }
+
+    /// `x`: sets the `i`th actionable finding aside with the human's `reason`.
+    pub fn waive(&mut self, i: usize, reason: &str) -> Result<()> {
+        let mut f = self.take(i)?;
+        f.reply = Some(reason.into());
+        self.waived.push(f);
+        Ok(())
+    }
+
+    /// `r` on a disputed finding: the human sides with the critic. It moves to `fixed`, for the
+    /// next critic to check once the worker has fixed it; returns it for the worker's prompt.
+    pub fn uphold(&mut self, i: usize) -> Result<Finding> {
+        let first = self.findings.len();
+        anyhow::ensure!(
+            (first..first + self.disputed.len()).contains(&i),
+            "only a disputed finding can be upheld"
+        );
+        let f = self.take(i)?;
+        self.fixed.push(f.clone());
+        Ok(f)
     }
 
     /// The blockers and majors to send back; unproven ones are in `optional` already.
@@ -189,6 +240,7 @@ pub fn run(
         optional,
         fixed: previous.fixed.clone(),
         disputed: previous.disputed.clone(),
+        waived: previous.waived.clone(),
         error: None,
     })
 }
@@ -222,10 +274,14 @@ fn prompt(task: &Task, base: &str, previous: &Findings) -> String {
             list(&previous.fixed)
         ));
     }
-    if !previous.disputed.is_empty() {
+    let settled: Vec<_> = (previous.disputed.iter())
+        .chain(&previous.waived)
+        .cloned()
+        .collect();
+    if !settled.is_empty() {
         p.push_str(&format!(
-            "\nThe worker disputes these; they're for the human, so don't report them again:\n{}\n",
-            list(&previous.disputed)
+            "\nThe worker disputes these or the human waived them, so don't report them again:\n{}\n",
+            list(&settled)
         ));
     }
     p
@@ -266,5 +322,14 @@ mod tests {
         assert_eq!(findings.fixed[0].claim, "a");
         assert_eq!(findings.fixed[0].reply, None);
         assert_eq!(findings.disputed[0].reply.as_deref(), Some("c is intended"));
+
+        // the human: uphold only a disputed one, waive any actionable one
+        assert!(findings.uphold(0).is_err(), "b is open, not disputed");
+        let upheld = findings.uphold(1).unwrap();
+        assert_eq!((upheld.claim.as_str(), findings.fixed.len()), ("c", 2));
+        findings.waive(0, "style only").unwrap();
+        assert_eq!(findings.waived[0].reply.as_deref(), Some("style only"));
+        assert_eq!(findings.actionable().count(), 0);
+        assert!(findings.waive(0, "x").is_err());
     }
 }

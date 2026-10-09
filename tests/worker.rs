@@ -234,6 +234,19 @@ fn worker_runs_setup_then_claude() {
         "{args}"
     );
 
+    // r on a finding: the worker resumes with the human's text, and the gate and critic run again
+    let (ok, t1) = yogan(
+        &["worker", "t1", "--reply", "- fix the blocker"],
+        "graft",
+        "",
+    );
+    assert!(ok);
+    assert_eq!(t1.status, Status::Review);
+    let args = fs::read_to_string(root.join("claude.args")).unwrap();
+    assert!(args.contains("--resume\ns-1\n"), "{args}");
+    let runs = fs::read_to_string(root.join("critic.count")).unwrap();
+    assert!(runs.lines().count() > 2, "the critic ran again");
+
     // a failing setup fails the task with its log path, before Claude starts
     let (ok, t2) = worker("t2", "echo db down; exit 3", "graft", "", None);
     assert!(!ok);
@@ -302,7 +315,9 @@ fn worker_runs_setup_then_claude() {
     assert_eq!(t1.status, Status::Review);
     let draft = t1.pr_draft.unwrap();
     assert_eq!(draft.title, "feat: do it [NO-TICKET]");
-    assert_eq!(draft.body, "What and why, briefly."); // no em dash
+    // no em dash, and yogan's review summary after the drafted text
+    let review = "What and why, briefly.\n\n**Review**\n\nThe critic found 6: 3 fixed, 3 open.\n";
+    assert_eq!(draft.body, review);
     assert_eq!(draft.head.len(), 40);
 
     // m with origin unchanged: no session and no gate; a failed draft leaves the task in Review

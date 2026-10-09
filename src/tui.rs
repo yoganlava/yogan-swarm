@@ -22,6 +22,7 @@ use rustix::process::{Pid, test_kill_process};
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::critic::{Findings, Severity};
 use crate::lead::{self, Mode, Phase, Request};
 use crate::stream::{self, Content};
 use crate::task::{self, Status, Task};
@@ -38,13 +39,14 @@ const GROUPS: [(Status, &str); 7] = [
     (Status::PrOpen, "PR open"),
 ];
 
-const TABS: [&str; 4] = ["Summary", "Activity", "Gate", "Diff"];
+const TABS: [&str; 5] = ["Summary", "Activity", "Gate", "Findings", "Diff"];
+const FINDINGS: usize = 3;
 
 const KEYS: [(&str, &str); 16] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
-    ("1-4", "tabs"),
+    ("1-5", "tabs"),
     ("d", "diff"),
     ("m", "open PR"),
     ("a", "approve"),
@@ -171,6 +173,14 @@ struct App {
     edit: bool,
     /// The reply to the selected proposal's lead, while it's being typed.
     reply: Option<TextArea<'static>>,
+    /// What the reply modal is for when it isn't the lead: `r` upholds the selected finding,
+    /// `x` waives it.
+    on_finding: Option<char>,
+    /// The selected task's findings, and the cursor over their actionable ones.
+    findings: Findings,
+    finding: usize,
+    /// Tasks in Review with a disputed finding.
+    disputed: Vec<String>,
     /// The selected question's id, answer and the repo files the answer cites.
     answer: Option<(String, String, Vec<String>)>,
 }
@@ -241,6 +251,10 @@ pub fn run(repo: &Path) -> Result<()> {
         edit: false,
         reply: None,
         answer: None,
+        on_finding: None,
+        findings: Findings::default(),
+        finding: 0,
+        disputed: Vec::new(),
     };
     let theme = Theme::detect();
     let mut terminal = ratatui::init();
@@ -462,7 +476,22 @@ impl App {
         let same = id.and_then(|id| ids.position(|i| *i == id));
         let rows = self.requests.len() + self.tasks.len();
         self.selected = same.unwrap_or(self.selected.min(rows.saturating_sub(1)));
+        let review = self
+            .tasks
+            .iter()
+            .filter(|(t, _)| t.status == Status::Review);
+        let disputes =
+            |t: &Task| Findings::load(state, &t.id).is_ok_and(|f| !f.disputed.is_empty());
+        self.disputed = review
+            .filter(|(t, _)| disputes(t))
+            .map(|(t, _)| t.id.clone())
+            .collect();
         Ok(())
+    }
+
+    /// Whether `j/k`, `r` and `x` act on the Findings tab's findings.
+    fn on_findings(&self) -> bool {
+        self.detail && self.tab == FINDINGS && self.task().is_some()
     }
 
     /// The selected row's request, if it's one.
@@ -515,7 +544,7 @@ impl App {
         }
         if let Some(input) = &mut self.reply {
             match key.code {
-                KeyCode::Esc => self.reply = None,
+                KeyCode::Esc => (self.reply, self.on_finding) = (None, None),
                 _ if ctrl('s') => {
                     let text = input.lines().join("\n");
                     self.reply = None;
@@ -578,6 +607,34 @@ impl App {
             .is_some_and(|(t, _)| t.status == Status::Proposed);
         let failed = self.request().is_some_and(|r| r.status == Phase::Failed);
         let answered = self.request().is_some_and(|r| r.status == Phase::Done);
+        if self.on_findings() {
+            let (n, first) = (
+                self.findings.actionable().count(),
+                self.findings.findings.len(),
+            );
+            let disputed = (first..first + self.findings.disputed.len()).contains(&self.finding);
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.finding = (self.finding + 1).min(n.saturating_sub(1));
+                    return true;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.finding = self.finding.saturating_sub(1);
+                    return true;
+                }
+                KeyCode::Char('x') if n > 0 => {
+                    self.reply = Some(field("Why waive it? The reason goes in the PR body"));
+                    self.on_finding = Some('x');
+                    return true;
+                }
+                KeyCode::Char('r') if disputed => {
+                    self.reply = Some(field("Why the critic is right, for the worker"));
+                    self.on_finding = Some('r');
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('n') => self.compose = Some(Compose::new(Mode::Auto, "")),
@@ -594,7 +651,7 @@ impl App {
                     Err(e) => self.notice = Some(format!("{e:#}")),
                 }
             }
-            KeyCode::Char(c @ '1'..='4') => self.tab = c as usize - '1' as usize,
+            KeyCode::Char(c @ '1'..='5') => self.tab = c as usize - '1' as usize,
             KeyCode::Char('d') => match self.slot_dir() {
                 Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default())),
                 None => self.notice = Some("this task has no worktree".into()),
@@ -667,6 +724,9 @@ impl App {
                 .slot_dir()
                 .map(|d| diffstat(&d, &base))
                 .unwrap_or_default();
+            self.findings = Findings::load(&self.state, &id).unwrap_or_default();
+            let n = self.findings.actionable().count();
+            self.finding = self.finding.min(n.saturating_sub(1));
             self.loaded = key;
         }
     }
@@ -817,6 +877,39 @@ impl App {
         Ok(url)
     }
 
+    /// `r`/`x` on the selected finding: upholds it with the human's note and sends it back to
+    /// the worker, or waives it with their reason.
+    fn act_on_finding(&mut self, act: char, text: &str) -> Result<()> {
+        let (t, _) = self.task().context("no task selected")?;
+        // the worker saves findings as it goes, so act only while it's stopped
+        ensure!(
+            t.status == Status::Review,
+            "act on findings once the task is in Review"
+        );
+        let id = t.id.clone();
+        let mut findings = Findings::load(&self.state, &id)?;
+        if act == 'x' {
+            findings.waive(self.finding, text)?;
+            findings.save(&self.state, &id)?;
+            self.info = Some("waived; the reason goes in the PR body".into());
+            return Ok(());
+        }
+        let f = findings.uphold(self.finding)?;
+        findings.save(&self.state, &id)?;
+        let prompt = format!(
+            "The human upholds this finding you disputed, so fix it and commit.\n\n\
+             [{:?}] {} - {}\nEvidence: {}\nYour reason: {}\nTheir note: {text}",
+            f.severity,
+            f.location,
+            f.claim,
+            f.evidence,
+            f.reply.as_deref().unwrap_or_default()
+        );
+        worker::spawn(&self.repo, &id, &["--reply", &prompt])?;
+        self.info = Some("sent back to the worker".into());
+        Ok(())
+    }
+
     /// `a`/`A`: approves the selected proposal, or all of them, and starts whatever is ready.
     fn approve(&mut self, all: bool) -> Result<()> {
         let selected = self.task().map(|(t, _)| t.id.clone());
@@ -865,6 +958,9 @@ impl App {
     /// Sends `text` to the selected proposal's lead, which refiles its revised plan.
     fn send_reply(&mut self, text: &str) -> Result<()> {
         ensure!(!text.trim().is_empty(), "write a reply first");
+        if let Some(act) = self.on_finding.take() {
+            return self.act_on_finding(act, text.trim());
+        }
         if let Some(r) = self.request() {
             let id = r.id.clone();
             lead::follow_up(&self.repo, &self.state, &id, text.trim())?;
@@ -995,6 +1091,14 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         vec![("tab", "field"), ("ctrl-s", "submit"), ("esc", "cancel")]
     } else if app.reply.is_some() {
         vec![("ctrl-s", "send"), ("esc", "cancel")]
+    } else if app.on_findings() {
+        let first = app.findings.findings.len();
+        let disputed = (first..first + app.findings.disputed.len()).contains(&app.finding);
+        let mut keys = vec![("j/k", "finding")];
+        keys.extend(disputed.then_some(("r", "uphold")));
+        keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive")));
+        keys.extend([("tab", "pane"), ("1-5", "tabs"), ("?", "help")]);
+        keys
     } else if app.instruction.is_some() {
         vec![("enter", "redraft"), ("esc", "cancel")]
     } else if app.preview {
@@ -1008,7 +1112,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
                 "x" => selected.is_some() || failed || answered,
                 "t" => failed,
                 "p" | "y" => answered,
-                "1-4" => selected.is_some(),
+                "1-5" => selected.is_some(),
                 "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
                 "r" => answered || selected.is_some_and(|t| t.status == Status::Proposed),
                 "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
@@ -1065,7 +1169,12 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         let all = f.area();
         f.buffer_mut().set_style(all, Style::new().dim());
         let area = centered(all, 64, 8);
-        let block = pane("Reply to the lead", true, theme);
+        let title = match app.on_finding {
+            Some('x') => "Waive the finding",
+            Some(_) => "Uphold the finding",
+            None => "Reply to the lead",
+        };
+        let block = pane(title, true, theme);
         f.render_widget(Clear, area);
         f.render_widget(input, block.inner(area));
         f.render_widget(block, area);
@@ -1232,8 +1341,18 @@ fn list(
                 selected = Some(items.len());
             }
             let age = since.and_then(|s| now.duration_since(s).ok());
+            let age = age.map(short).unwrap_or_default();
+            // ponytail: the step is the status; T16's Activity knows the real one (testing, editing)
+            let right = match t.status {
+                Status::Running => format!("working · {age}"),
+                Status::Checking => format!("gate · {age}"),
+                _ if app.disputed.contains(&t.id) => format!("disputed · {age}"),
+                _ => age,
+            };
             let depth = lineage(t, &app.tasks).len() - 1;
-            items.push(ListItem::new(row(t, depth, age, sel, width, theme, tick)));
+            items.push(ListItem::new(row(
+                t, depth, &right, sel, width, theme, tick,
+            )));
             i += 1;
         }
     }
@@ -1245,19 +1364,12 @@ fn list(
 fn row(
     t: &Task,
     depth: usize,
-    age: Option<Duration>,
+    right: &str,
     sel: bool,
     width: usize,
     theme: &Theme,
     tick: usize,
 ) -> Line<'static> {
-    let age = age.map(short).unwrap_or_default();
-    // ponytail: the step is the status; T16's Activity knows the real one (testing, editing)
-    let right = match t.status {
-        Status::Running => format!("working · {age}"),
-        Status::Checking => format!("gate · {age}"),
-        _ => age,
-    };
     let title = if t.title.is_empty() { &t.id } else { &t.title };
     let title = match depth {
         0 => title.clone(),
@@ -1265,7 +1377,7 @@ fn row(
     };
     let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
     let glyph = theme.glyph(t.status, gate_failed, tick);
-    row_line(glyph, &title, &right, sel, width, theme)
+    row_line(glyph, &title, right, sel, width, theme)
 }
 
 /// A list row from its parts: selection bar, glyph, title and dim right-hand text.
@@ -1338,6 +1450,10 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
         }
         1 => activity_tab(f, body, &app.activity, theme),
         2 => gate_tab(f, body, t, &app.gate_log, theme),
+        FINDINGS => {
+            let cursor = app.on_findings().then_some(app.finding);
+            findings_tab(f, body, &app.findings, cursor, theme)
+        }
         _ => diff_tab(f, body, &app.diff, theme),
     }
 }
@@ -1490,6 +1606,62 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// The critic's findings by what became of them, each with its evidence and the worker's or the
+/// human's reply; `cursor` marks the selected one of the actionable (open, disputed, optional).
+fn findings_tab(f: &mut Frame, area: Rect, fs: &Findings, cursor: Option<usize>, theme: &Theme) {
+    let mut lines = Vec::new();
+    if let Some(e) = &fs.error {
+        lines.push(Line::styled(
+            format!("The critic didn't finish: {e}"),
+            theme.red,
+        ));
+    }
+    let sections = [
+        ("Open", &fs.findings, true, "worker"),
+        ("Disputed", &fs.disputed, true, "worker"),
+        ("Optional, unproven", &fs.optional, true, "worker"),
+        ("Fixed", &fs.fixed, false, "worker"),
+        ("Waived", &fs.waived, false, "reason"),
+    ];
+    let mut i = 0;
+    for (label, list, actionable, who) in sections {
+        if list.is_empty() {
+            continue;
+        }
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::raw(label).dim());
+        for x in list {
+            let sel = actionable && cursor == Some(i);
+            i += usize::from(actionable);
+            let glyph = match x.severity {
+                Severity::Blocker => Span::styled(theme.fail, theme.red),
+                Severity::Major => Span::styled(theme.checking, theme.amber),
+                Severity::Minor => Span::raw(theme.queued).dim(),
+            };
+            let claim = Span::raw(x.claim.clone());
+            lines.push(Line::from(vec![
+                Span::styled(if sel { theme.bar } else { " " }, theme.accent),
+                Span::raw(" "),
+                glyph,
+                Span::raw(format!(" {} ", x.location)).dim(),
+                if sel { claim.bold() } else { claim },
+            ]));
+            if !x.evidence.is_empty() {
+                lines.push(Line::raw(format!("    {}", x.evidence)).dim());
+            }
+            if let Some(reply) = &x.reply {
+                lines.push(Line::raw(format!("    {who}: {reply}")).dim());
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw("No findings yet.").dim());
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 /// One line per tool call, following the tail: edits in the accent, shell commands in a
@@ -1689,6 +1861,10 @@ mod tests {
             edit: false,
             reply: None,
             answer: None,
+            on_finding: None,
+            findings: Findings::default(),
+            finding: 0,
+            disputed: Vec::new(),
         };
         (app, now)
     }
@@ -1722,7 +1898,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Diff                            │",
+                "│ Summary  Activity  Gate  Findings  Diff                  │",
                 "│                                                          │",
                 "│ Reject negative max_delay                                │",
                 "│ Review · u/reject-negative · slot 1 · opus/high · CC-687 │",
@@ -1733,7 +1909,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR",
+                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR",
             ]
         );
     }
@@ -1759,7 +1935,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Diff                            │",
+                "│ Summary  Activity  Gate  Findings  Diff                  │",
                 "│                                                          │",
                 "│ read    src/old.rs                                       │",
                 "│ read    src/config.rs                                    │",
@@ -1770,7 +1946,7 @@ mod tests {
                 "│ TodoWrite                                                │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR",
+                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR",
             ]
         );
     }
@@ -1797,7 +1973,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Diff                            │",
+                "│ Summary  Activity  Gate  Findings  Diff                  │",
                 "│                                                          │",
                 "│ ✓  clean tree                                            │",
                 "│ ✓  fmt                                                   │",
@@ -1808,7 +1984,7 @@ mod tests {
                 "│ thread 'parse' panicked at src/config.rs:40:9:           │",
                 "│ assertion failed: delay >= 0                             │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  x discard",
+                " n new task  j/k move  tab pane  1-5 tabs  d diff  x discard",
             ]
         );
     }
@@ -1822,11 +1998,11 @@ mod tests {
             ("assets/logo.png".into(), 0, 0),
         ];
         assert_eq!(
-            tab_screen(app, 3),
+            tab_screen(app, 4),
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Diff                            │",
+                "│ Summary  Activity  Gate  Findings  Diff                  │",
                 "│                                                          │",
                 "│ src/config.rs             +12    -3 ++++++--             │",
                 "│ crates/ledger/src/limi…   +40    -0 ++++++++++++++++++++ │",
@@ -1837,7 +2013,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR",
+                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR",
             ]
         );
     }
@@ -2000,7 +2176,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ○ 3                                                                          ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ Review                                    ││ Summary  Activity  Gate  Diff                       │",
+                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff             │",
                 "│   ✓ Reject negative max_delay             ││                                                     │",
                 "│                                           ││ Reject negative max_delay in the CLI                │",
                 "│ Proposed                                  ││ Proposed · CC-687 · cli, config · after “Validate   │",
@@ -2013,7 +2189,7 @@ mod tests {
                 "│                                           ││ - the error names the flag                          │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  a approve  A approve all  e edit  r reply  x discard  ? h",
+                " n new task  j/k move  tab pane  1-5 tabs  a approve  A approve all  e edit  r reply  x discard  ? h",
             ]
         );
     }
@@ -2171,6 +2347,108 @@ mod tests {
         fs::remove_dir_all(&state).unwrap();
     }
 
+    fn sample_findings() -> Findings {
+        use crate::critic::Finding;
+        let finding =
+            |severity, location: &str, claim: &str, evidence: &str, reply: Option<&str>| Finding {
+                severity,
+                location: location.into(),
+                claim: claim.into(),
+                evidence: evidence.into(),
+                reply: reply.map(Into::into),
+            };
+        Findings {
+            findings: vec![finding(
+                Severity::Blocker,
+                "src/config.rs:41",
+                "-1 still parses",
+                "cargo test negative fails",
+                None,
+            )],
+            disputed: vec![finding(
+                Severity::Major,
+                "src/retry.rs:9",
+                "no test for zero",
+                "no test calls it with 0",
+                Some("0 is covered by the default"),
+            )],
+            optional: vec![finding(
+                Severity::Major,
+                "src/lib.rs:3",
+                "may overflow",
+                "",
+                None,
+            )],
+            waived: vec![finding(
+                Severity::Minor,
+                "src/config.rs:40",
+                "rename it",
+                "",
+                Some("matches the API"),
+            )],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn findings_tab() {
+        let (mut app, _) = app();
+        app.findings = sample_findings();
+        (app.finding, app.detail, app.tab) = (1, true, FINDINGS);
+        let mut term = Terminal::new(TestBackend::new(60, 22)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
+                "╭ Task ────────────────────────────────────────────────────╮",
+                "│ Summary  Activity  Gate  Findings  Diff                  │",
+                "│                                                          │",
+                "│ Open                                                     │",
+                "│   ✗ src/config.rs:41 -1 still parses                     │",
+                "│     cargo test negative fails                            │",
+                "│                                                          │",
+                "│ Disputed                                                 │",
+                "│ ▌ ◆ src/retry.rs:9 no test for zero                      │",
+                "│     no test calls it with 0                              │",
+                "│     worker: 0 is covered by the default                  │",
+                "│                                                          │",
+                "│ Optional, unproven                                       │",
+                "│   ◆ src/lib.rs:3 may overflow                            │",
+                "│                                                          │",
+                "│ Waived                                                   │",
+                "│   ○ src/config.rs:40 rename it                           │",
+                "│     reason: matches the API                              │",
+                "│                                                          │",
+                "╰──────────────────────────────────────────────────────────╯",
+                " j/k finding  r uphold  x waive  tab pane  1-5 tabs  ? help ",
+            ]
+        );
+    }
+
+    #[test]
+    fn waiving_a_finding() {
+        let (mut app, _) = app();
+        let state = std::env::temp_dir().join(format!("yogan-waive-{}", std::process::id()));
+        sample_findings().save(&state, "t1").unwrap();
+        app.state = state.clone();
+        (app.detail, app.tab) = (true, FINDINGS);
+        app.load_tab();
+        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.on_finding, Some('x'));
+        app.reply.as_mut().unwrap().insert_str("0 is fine here");
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        let saved = Findings::load(&state, "t1").unwrap();
+        assert!(saved.disputed.is_empty());
+        assert_eq!(saved.waived[1].claim, "no test for zero");
+        assert_eq!(saved.waived[1].reply.as_deref(), Some("0 is fine here"));
+        fs::remove_dir_all(&state).unwrap();
+    }
+
     #[test]
     fn reaps_dead_leads() {
         let state = std::env::temp_dir().join(format!("yogan-reap-{}", std::process::id()));
@@ -2263,7 +2541,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ Review                                    ││ Summary  Activity  Gate  Diff                       │",
+                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff             │",
                 "│ ▌ ✓ Reject negative max_delay          4m ││                                                     │",
                 "│                                           ││ Reject negative max_delay                           │",
                 "│ Failed                                    ││ Review · u/reject-negative · slot 1 · opus/high     │",
@@ -2276,7 +2554,7 @@ mod tests {
                 "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR  x discard  ? help  q quit             ",
+                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR  x discard  ? help  q quit             ",
             ]
         );
     }
@@ -2298,7 +2576,7 @@ mod tests {
                 "│ Running                                                  │",
                 "│ > / Retry webhook sends                    working · 12m │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  x discard  ? help",
+                " n new task  j/k move  tab pane  1-5 tabs  x discard  ? help",
             ]
         );
     }
