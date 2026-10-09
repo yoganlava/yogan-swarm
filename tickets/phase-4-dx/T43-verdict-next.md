@@ -1,4 +1,4 @@
-- [ ] **T43 Pipeline strip, verdict and NEXT buttons**
+- [x] **T43 Pipeline strip, verdict and NEXT buttons**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Try it (detail pane); Screens › B; Visual language.
 
