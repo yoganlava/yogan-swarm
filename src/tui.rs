@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -231,13 +231,16 @@ impl Settings {
 }
 
 /// Every color and glyph, so a light-terminal or ASCII variant is one swap. Only key and reason
-/// chips paint a background: elsewhere the terminal's own theme shows through.
+/// chips and the hovered target paint a background: elsewhere the terminal's own theme shows
+/// through.
 pub struct Theme {
     accent: Color,
     /// Behind a footer key.
     key: Color,
     /// Text on a reason chip.
     ink: Color,
+    /// Behind the target under the mouse.
+    hover: Color,
     /// Shell commands in Activity.
     shell: Color,
     green: Color,
@@ -286,6 +289,7 @@ impl Theme {
             accent: rgb(122, 162, 247, Color::Blue),
             key: rgb(42, 47, 69, Color::Black),
             ink: rgb(26, 27, 38, Color::Black),
+            hover: rgb(59, 66, 97, Color::DarkGray),
             shell: rgb(125, 207, 255, Color::Cyan),
             green: rgb(158, 206, 106, Color::Green),
             amber: rgb(224, 175, 104, Color::Yellow),
@@ -443,19 +447,29 @@ struct App {
     slots: u32,
     /// Where the last frame drew things, for the mouse.
     hits: RefCell<Hits>,
+    /// The mouse's cell, whose target gets a tint and its hint in its pane's bottom border.
+    hover: Option<Position>,
 }
 
 /// A file `e` edits, as (task id, whether it's the PR draft, path).
 type Edit = (String, bool, PathBuf);
 
-/// The list and detail panes, for the wheel, and each clickable rect in drawing order.
+/// The list and detail panes, for the wheel, and each clickable rect with its hover hint, in
+/// drawing order.
 #[derive(Default)]
 struct Hits {
     list: Rect,
     detail: Rect,
     /// The detail tabs, where the wheel cycles them.
     tabs: Rect,
-    targets: Vec<(Rect, Target)>,
+    targets: Vec<(Rect, Target, String)>,
+}
+
+impl Hits {
+    /// The topmost target at `p`.
+    fn at(&self, p: Position) -> Option<&(Rect, Target, String)> {
+        self.targets.iter().rev().find(|(r, ..)| r.contains(p))
+    }
 }
 
 /// What a click does: press a key, or one of the things with no key: select a list row, fold
@@ -619,6 +633,7 @@ pub fn run(repo: &Path) -> Result<()> {
         slots: cfg.as_ref().map_or(0, |c| c.worker.slots),
         window: cfg.map_or((0, 1.0), |c| (c.watch.autocompact, c.watch.handoff_at)),
         hits: RefCell::default(),
+        hover: None,
     };
     let theme = Theme::detect();
     let mouse = config::load(repo).is_ok_and(|c| c.tui.mouse);
@@ -654,14 +669,22 @@ pub fn run(repo: &Path) -> Result<()> {
             }
             let running = app.tasks.iter().any(|(t, _)| running(t));
             let wait = Duration::from_millis(if running { 125 } else { 250 });
-            if event::poll(wait)? {
+            let until = Instant::now() + wait;
+            while event::poll(until.saturating_duration_since(Instant::now()))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press && !app.key(key) => {
                         return Ok(());
                     }
+                    // a move that keeps the same hovered target doesn't redraw
+                    Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                        if !app.hover(Position::new(m.column, m.row)) {
+                            continue;
+                        }
+                    }
                     Event::Mouse(m) if !app.mouse(m) => return Ok(()),
                     _ => {}
                 }
+                break;
             }
             if let Some((dir, base, path)) = app.pager.take() {
                 restore(mouse);
@@ -1648,6 +1671,16 @@ impl App {
         ])
     }
 
+    /// Moves the hover to `at`; true when that changes the hovered target, which needs a redraw.
+    fn hover(&mut self, at: Position) -> bool {
+        let hits = self.hits.borrow();
+        let rect = |p: Option<Position>| p.and_then(|p| hits.at(p)).map(|(r, ..)| *r);
+        let changed = rect(self.hover) != rect(Some(at));
+        drop(hits);
+        self.hover = Some(at);
+        changed
+    }
+
     /// A click presses the key of the target under it or selects its row; the wheel scrolls the
     /// detail pane or moves through the list. Returns false to quit.
     fn mouse(&mut self, m: MouseEvent) -> bool {
@@ -1657,12 +1690,11 @@ impl App {
         let at = Position::new(m.column, m.row);
         let (in_list, in_detail, in_tabs, hit) = {
             let hits = self.hits.borrow();
-            let hit = hits.targets.iter().rev().find(|(r, _)| r.contains(at));
             (
                 hits.list.contains(at),
                 hits.detail.contains(at),
                 hits.tabs.contains(at),
-                hit.map(|(_, t)| *t),
+                hits.at(at).map(|(_, t, _)| *t),
             )
         };
         let before = self.selected;
@@ -2088,7 +2120,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         app.hits
             .borrow_mut()
             .targets
-            .push((divider, Target::Divider));
+            .push((divider, Target::Divider, "drag · resize".into()));
         list(f, left, app, theme, !app.detail, tick, now);
         detail(f, right, app, theme, app.detail, tick, now);
     } else if app.detail {
@@ -2219,7 +2251,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             for k in &keys {
                 let w = Line::from(chip(k).to_vec()).width() as u16;
                 let rect = Rect::new(x, footer.y, w, 1).intersection(footer);
-                let target = key_of(k.0).map(|key| (rect, Target::Key(key)));
+                let hint = format!("{} · {}", k.0, k.1);
+                let target = key_of(k.0).map(|key| (rect, Target::Key(key), hint));
                 app.hits.borrow_mut().targets.extend(target);
                 x = x.saturating_add(w);
             }
@@ -2276,8 +2309,12 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             ];
             let w = Line::from(button[..2].to_vec()).width() as u16;
             let rect = Rect::new(x, buttons.y, w, 1).intersection(buttons);
+            let hint = format!("{key} · {label}");
             let key = KeyEvent::new(code, KeyModifiers::NONE);
-            app.hits.borrow_mut().targets.push((rect, Target::Key(key)));
+            app.hits
+                .borrow_mut()
+                .targets
+                .push((rect, Target::Key(key), hint));
             x = x.saturating_add(w + 3);
             row.extend(button);
         }
@@ -2340,11 +2377,29 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             .padding(Padding::horizontal(1));
         f.render_widget(Clear, area);
         f.render_widget(para.block(block), area);
-        let target = match err {
-            true => Target::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            false => Target::Info,
+        let (target, hint) = match err {
+            true => (
+                Target::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                "esc",
+            ),
+            false => (Target::Info, "click"),
         };
-        app.hits.borrow_mut().targets.push((area, target));
+        let hint = format!("{hint} · dismiss");
+        app.hits.borrow_mut().targets.push((area, target, hint));
+    }
+    // the hovered target gets a tint, and its hint in the bottom border of its pane
+    let hits = app.hits.borrow();
+    if let Some(at) = app.hover
+        && let Some((rect, _, hint)) = hits.at(at)
+    {
+        f.buffer_mut()
+            .set_style(*rect, Style::new().bg(theme.hover));
+        let pane = [hits.list, hits.detail]
+            .into_iter()
+            .find(|p| p.contains(at));
+        let hint = Line::styled(format!(" {hint} "), theme.accent).right_aligned();
+        let area = pane.unwrap_or(body).inner(Margin::new(1, 0));
+        f.render_widget(Block::new().title_bottom(hint), area);
     }
 }
 
@@ -2484,7 +2539,11 @@ fn header_line(app: &App, theme: &Theme, area: Rect, compact: bool) -> Line<'sta
     };
     let rect = Rect::new(x, area.y, chip.width() as u16, 1).intersection(area);
     let key = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE);
-    app.hits.borrow_mut().targets.push((rect, Target::Key(key)));
+    let hint = "] · next needing you".into();
+    app.hits
+        .borrow_mut()
+        .targets
+        .push((rect, Target::Key(key), hint));
     spans.push(chip);
     if compact {
         spans.push(Span::raw("  "));
@@ -2519,10 +2578,11 @@ fn header_line(app: &App, theme: &Theme, area: Rect, compact: bool) -> Line<'sta
                 let t = &app.tasks[i].0;
                 let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
                 let rect = Rect::new(x, area.y, 1, 1).intersection(area);
-                app.hits
-                    .borrow_mut()
-                    .targets
-                    .push((rect, Target::Row(n + i)));
+                app.hits.borrow_mut().targets.push((
+                    rect,
+                    Target::Row(n + i),
+                    "click · select".into(),
+                ));
                 Span::styled(theme.slot.0, theme.glyph(t.status, gate_failed, 0).style)
             }
             None => Span::raw(theme.slot.1).dim(),
@@ -2700,7 +2760,8 @@ fn list(
     let bar: Vec<_> = (bar.into_iter())
         .filter_map(|(r, top)| {
             let mut below = rows[top..].iter().flatten();
-            Some((r, *below.find(|t| matches!(t, Target::Row(_)))?))
+            let row = *below.find(|t| matches!(t, Target::Row(_)))?;
+            Some((r, row, "click · scroll".into()))
         })
         .collect();
     let mut hits = app.hits.borrow_mut();
@@ -2710,14 +2771,17 @@ fn list(
         .skip(state.offset())
         .zip(inner.y..inner.bottom());
     let rows = shown.filter_map(|(target, y)| {
-        Some((
-            Rect {
-                y,
-                height: 1,
-                ..area
-            },
-            target?,
-        ))
+        let target = target?;
+        let hint = match target {
+            Target::Fold(_) => "click · fold",
+            _ => "click select · double-click zoom",
+        };
+        let rect = Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+        Some((rect, target, hint.into()))
     });
     hits.targets.extend(rows);
     hits.targets.extend(bar);
@@ -2813,9 +2877,9 @@ fn detail(
 ) {
     app.hits.borrow_mut().detail = area;
     let compact = f.area().height < COMPACT;
-    let (label, key) = match app.zoom {
-        true => (" esc unzoom ", KeyCode::Esc),
-        false => (" z zoom ", KeyCode::Char('z')),
+    let (label, key, hint) = match app.zoom {
+        true => (" esc unzoom ", KeyCode::Esc, "esc · unzoom"),
+        false => (" z zoom ", KeyCode::Char('z'), "z · zoom"),
     };
     let block = pane("Task", focused, theme).title(Line::raw(label).dim().right_aligned());
     let inner = block.inner(area);
@@ -2823,7 +2887,10 @@ fn detail(
     let w = label.width() as u16;
     let rect = Rect::new(area.right().saturating_sub(w + 1), area.y, w, 1).intersection(area);
     let target = Target::Key(KeyEvent::new(key, KeyModifiers::NONE));
-    app.hits.borrow_mut().targets.push((rect, target));
+    app.hits
+        .borrow_mut()
+        .targets
+        .push((rect, target, hint.into()));
     app.scroll.bar.set(None);
     detail_body(f, inner, app, theme, compact, tick, now);
     // the tab's scrollbar sits on the pane's right border; a click there jumps to that offset
@@ -2837,7 +2904,7 @@ fn detail(
         let rows = scrollbar(f, track, max as usize, top as usize);
         let rows = rows.into_iter().map(|(r, top)| {
             let offset = if tail { max - top as u16 } else { top as u16 };
-            (r, Target::Scroll(offset))
+            (r, Target::Scroll(offset), "click · scroll".into())
         });
         app.hits.borrow_mut().targets.extend(rows);
     }
@@ -2933,7 +3000,7 @@ fn detail_body(
         ];
         let w = Line::from(button.to_vec()).width() as u16;
         let rect = Rect::new(x, next.y, w, 1).intersection(next);
-        let target = key_of(key).map(|k| (rect, Target::Key(k)));
+        let target = key_of(key).map(|k| (rect, Target::Key(k), format!("{key} · {label}")));
         app.hits.borrow_mut().targets.extend(target);
         x = x.saturating_add(w + 2);
         line.extend(button);
@@ -2976,7 +3043,8 @@ fn detail_body(
         let w = Line::from(spans.clone()).width() as u16;
         let key = if compact { (i + 1) % TABS.len() } else { i };
         let rect = Rect::new(x, tabs.y, w, 1).intersection(tabs);
-        hits.targets.push((rect, Target::Key(digit(key))));
+        let hint = format!("{} · {}", key + 1, TABS[key]);
+        hits.targets.push((rect, Target::Key(digit(key)), hint));
         x = x.saturating_add(w);
         line.extend(spans);
     }
@@ -3705,6 +3773,7 @@ mod tests {
             folded: [false; 3],
             slots: 3,
             hits: RefCell::default(),
+            hover: None,
         };
         (app, now)
     }
@@ -5187,6 +5256,78 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.tab, RUN);
+    }
+
+    #[test]
+    fn hover_shows_the_key() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let at = |term: &Terminal<TestBackend>, text: &str| {
+            let rows = screen(term);
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(text))
+                .unwrap();
+            Position::new(
+                row[..row.find(text).unwrap()].chars().count() as u16,
+                y as u16,
+            )
+        };
+        let border = |term: &Terminal<TestBackend>| screen(term)[22].clone();
+
+        // a move over a tab sets the hint, one within it changes nothing, empty space clears it
+        let gate = at(&term, "Gate ✓  Findings");
+        assert!(app.hover(gate));
+        assert!(!app.hover(Position {
+            x: gate.x + 1,
+            ..gate
+        }));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(border(&term).ends_with("─ 3 · Gate ╯"), "{}", border(&term));
+        assert!(app.hover(Position::new(70, 8)));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(!border(&term).contains('·'));
+
+        // a footer key: tinted, and named in the bottom border above it
+        let m = at(&term, " m  open PR");
+        assert!(app.hover(m));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued                         slots ▰▱▱   $0.00 ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ ▾ NEEDS YOU 2 ─────────────────────────── ││ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr          │",
+                "│ ▌ ✓ Reject negative max_delay   ready  4m ││                                                     │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ gate    ● 1/1            slot 1 · opus/high         │",
+                "│                                           ││ spend   ──────── $0.00/$5.00                        │",
+                "│ ▾ WORKING 1 ───────────────────────────── ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ NEXT   m  open the PR    r  ask for changes         │",
+                "│                                           ││                                                     │",
+                "│ ▾ LATER 1 ─────────────────────────────── ││  Summary  Activity  Gate ✓  Findings  Diff  Run     │",
+                "│   ○ Split the ledger reconc… needs a slot ││                                                     │",
+                "│                                           ││ Reject negative max_delay                           │",
+                "│                                           ││ Review · u/reject-negative · slot 1 · opus/high     │",
+                "│                                           ││                                                     │",
+                "│                                           ││ max_delay below zero now fails at parse time.       │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰──────────────────────────────────────── m · open PR ╯",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+            ]
+        );
+        let buf = term.backend().buffer();
+        assert_eq!(buf[m].bg, theme.hover);
+        assert_eq!(buf[(m.x + 11, m.y)].bg, theme.hover);
+        assert_ne!(buf[(m.x + 12, m.y)].bg, theme.hover);
     }
 
     #[test]

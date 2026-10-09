@@ -1,4 +1,4 @@
-- [ ] **T40 Hover shows the key**
+- [x] **T40 Hover shows the key**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Try it (hover); How it's built › Hover.
 
