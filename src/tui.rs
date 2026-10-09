@@ -21,9 +21,10 @@ use rustix::process::{Pid, test_kill_process};
 use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::lead::{self, Phase, Request};
 use crate::stream::{self, Content};
 use crate::task::{self, Status, Task};
-use crate::{config, git, lead, pr, sched, slot, worker};
+use crate::{config, git, pr, sched, slot, worker};
 
 /// List order, what needs you first; `Discarded` isn't shown.
 const GROUPS: [(Status, &str); 7] = [
@@ -129,8 +130,11 @@ struct App {
     repo: PathBuf,
     state: PathBuf,
     name: String,
+    /// Requests whose lead is planning or failed, listed before the tasks.
+    requests: Vec<Request>,
     /// Shown tasks in list order, each with when its file last changed.
     tasks: Vec<(Task, Option<SystemTime>)>,
+    /// A row of `requests` then `tasks`.
     selected: usize,
     /// Narrow layout shows the detail pane instead of the list.
     detail: bool,
@@ -201,6 +205,7 @@ pub fn run(repo: &Path) -> Result<()> {
         repo: repo.to_path_buf(),
         state: state.clone(),
         name: name.into_owned(),
+        requests: Vec::new(),
         tasks: Vec::new(),
         selected: 0,
         detail: false,
@@ -388,13 +393,28 @@ fn reap(state: &Path) -> Result<()> {
             t.save(state)?;
         }
     }
+    // a lead records its pid when it starts, so none yet means it hasn't
+    for mut r in lead::load_all(state)? {
+        if r.status == Phase::Planning && r.pid.is_some_and(|p| !alive(p)) {
+            r.status = Phase::Failed;
+            r.summary = Some("the lead exited without finishing".into());
+            r.save(state)?;
+        }
+    }
     Ok(())
 }
 
 impl App {
-    /// Re-reads the task files, keeping the selection on the same task.
+    /// Re-reads the request and task files, keeping the selection on the same row.
     fn reload(&mut self, state: &Path) -> Result<()> {
-        let id = self.tasks.get(self.selected).map(|(t, _)| t.id.clone());
+        let id = match self.request() {
+            Some(r) => Some(r.id.clone()),
+            None => self.task().map(|(t, _)| t.id.clone()),
+        };
+        let mut requests = lead::load_all(state)?;
+        requests.retain(|r| r.status != Phase::Done);
+        requests.sort_by(|a, b| a.id.cmp(&b.id));
+        self.requests = requests;
         let rank = |s: Status| GROUPS.iter().position(|(g, _)| *g == s);
         let tasks: Vec<_> = task::load_all(state)?
             .into_iter()
@@ -410,9 +430,23 @@ impl App {
         // children right after their parent, so the list reads as a tree
         tasks.sort_by(|(a, pa), (b, pb)| (rank(a.0.status), pa).cmp(&(rank(b.0.status), pb)));
         self.tasks = tasks.into_iter().map(|(t, _)| t).collect();
-        let same = id.and_then(|id| self.tasks.iter().position(|(t, _)| t.id == id));
-        self.selected = same.unwrap_or(self.selected.min(self.tasks.len().saturating_sub(1)));
+        let mut ids =
+            (self.requests.iter().map(|r| &r.id)).chain(self.tasks.iter().map(|(t, _)| &t.id));
+        let same = id.and_then(|id| ids.position(|i| *i == id));
+        let rows = self.requests.len() + self.tasks.len();
+        self.selected = same.unwrap_or(self.selected.min(rows.saturating_sub(1)));
         Ok(())
+    }
+
+    /// The selected row's request, if it's one.
+    fn request(&self) -> Option<&Request> {
+        self.requests.get(self.selected)
+    }
+
+    /// The selected row's task, if it's one.
+    fn task(&self) -> Option<&(Task, Option<SystemTime>)> {
+        let i = self.selected.checked_sub(self.requests.len())?;
+        self.tasks.get(i)
     }
 
     /// Returns false to quit.
@@ -500,8 +534,7 @@ impl App {
             return true;
         }
         let proposed = self
-            .tasks
-            .get(self.selected)
+            .task()
             .is_some_and(|(t, _)| t.status == Status::Proposed);
         match key.code {
             KeyCode::Char('?') => self.help = true,
@@ -527,7 +560,8 @@ impl App {
                 self.reply = Some(field("What should the lead change?"));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(self.tasks.len().saturating_sub(1));
+                let rows = self.requests.len() + self.tasks.len();
+                self.selected = (self.selected + 1).min(rows.saturating_sub(1));
             }
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
             KeyCode::Tab => self.detail = !self.detail,
@@ -539,23 +573,23 @@ impl App {
 
 impl App {
     fn slot_dir(&self) -> Option<PathBuf> {
-        let (t, _) = self.tasks.get(self.selected)?;
+        let (t, _) = self.task()?;
         Some(self.state.join("slots").join(t.slot?.to_string()))
     }
 
     /// Reads what the current tab shows for the selected task. The gate log and diff are
     /// re-read only when the task's file changes; the activity tail every time.
     fn load_tab(&mut self) {
-        let Some((t, since)) = self.tasks.get(self.selected) else {
+        let Some((id, since)) = self.task().map(|(t, since)| (t.id.clone(), *since)) else {
             return;
         };
         if self.tab == 1 {
-            let log = self.state.join(format!("logs/{}.jsonl", t.id));
+            let log = self.state.join(format!("logs/{id}.jsonl"));
             self.activity = activity(&log, &self.slot_dir().unwrap_or_default());
         }
-        let key = Some((t.id.clone(), *since));
+        let key = Some((id.clone(), since));
         if self.tab >= 2 && self.loaded != key {
-            let log = self.state.join(format!("logs/{}.gate.log", t.id));
+            let log = self.state.join(format!("logs/{id}.gate.log"));
             self.gate_log = fs::read_to_string(log).unwrap_or_default();
             self.diff = self.slot_dir().map(|d| diffstat(&d)).unwrap_or_default();
             self.loaded = key;
@@ -564,7 +598,7 @@ impl App {
 
     /// Stops the task's worker, runs `[scripts] teardown` in its slot and frees the slot.
     fn discard(&mut self) -> Result<()> {
-        let Some((t, _)) = self.tasks.get(self.selected) else {
+        let Some((t, _)) = self.task() else {
             return Ok(());
         };
         let mut t = t.clone();
@@ -601,7 +635,7 @@ impl App {
     /// and draft it (following `instruction` when regenerating); the preview opens when it lands.
     fn draft(&mut self, instruction: Option<&str>) -> Result<()> {
         ensure!(self.awaiting.is_none(), "a PR draft is on its way");
-        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        let (t, _) = self.task().context("no task selected")?;
         ensure!(
             t.status == Status::Review && gate_passed(t),
             "a PR needs a task in Review with a passing gate"
@@ -635,6 +669,7 @@ impl App {
         };
         let t = &self.tasks[i].0;
         if t.status == Status::Review && t.pr_draft.is_some() && t.pr_draft != *old {
+            let i = self.requests.len() + i;
             (self.selected, self.preview, self.awaiting) = (i, true, None);
         } else if t.status == Status::Failed || (t.status == Status::Review && !gate_passed(t)) {
             self.notice = Some("no PR draft: see the task's Summary and Gate tabs".into());
@@ -649,7 +684,7 @@ impl App {
 
     /// `e` in the preview: the draft as `title`, blank line, body in `$EDITOR`.
     fn edit_draft(&mut self) -> Result<()> {
-        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        let (t, _) = self.task().context("no task selected")?;
         let mut t = t.clone();
         let dir = self.slot_dir().context("this task has no worktree")?;
         let draft = t.pr_draft.as_mut().context("no PR draft")?;
@@ -668,7 +703,7 @@ impl App {
     /// `enter` in the preview: pushes, opens the PR, then tears down and frees the slot.
     /// Returns the PR's URL.
     fn open_pr(&mut self) -> Result<String> {
-        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        let (t, _) = self.task().context("no task selected")?;
         let mut t = t.clone();
         let dir = self.slot_dir().context("this task has no worktree")?;
         let draft = t.pr_draft.as_ref().context("no PR draft")?;
@@ -690,7 +725,7 @@ impl App {
 
     /// `a`/`A`: approves the selected proposal, or all of them, and starts whatever is ready.
     fn approve(&mut self, all: bool) -> Result<()> {
-        let selected = self.tasks.get(self.selected).map(|(t, _)| t.id.clone());
+        let selected = self.task().map(|(t, _)| t.id.clone());
         let mut tasks = task::load_all(&self.state)?;
         let ids: Vec<String> = tasks
             .iter()
@@ -713,7 +748,7 @@ impl App {
 
     /// `e` on a proposal: its editable fields as TOML in `$EDITOR`, checked like a new proposal.
     fn edit_task(&mut self) -> Result<()> {
-        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        let (t, _) = self.task().context("no task selected")?;
         ensure!(
             t.status == Status::Proposed,
             "only a proposal can be edited"
@@ -736,7 +771,7 @@ impl App {
     /// Sends `text` to the selected proposal's lead, which refiles its revised plan.
     fn send_reply(&mut self, text: &str) -> Result<()> {
         ensure!(!text.trim().is_empty(), "write a reply first");
-        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        let (t, _) = self.task().context("no task selected")?;
         ensure!(
             t.status == Status::Proposed && !t.plan.is_empty(),
             "this task has no lead to reply to"
@@ -831,7 +866,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     ])
     .areas(f.area());
     f.render_widget(header_line(app, theme), header);
-    let selected = app.tasks.get(app.selected).map(|(t, _)| t);
+    let selected = app.task().map(|(t, _)| t);
     let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
         compose(f, body, c, theme);
@@ -1010,6 +1045,27 @@ fn list(
     let block = pane("Tasks", focused, theme);
     let width = block.inner(area).width as usize;
     let (mut items, mut selected, mut i) = (Vec::new(), None, 0);
+    if !app.requests.is_empty() {
+        items.push(ListItem::new(Line::raw("Planning").dim()));
+    }
+    for r in &app.requests {
+        let sel = i == app.selected;
+        if sel {
+            selected = Some(items.len());
+        }
+        let (glyph, right) = match r.status {
+            Phase::Failed => (Span::styled(theme.fail, theme.red), "failed"),
+            _ => {
+                let spin = theme.spinner[tick % theme.spinner.len()];
+                (Span::styled(spin, theme.accent), "planning")
+            }
+        };
+        let title = r.text.lines().next().unwrap_or_default();
+        items.push(ListItem::new(row_line(
+            glyph, title, right, sel, width, theme,
+        )));
+        i += 1;
+    }
     for (status, label) in GROUPS {
         let group: Vec<_> = app
             .tasks
@@ -1060,18 +1116,31 @@ fn row(
         0 => title.clone(),
         d => format!("{}{}{title}", "  ".repeat(d - 1), theme.tree),
     };
+    let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
+    let glyph = theme.glyph(t.status, gate_failed, tick);
+    row_line(glyph, &title, &right, sel, width, theme)
+}
+
+/// A list row from its parts: selection bar, glyph, title and dim right-hand text.
+fn row_line(
+    glyph: Span<'static>,
+    title: &str,
+    right: &str,
+    sel: bool,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
     let title = truncate(
-        &title,
+        title,
         width.saturating_sub(5 + right.width()),
         theme.ellipsis,
     );
     let pad = width.saturating_sub(4 + title.width() + right.width());
-    let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
     let bar = if sel { theme.bar } else { " " };
     Line::from(vec![
         Span::styled(bar, theme.accent),
         Span::raw(" "),
-        theme.glyph(t.status, gate_failed, tick),
+        glyph,
         Span::raw(" "),
         Span::styled(
             title,
@@ -1082,7 +1151,7 @@ fn row(
             },
         ),
         Span::raw(" ".repeat(pad)),
-        Span::raw(right).dim(),
+        Span::raw(right.to_string()).dim(),
     ])
 }
 
@@ -1090,8 +1159,11 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     let block = pane("Task", focused, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let Some((t, _)) = app.tasks.get(app.selected) else {
-        f.render_widget(Line::raw("No tasks yet.").dim(), inner);
+    let Some((t, _)) = app.task() else {
+        match app.request() {
+            Some(r) => request(f, inner, r, theme),
+            None => f.render_widget(Line::raw("No tasks yet.").dim(), inner),
+        }
         return;
     };
     let [tabs, _, body] = Layout::vertical([
@@ -1154,6 +1226,24 @@ fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>) {
         lines.extend([Line::raw(""), Line::raw("Done when").bold()]);
         lines.extend(t.acceptance.iter().map(|a| Line::raw(format!("- {a}"))));
     }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// A request: its first line, status and ticket, why its lead failed, then the full request.
+fn request(f: &mut Frame, area: Rect, r: &Request, theme: &Theme) {
+    let failed = r.status == Phase::Failed;
+    let mut meta = vec![if failed { "Failed" } else { "Planning" }.to_string()];
+    meta.extend(r.ticket.clone());
+    let mut lines = vec![
+        Line::raw(r.text.lines().next().unwrap_or_default().to_string()).bold(),
+        Line::raw(meta.join(" · ")).dim(),
+        Line::raw(""),
+    ];
+    if failed && let Some(why) = &r.summary {
+        lines.extend(why.lines().map(|l| Line::styled(l.to_string(), theme.red)));
+        lines.push(Line::raw(""));
+    }
+    lines.extend(r.text.lines().map(|l| Line::raw(l.to_string()).dim()));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
@@ -1332,6 +1422,7 @@ mod tests {
             repo: PathBuf::new(),
             state: PathBuf::new(),
             name: "fuse-os".into(),
+            requests: Vec::new(),
             tasks,
             selected: 0,
             detail: false,
@@ -1675,6 +1766,78 @@ mod tests {
                 " n new task  j/k move  tab pane  1-4 tabs  a approve  A approve all  e edit  r reply  x discard  ? h",
             ]
         );
+    }
+
+    #[test]
+    fn requests_screen() {
+        let (mut app, now) = app();
+        app.requests = vec![
+            Request {
+                id: "r1".into(),
+                text: "Split the ledger job into per-account batches".into(),
+                ..Default::default()
+            },
+            Request {
+                id: "r2".into(),
+                text: "Reject a negative max_delay\nIt panics in the retry loop.".into(),
+                ticket: Some("CC-687".into()),
+                status: Phase::Failed,
+                summary: Some("claude exited with exit status: 1".into()),
+                ..Default::default()
+            },
+        ];
+        app.selected = 1;
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "│ Planning                                  ││ Reject a negative max_delay                         │",
+                "│   ⠋ Split the ledger job into p… planning ││ Failed · CC-687                                     │",
+                "│ ▌ ✗ Reject a negative max_delay    failed ││                                                     │",
+                "│                                           ││ claude exited with exit status: 1                   │",
+                "│ Review                                    ││                                                     │",
+                "│   ✓ Reject negative max_delay          4m ││ Reject a negative max_delay                         │",
+                "│                                           ││ It panics in the retry loop.                        │",
+                "│ Failed                                    ││                                                     │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " n new task  j/k move  tab pane  ? help  q quit                                                     ",
+            ]
+        );
+        assert!(app.task().is_none());
+        app.selected = 2;
+        assert_eq!(app.task().unwrap().0.id, "t1");
+    }
+
+    #[test]
+    fn reaps_dead_leads() {
+        let state = std::env::temp_dir().join(format!("yogan-reap-{}", std::process::id()));
+        let mut child = Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        let request = |id: &str, pid| Request {
+            id: id.into(),
+            pid,
+            ..Default::default()
+        };
+        request("dead", Some(child.id())).save(&state).unwrap();
+        request("starting", None).save(&state).unwrap();
+        request("alive", Some(std::process::id()))
+            .save(&state)
+            .unwrap();
+        reap(&state).unwrap();
+        let status = |id: &str| lead::load(&state, id).unwrap();
+        let dead = status("dead");
+        assert_eq!(dead.status, Phase::Failed);
+        assert_eq!(
+            dead.summary.as_deref(),
+            Some("the lead exited without finishing")
+        );
+        assert_eq!(status("starting").status, Phase::Planning);
+        assert_eq!(status("alive").status, Phase::Planning);
+        fs::remove_dir_all(&state).unwrap();
     }
 
     #[test]

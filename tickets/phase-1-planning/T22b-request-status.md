@@ -1,4 +1,4 @@
-- [ ] **T22b Request status in the TUI**
+- [x] **T22b Request status in the TUI**
 
 Plan: TUI › Screens › 1. Compose ("the request shows up under Planning"), 2. Planning.
 

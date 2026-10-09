@@ -31,6 +31,8 @@ pub struct Request {
     pub ticket: Option<String>,
     pub status: Phase,
     pub session: Option<String>,
+    /// The running lead's, for the TUI's dead-lead check.
+    pub pid: Option<u32>,
     /// The lead's final message, or why it failed.
     pub summary: Option<String>,
 }
@@ -53,6 +55,10 @@ impl Request {
     pub fn save(&self, dir: &Path) -> Result<()> {
         task::write_toml(&dir.join("requests"), &self.id, self)
     }
+}
+
+pub fn load_all(dir: &Path) -> Result<Vec<Request>> {
+    task::read_toml_dir(&dir.join("requests"))
 }
 
 pub fn load(dir: &Path, id: &str) -> Result<Request> {
@@ -109,7 +115,7 @@ pub fn reply(state: &Path, id: &str, feedback: &str) -> Result<String> {
         }
     }
     req.status = Phase::Planning;
-    req.summary = None;
+    (req.summary, req.pid) = (None, None);
     req.save(state)?;
     let mut prompt = format!(
         "{feedback}\n\nRevise the plan. Your pending proposals were withdrawn, so file every \
@@ -130,6 +136,8 @@ pub fn reply(state: &Path, id: &str, feedback: &str) -> Result<String> {
 pub fn run(repo: &Path, id: &str, reply: Option<&str>) -> Result<()> {
     let state = task::state_dir(repo)?;
     let mut req = load(&state, id)?;
+    req.pid = Some(std::process::id());
+    req.save(&state)?;
     let res = plan(repo, &state, &mut req, reply);
     req.status = if res.is_ok() {
         Phase::Done

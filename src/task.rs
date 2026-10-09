@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, ensure};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,19 +78,24 @@ pub(crate) fn write_toml(dir: &Path, id: &str, value: &impl Serialize) -> Result
 }
 
 pub fn load_all(dir: &Path) -> Result<Vec<Task>> {
-    let entries = match fs::read_dir(dir.join("tasks")) {
+    read_toml_dir(&dir.join("tasks"))
+}
+
+/// Every `<dir>/*.toml`; a missing `dir` has none.
+pub(crate) fn read_toml_dir<T: DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
+    let entries = match fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         entries => entries?,
     };
-    let mut tasks = Vec::new();
+    let mut values = Vec::new();
     for entry in entries {
         let path = entry?.path();
         if path.extension().is_some_and(|e| e == "toml") {
             let text = fs::read_to_string(&path)?;
-            tasks.push(toml::from_str(&text).with_context(|| path.display().to_string())?);
+            values.push(toml::from_str(&text).with_context(|| path.display().to_string())?);
         }
     }
-    Ok(tasks)
+    Ok(values)
 }
 
 /// `<prefix><unix seconds>`, so ids sort by creation.
