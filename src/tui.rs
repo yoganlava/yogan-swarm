@@ -90,7 +90,7 @@ const KEYS: [(&str, &str); 24] = [
     ("p", "plan it"),
     ("y", "copy"),
     ("x", "discard"),
-    ("?", "help"),
+    ("?", "commands"),
     ("q", "quit"),
     ("c", "continue"),
     ("w", "rewind"),
@@ -362,7 +362,8 @@ struct App {
     selected: usize,
     /// Narrow layout shows the detail pane instead of the list.
     detail: bool,
-    help: bool,
+    /// The command palette's query and selected row, while it's open.
+    palette: Option<(String, usize)>,
     compose: Option<Compose>,
     /// An error to show as a toast until `esc` or a click on it.
     notice: Option<String>,
@@ -470,6 +471,7 @@ struct Hits {
     detail: Rect,
     /// The detail tabs, where the wheel cycles them.
     tabs: Rect,
+    palette: Rect,
     targets: Vec<(Rect, Target, String)>,
 }
 
@@ -482,7 +484,7 @@ impl Hits {
 
 /// What a click does: press a key, or one of the things with no key: select a list row, fold
 /// a group, dismiss the info toast, start dragging the divider, scroll the detail pane to
-/// an offset, fold or unfold a Diff file, or open Diff at a finding's file.
+/// an offset, fold or unfold a Diff file, open Diff at a finding's file, or run a palette row.
 #[derive(Clone, Copy)]
 enum Target {
     Key(KeyEvent),
@@ -493,6 +495,7 @@ enum Target {
     Fold(usize),
     File(usize),
     Location(usize),
+    Command(usize),
 }
 
 /// The detail pane's scroll offset, and the scrollbar its tab asked for this frame as (area,
@@ -596,7 +599,7 @@ pub fn run(repo: &Path) -> Result<()> {
         tasks: Vec::new(),
         selected: 0,
         detail: false,
-        help: false,
+        palette: None,
         compose: None,
         notice: None,
         info: None,
@@ -1188,12 +1191,33 @@ impl App {
             }
             return true;
         }
+        if self.palette.is_some() {
+            let n = self.commands().len();
+            let Some((query, row)) = &mut self.palette else {
+                return true;
+            };
+            match key.code {
+                KeyCode::Esc => self.palette = None,
+                KeyCode::Enter => {
+                    let row = *row;
+                    return self.command(row);
+                }
+                KeyCode::Down => *row = (*row + 1).min(n.saturating_sub(1)),
+                KeyCode::Up => *row = row.saturating_sub(1),
+                KeyCode::Backspace => {
+                    query.pop();
+                    *row = 0;
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    *row = 0;
+                }
+                _ => {}
+            }
+            return true;
+        }
         if key.code == KeyCode::Char('q') {
             return false;
-        }
-        if self.help {
-            self.help = false;
-            return true;
         }
         let proposed = self
             .task()
@@ -1256,7 +1280,7 @@ impl App {
         match key.code {
             // before `d`, which would take ctrl-d too
             _ if ctrl('d') || ctrl('u') => self.scroll_by(ctrl('d')),
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?' | ':') => self.palette = Some((String::new(), 0)),
             KeyCode::Char(',') => self.open_settings(false),
             KeyCode::Char('n') => self.compose = Some(Compose::new(Mode::Auto, "")),
             KeyCode::Char('p') if answered => {
@@ -1568,7 +1592,8 @@ impl App {
             return;
         };
         // never move the selection under an open modal, whose keys would then act on it
-        let modal = self.confirm || self.help || self.reply.is_some() || self.compose.is_some();
+        let modal = self.confirm || self.palette.is_some() || self.reply.is_some();
+        let modal = modal || self.compose.is_some();
         if modal || self.instruction.is_some() {
             return;
         }
@@ -1703,11 +1728,63 @@ impl App {
         ])
     }
 
+    /// The palette's rows matching its query by subsequence: the selection's actions, the other
+    /// keys valid here, then `Go to` each task, as (key, label, context, what it runs).
+    fn commands(&self) -> Vec<(&'static str, String, String, Target)> {
+        let query = self.palette.as_ref().map_or("", |p| &p.0).to_lowercase();
+        let here = match (self.task(), self.request()) {
+            (Some((t, _)), _) => t.title.clone(),
+            (_, Some(r)) => r.text.lines().next().unwrap_or_default().to_string(),
+            _ => String::new(),
+        };
+        let actions = actions(self);
+        let others = KEYS
+            .into_iter()
+            .filter(|(k, _)| *k != "?" && valid(self, k) && !actions.iter().any(|(a, _)| a == k));
+        let keys = (actions.iter().map(|&(k, l)| (k, l, here.clone())))
+            .chain(others.map(|(k, l)| (k, l, "anywhere".to_string())))
+            .filter_map(|(k, l, at)| Some((k, l.to_string(), at, Target::Key(key_of(k)?))));
+        let n = self.requests.len();
+        let go = self.tasks.iter().enumerate().map(|(i, (t, _))| {
+            let status = status_rank(t.status).map_or("", |(_, l)| l);
+            let label = format!("Go to {}", t.title);
+            ("", label, status.to_string(), Target::Row(n + i))
+        });
+        let matches = |(k, l, ..): &(&str, String, String, Target)| {
+            let hay = format!("{k} {l}").to_lowercase();
+            let mut hay = hay.chars();
+            query.chars().all(|c| hay.any(|h| h == c))
+        };
+        keys.chain(go).filter(matches).collect()
+    }
+
+    /// Closes the palette and runs its `i`th row. Returns false to quit.
+    fn command(&mut self, i: usize) -> bool {
+        let target = self.commands().get(i).map(|c| c.3);
+        self.palette = None;
+        match target {
+            Some(Target::Key(key)) => return self.key(key),
+            Some(Target::Row(i)) if i != self.selected => {
+                self.selected = i;
+                self.scroll.set(0);
+                self.diff_file = 0;
+                self.unfolded.clear();
+            }
+            _ => {}
+        }
+        true
+    }
+
     /// Moves the hover to `at`; true when that changes the hovered target, which needs a redraw.
+    /// Hovering a palette row selects it.
     fn hover(&mut self, at: Position) -> bool {
         let hits = self.hits.borrow();
         let rect = |p: Option<Position>| p.and_then(|p| hits.at(p)).map(|(r, ..)| *r);
         let changed = rect(self.hover) != rect(Some(at));
+        if let (Some((_, row)), Some((_, Target::Command(i), _))) = (&mut self.palette, hits.at(at))
+        {
+            *row = *i;
+        }
         drop(hits);
         self.hover = Some(at);
         changed
@@ -1717,15 +1794,19 @@ impl App {
     /// detail pane or moves through the list. Returns false to quit.
     fn mouse(&mut self, m: MouseEvent) -> bool {
         let modal = self.compose.is_some() || self.settings.is_some() || self.reply.is_some();
-        let modal =
-            modal || self.preview || self.confirm || self.help || self.instruction.is_some();
+        let modal = modal
+            || self.preview
+            || self.confirm
+            || self.palette.is_some()
+            || self.instruction.is_some();
         let at = Position::new(m.column, m.row);
-        let (in_list, in_detail, in_tabs, hit) = {
+        let (in_list, in_detail, in_tabs, in_palette, hit) = {
             let hits = self.hits.borrow();
             (
                 hits.list.contains(at),
                 hits.detail.contains(at),
                 hits.tabs.contains(at),
+                hits.palette.contains(at),
                 hits.at(at).map(|(_, t, _)| *t),
             )
         };
@@ -1735,6 +1816,12 @@ impl App {
                 self.split = (m.column + 1).clamp(30, 70);
             }
             (MouseEventKind::Up(MouseButton::Left), _) => self.dragging = false,
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Command(i))) => {
+                return self.command(i);
+            }
+            (MouseEventKind::Down(_), _) if self.palette.is_some() && !in_palette => {
+                self.palette = None;
+            }
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Key(key))) => {
                 return self.key(key);
             }
@@ -2196,8 +2283,6 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         f.render_widget(header_line(app, theme, header, false), header);
     }
     let selected = app.task().map(|(t, _)| t);
-    let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
-    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
     let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
         compose(f, body, c, theme);
@@ -2273,47 +2358,12 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         vec![push, ("g", "regenerate"), ("e", "edit"), ("esc", "back")]
     } else {
         // up to six keys that do something for the selection, the one that moves it on first
-        let valid = |k: &str| match k {
-            "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
-            "x" => selected.is_some() || failed || answered,
-            "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
-            "c" => selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed)),
-            "w" => selected.is_some_and(|t| t.status == Status::Review),
-            "p" | "y" => answered,
-            "1-6" => selected.is_some(),
-            "R" => {
-                selected.is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id))
-            }
-            "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
-            "r" => {
-                answered
-                    || selected
-                        .is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
-            }
-            "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
-            "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
-            _ => true,
-        };
-        let first: &[&str] = match selected.map(|t| t.status) {
-            Some(Status::Review) => &["m", "r", "d", "x", "c", "w", "R", "o"],
-            Some(Status::Failed) => &["t", "c", "x", "d", "o"],
-            Some(Status::Proposed) => &["a", "A", "e", "r", "x"],
-            _ if answered => &["p", "r", "y", "x"],
-            _ => &["t", "d", "o", "R", "x"],
-        };
-        let mut keys: Vec<_> = [first, &["n", "1-6", "j/k", "tab", "q"]]
-            .concat()
+        let global = ["n", "1-6", "j/k", "tab", "q"]
             .into_iter()
-            .filter(|k| valid(k))
-            .filter_map(|k| KEYS.into_iter().find(|(key, _)| *key == k))
-            .map(|(k, label)| match (k, selected.map(|t| t.status)) {
-                ("x", Some(_)) => (k, "discard task"),
-                ("r", Some(Status::Review)) => (k, "reply to worker"),
-                ("r", _) => (k, "reply to lead"),
-                _ => (k, label),
-            })
-            .take(6)
-            .collect();
+            .filter(|k| valid(app, k));
+        let mut keys = actions(app);
+        keys.extend(global.filter_map(|k| KEYS.into_iter().find(|(key, _)| *key == k)));
+        keys.truncate(6);
         keys.push(("?", "more"));
         keys
     };
@@ -2368,13 +2418,11 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     };
     line.splice(0..0, prefix);
     f.render_widget(Line::from(line), footer);
-    if app.help || app.confirm || app.reply.is_some() {
+    if app.palette.is_some() || app.confirm || app.reply.is_some() {
         // only an open modal's own targets respond
         app.hits.borrow_mut().targets.clear();
     }
-    if app.help {
-        help(f, theme);
-    }
+    palette(f, app, theme);
     let confirm = match (app.request(), selected) {
         (Some(r), _) => Some((
             "Dismiss",
@@ -2512,6 +2560,133 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
 
 fn gate_passed(t: &Task) -> bool {
     t.gate.as_ref().is_some_and(|g| g.iter().all(|c| c.passed))
+}
+
+/// Whether the `KEYS` key `k` does something for the selection.
+fn valid(app: &App, k: &str) -> bool {
+    let selected = app.task().map(|(t, _)| t);
+    let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
+    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
+    match k {
+        "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
+        "x" => selected.is_some() || failed || answered,
+        "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
+        "c" => selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed)),
+        "w" => selected.is_some_and(|t| t.status == Status::Review),
+        "p" | "y" => answered,
+        "1-6" => selected.is_some(),
+        "R" => selected.is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id)),
+        "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
+        "r" => {
+            answered
+                || selected.is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
+        }
+        "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
+        "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
+        _ => true,
+    }
+}
+
+/// The selection's valid keys as (key, label), the one that moves it on first.
+fn actions(app: &App) -> Vec<(&'static str, &'static str)> {
+    let status = app.task().map(|(t, _)| t.status);
+    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
+    let first: &[&str] = match status {
+        Some(Status::Review) => &["m", "r", "d", "x", "c", "w", "R", "o"],
+        Some(Status::Failed) => &["t", "c", "x", "d", "o"],
+        Some(Status::Proposed) => &["a", "A", "e", "r", "x"],
+        _ if answered => &["p", "r", "y", "x"],
+        _ => &["t", "d", "o", "R", "x"],
+    };
+    first
+        .iter()
+        .filter(|k| valid(app, k))
+        .filter_map(|k| KEYS.into_iter().find(|(key, _)| key == k))
+        .map(|(k, label)| match (k, status) {
+            ("x", Some(_)) => (k, "discard task"),
+            ("r", Some(Status::Review)) => (k, "reply to worker"),
+            ("r", _) => (k, "reply to lead"),
+            _ => (k, label),
+        })
+        .collect()
+}
+
+/// The command palette: the query, then the matching rows with their key chips and context.
+fn palette(f: &mut Frame, app: &App, theme: &Theme) {
+    let Some((query, row)) = &app.palette else {
+        return;
+    };
+    let rows = app.commands();
+    let all = f.area();
+    let n = rows
+        .len()
+        .clamp(1, all.height.saturating_sub(9).max(1) as usize);
+    let area = centered(all, 68.min(all.width.saturating_sub(4)), n as u16 + 4);
+    let block = pane("Commands", true, theme);
+    let [input, rule, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(block.inner(area));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let prompt = Line::from(vec![
+        Span::styled("› ", theme.accent).bold(),
+        Span::raw(query.clone()).bold(),
+        Span::styled("▏", theme.accent),
+    ]);
+    f.render_widget(prompt, input);
+    f.render_widget(
+        Line::raw("type to filter · ↑↓ · enter")
+            .dim()
+            .right_aligned(),
+        input,
+    );
+    f.render_widget(
+        Line::raw(theme.rule.repeat(rule.width as usize)).dim(),
+        rule,
+    );
+    let mut hits = app.hits.borrow_mut();
+    hits.palette = area;
+    if rows.is_empty() {
+        f.render_widget(Line::raw("No command matches").dim(), list);
+    }
+    let sel = (*row).min(rows.len().saturating_sub(1));
+    let off = sel.saturating_sub(n - 1);
+    for (r, (key, label, context, _)) in rows.iter().enumerate().skip(off).take(n) {
+        let at = Rect::new(list.x, list.y + (r - off) as u16, list.width, 1);
+        let chip = match *key {
+            "" => Span::raw(""),
+            k => Span::styled(format!(" {k} "), theme.accent)
+                .bold()
+                .bg(theme.key),
+        };
+        let context = truncate(context, 22, theme.ellipsis);
+        let room = (list.width as usize).saturating_sub(8 + context.width());
+        let label = truncate(label, room, theme.ellipsis);
+        let pad = 6usize.saturating_sub(chip.width());
+        let gap = room.saturating_sub(label.width()) + 1;
+        let style = if r == sel {
+            Style::new().bold()
+        } else {
+            Style::new()
+        };
+        let line = Line::from(vec![
+            Span::styled(if r == sel { theme.bar } else { " " }, theme.accent),
+            chip,
+            Span::raw(" ".repeat(pad)),
+            Span::styled(label.clone(), style),
+            Span::raw(" ".repeat(gap)),
+            Span::raw(context).dim(),
+        ]);
+        f.render_widget(line, at);
+        let hint = match *key {
+            "" => label,
+            k => format!("{k} · {label}"),
+        };
+        hits.targets.push((at, Target::Command(r), hint));
+    }
 }
 
 /// The PR draft in place of both panes, with the `g` instruction input below when open.
@@ -3859,19 +4034,6 @@ fn diff_tab(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     app.hits.borrow_mut().targets.extend(targets);
 }
 
-fn help(f: &mut Frame, theme: &Theme) {
-    let area = centered(f.area(), 34, KEYS.len() as u16 + 2);
-    let lines = KEYS.iter().map(|(key, label)| {
-        Line::from(vec![
-            Span::styled(format!("{key:<8}"), theme.accent),
-            Span::raw(*label),
-        ])
-    });
-    f.render_widget(Clear, area);
-    let block = pane("Keys", true, theme);
-    f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()).block(block), area);
-}
-
 fn short(d: Duration) -> String {
     match d.as_secs() {
         s if s < 60 => format!("{s}s"),
@@ -3953,7 +4115,7 @@ mod tests {
             tasks,
             selected: 0,
             detail: false,
-            help: false,
+            palette: None,
             compose: None,
             notice: None,
             info: None,
@@ -5943,5 +6105,75 @@ mod tests {
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
         assert!(screen(&term)[5].contains("f1.rs"));
+    }
+
+    #[test]
+    fn palette_filters_and_runs_the_selected_row() {
+        let (mut app, _) = app();
+        app.tasks[1].0.status = Status::Proposed;
+        app.selected = 1;
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.key(KeyEvent::from(KeyCode::Char(c)));
+            }
+        };
+        typed(&mut app, "?appr");
+        let labels = |app: &App| app.commands().into_iter().map(|c| c.1).collect::<Vec<_>>();
+        assert_eq!(labels(&app), ["approve", "approve all"]);
+        // `e edit` comes first among the rows `ed` keeps; enter runs it and closes the palette
+        app.key(KeyEvent::from(KeyCode::Esc));
+        typed(&mut app, ":ed");
+        assert_eq!(labels(&app)[0], "edit");
+        app.key(KeyEvent::from(KeyCode::Down));
+        app.key(KeyEvent::from(KeyCode::Up));
+        app.key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.edit && app.palette.is_none());
+        // a `Go to` row selects its task
+        typed(&mut app, "?go bump");
+        app.key(KeyEvent::from(KeyCode::Backspace));
+        typed(&mut app, "p");
+        app.key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!((app.selected, app.palette.is_none()), (1, true));
+    }
+
+    #[test]
+    fn palette_snapshot() {
+        let (mut app, _) = app();
+        app.tasks[1].0.status = Status::Proposed;
+        app.selected = 1;
+        app.palette = Some(("appr".into(), 0));
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued                         slots ▰▱▱   $0.00 ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ ▾ NEEDS YOU 2 ─────────────────────────── ││ ◉ plan ┄ queue ┄ run ┄ check ┄ review ┄ pr          │",
+                "│   ✓ Reject negative max_delay      ready  ││                                                     │",
+                "│ ▌ ○ Bump sqlx to 0.9        1 to approve  ││ spend   ──────── $0.00/$5.00                        │",
+                "│                                           ││                                                     │",
+                "│ ▾ WORKING 1 ───────────────────────────── ││ NEXT   a  approve    e  edit                        │",
+                "│   ⠋ Retry webhook sends        working ·  ││                                                     │",
+                "│                                           ││  Summary  Activity  Gate  Findings  Diff  Run       │",
+                "│ ▾ LATER 1 ────╭ Commands ────────────────────────────────────────────────────────╮               │",
+                "│   ○ Split the │ › appr▏                              type to filter · ↑↓ · enter │               │",
+                "│               │ ──────────────────────────────────────────────────────────────── │               │",
+                "│               │ ▌ a    approve                                  Bump sqlx to 0.9 │               │",
+                "│               │   A    approve all                              Bump sqlx to 0.9 │               │",
+                "│               ╰──────────────────────────────────────────────────────────────────╯               │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " a  approve  A  approve all  e  edit  r  reply to lead  x  discard task  n  new task  ?  more       ",
+            ]
+        );
     }
 }

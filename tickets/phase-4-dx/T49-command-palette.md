@@ -1,4 +1,4 @@
-- [ ] **T49 Command palette replaces the help overlay**
+- [x] **T49 Command palette replaces the help overlay**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Screens › D; Decided 1.
 
