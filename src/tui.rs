@@ -49,7 +49,7 @@ const RUN: usize = 5;
 /// Lines a scroll key moves the detail pane.
 const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 22] = [
+const KEYS: [(&str, &str); 23] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -72,6 +72,7 @@ const KEYS: [(&str, &str); 22] = [
     ("o", "open"),
     (",", "settings"),
     ("pgup/pgdn", "scroll"),
+    ("z", "zoom"),
 ];
 
 /// How a Settings field changes: cycling through choices, or stepping a number within bounds.
@@ -360,6 +361,10 @@ struct App {
     open_at: Option<(PathBuf, Option<u32>)>,
     /// The cursor over the Diff tab's files.
     diff_file: usize,
+    /// The detail pane has the full width.
+    zoom: bool,
+    /// The last row click, to spot a double-click.
+    last_click: Option<(Position, Instant)>,
     /// Where the last frame drew things, for the mouse.
     hits: RefCell<Hits>,
 }
@@ -495,6 +500,8 @@ pub fn run(repo: &Path) -> Result<()> {
         editing: None,
         open_at: None,
         diff_file: 0,
+        zoom: false,
+        last_click: None,
         hits: RefCell::default(),
     };
     let theme = Theme::detect();
@@ -1055,6 +1062,10 @@ impl App {
                 }
             }
             KeyCode::Char(c @ '1'..='6') => self.tab = c as usize - '1' as usize,
+            KeyCode::Right => self.tab = (self.tab + 1) % TABS.len(),
+            KeyCode::Left => self.tab = (self.tab + TABS.len() - 1) % TABS.len(),
+            KeyCode::Char('z') => self.zoom = !self.zoom,
+            KeyCode::Esc => self.zoom = false,
             KeyCode::Char('R') => {
                 if let Err(e) = self.toggle_run() {
                     self.notice = Some(format!("{e:#}"));
@@ -1495,6 +1506,13 @@ impl App {
                 return self.key(key);
             }
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Row(i))) if !modal => {
+                // crossterm doesn't report double-clicks: two Downs on one cell within 400 ms
+                let now = Instant::now();
+                let double = self.last_click.is_some_and(|(p, t)| {
+                    p == at && now.duration_since(t) < Duration::from_millis(400)
+                });
+                self.zoom |= double;
+                self.last_click = (!double).then_some((at, now));
                 self.selected = i;
             }
             (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, _) if !modal => {
@@ -1837,6 +1855,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         && let Some(d) = draft
     {
         preview(f, body, d, app.instruction.as_ref(), theme);
+    } else if app.zoom {
+        detail(f, body, app, theme, true);
     } else if body.width >= 100 {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(body);
@@ -2414,9 +2434,17 @@ fn row_line(
 fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     app.hits.borrow_mut().detail = area;
     let compact = f.area().height < COMPACT;
-    let block = pane("Task", focused, theme);
+    let (label, key) = match app.zoom {
+        true => (" esc unzoom ", KeyCode::Esc),
+        false => (" z zoom ", KeyCode::Char('z')),
+    };
+    let block = pane("Task", focused, theme).title(Line::raw(label).dim().right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let w = label.width() as u16;
+    let rect = Rect::new(area.right().saturating_sub(w + 1), area.y, w, 1).intersection(area);
+    let target = Target::Key(KeyEvent::new(key, KeyModifiers::NONE));
+    app.hits.borrow_mut().targets.push((rect, target));
     let Some((t, _)) = app.task() else {
         match app.request() {
             Some(r) => request(f, inner, r, app.answer.as_ref(), theme, &app.scroll),
@@ -3035,6 +3063,8 @@ mod tests {
             editing: None,
             open_at: None,
             diff_file: 0,
+            zoom: false,
+            last_click: None,
             hits: RefCell::default(),
         };
         (app, now)
@@ -3068,7 +3098,7 @@ mod tests {
         assert_eq!(
             tab_screen(app, 0),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
                 "│ Summary ▾                                                │",
                 "│ Reject negative max_delay                                │",
                 "│ Review · u/reject-negative · slot 1 · session 2/3 ·      │",
@@ -3155,7 +3185,7 @@ mod tests {
         assert_eq!(
             tab_screen(app, 1),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
                 "│ Activity ▾                                               │",
                 "│ read    src/old.rs                                       │",
                 "│ read    src/config.rs                                    │",
@@ -3193,7 +3223,7 @@ mod tests {
         assert_eq!(
             tab_screen(app, 2),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
                 "│ Gate ▾                                                   │",
                 "│ ✓  clean tree                                            │",
                 "│ ✓  fmt                                                   │",
@@ -3225,7 +3255,7 @@ mod tests {
         assert_eq!(
             tab_screen(app, RUN),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
                 "│ Run ▾                                                    │",
                 "│ slot 1 · ports 1160-1239                                 │",
                 "│ ✓ setup  ◆ run running  ○ teardown when freed            │",
@@ -3334,7 +3364,7 @@ mod tests {
         assert_eq!(
             tab_screen(app, 4),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
                 "│ Diff ▾                                                   │",
                 "│ ▌ src/config.rs           +12    -3 ++++++--             │",
                 "│   crates/ledger/src/li…   +40    -0 ++++++++++++++++++++ │",
@@ -3508,7 +3538,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
                 "│   ✓ Reject negative max_delay             ││ Summary ▾                                           │",
                 "│   ○ Validate max_delay at parse time      ││ Reject negative max_delay in the CLI                │",
                 "│ ▌ ○ └ Reject negative max_delay in the …  ││ Proposed · CC-687 · cli, config · after “Validate   │",
@@ -3553,7 +3583,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
                 "│   ⠋ Split the ledger job into p… planning ││ Reject a negative max_delay                         │",
                 "│ ▌ ✗ Reject a negative max_delay    failed ││ Failed · CC-687                                     │",
                 "│   ✓ Reject negative max_delay          4m ││                                                     │",
@@ -3653,7 +3683,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
                 "│ ▌ ✓ How are tasks saved?         answered ││ How are tasks saved?                                │",
                 "│   ✓ Reject negative max_delay          4m ││ Question                                            │",
                 "│   ✗ Bump sqlx to 0.9                   1h ││                                                     │",
@@ -3782,7 +3812,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
                 "│ Findings ▾                                               │",
                 "│ Open                                                     │",
                 "│   ✗ src/config.rs:41 -1 still parses                     │",
@@ -4063,7 +4093,7 @@ mod tests {
             screen(&term),
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
                 "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff  Run        │",
                 "│ ▌ ✓ Reject negative max_delay          4m ││                                                     │",
                 "│                                           ││ Reject negative max_delay                           │",
@@ -4156,7 +4186,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
                 "│ ▌ ✓ Reject negative max_delay          4m ││ Activity ▾                                          │",
                 "│   ✗ Bump sqlx to 0.9                   1h ││ read    src/config.rs                               │",
                 "│   ⠋ Retry webhook sends     working · 12m ││ run     cargo test -p ledger                        │",
@@ -4228,6 +4258,76 @@ mod tests {
         assert!(click(&mut app, " y  Dismiss") && !app.confirm && app.notice.is_none());
         assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Dismissed);
         fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn double_click_zooms() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let row = screen(&term)
+            .iter()
+            .position(|r| r.contains("Bump sqlx"))
+            .unwrap() as u16;
+        let press = |app: &mut App, code| app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        let down = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(down(5, row));
+        assert!(!app.zoom);
+        app.mouse(down(6, row)); // another cell: still one click each
+        assert!(!app.zoom);
+        app.mouse(down(6, row));
+        assert!(app.zoom && app.selected == 1);
+
+        // ←/→ cycle the tabs, wrapping
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.tab, 5);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.tab, 0);
+        app.selected = 0;
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
+                "╭ Task ──────────────────────────────────────────────────────────────────────────────── esc unzoom ╮",
+                "│ Summary  Activity  Gate  Findings  Diff  Run                                                     │",
+                "│                                                                                                  │",
+                "│ Reject negative max_delay                                                                        │",
+                "│ Review · u/reject-negative · slot 1 · opus/high                                                  │",
+                "│                                                                                                  │",
+                "│ max_delay below zero now fails at parse time.                                                    │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
+                " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more                         ",
+            ]
+        );
+        // the border label unzooms; z zooms again and esc goes back
+        let label = screen(&term)[1].find("esc unzoom").unwrap();
+        app.mouse(down(screen(&term)[1][..label].chars().count() as u16, 1));
+        assert!(!app.zoom);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.zoom);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.zoom);
     }
 
     #[test]
