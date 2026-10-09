@@ -487,8 +487,10 @@ impl Hits {
 /// What a click does: press a key, or one of the things with no key: select a list row, fold
 /// a group, dismiss the info toast, start dragging the divider, scroll the detail pane to
 /// an offset, fold or unfold a Diff file, open Diff at a finding's file, or run a palette row.
+/// `Hint` only shows its hint on hover.
 #[derive(Clone, Copy)]
 enum Target {
+    Hint,
     Key(KeyEvent),
     Row(usize),
     Info,
@@ -2929,19 +2931,21 @@ fn header_line(app: &App, theme: &Theme, area: Rect, compact: bool) -> Line<'sta
     let n = app.requests.len();
     for slot in 1..=app.slots {
         let held = app.tasks.iter().position(|(t, _)| t.slot == Some(slot));
+        let rect = Rect::new(x, area.y, 1, 1).intersection(area);
+        let mut hits = app.hits.borrow_mut();
         spans.push(match held {
             Some(i) => {
                 let t = &app.tasks[i].0;
                 let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
-                let rect = Rect::new(x, area.y, 1, 1).intersection(area);
-                app.hits.borrow_mut().targets.push((
-                    rect,
-                    Target::Row(n + i),
-                    "click · select".into(),
-                ));
+                let hint = format!("slot {slot} · {}", t.title);
+                hits.targets.push((rect, Target::Row(n + i), hint));
                 Span::styled(theme.slot.0, theme.glyph(t.status, gate_failed, 0).style)
             }
-            None => Span::raw(theme.slot.1).dim(),
+            None => {
+                hits.targets
+                    .push((rect, Target::Hint, format!("slot {slot} · free")));
+                Span::raw(theme.slot.1).dim()
+            }
         });
         x = x.saturating_add(1);
     }
@@ -6018,6 +6022,33 @@ mod tests {
         assert_eq!(buf[m].bg, theme.hover);
         assert_eq!(buf[(m.x + 11, m.y)].bg, theme.hover);
         assert_ne!(buf[(m.x + 12, m.y)].bg, theme.hover);
+    }
+
+    #[test]
+    fn hovering_a_slot_names_its_task() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let header = &screen(&term)[0];
+        let x = header[..header.find("slots ▰▱▱").unwrap()].chars().count() as u16 + 6;
+        let border = |term: &Terminal<TestBackend>| screen(term)[22].clone();
+
+        assert!(app.hover(Position::new(x, 0)));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(
+            border(&term).contains(" slot 1 · Reject negative max_delay "),
+            "{}",
+            border(&term)
+        );
+
+        assert!(app.hover(Position::new(x + 1, 0)));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(
+            border(&term).contains(" slot 2 · free "),
+            "{}",
+            border(&term)
+        );
     }
 
     #[test]

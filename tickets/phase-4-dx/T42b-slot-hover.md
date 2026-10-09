@@ -1,4 +1,4 @@
-- [ ] **T42b Hovering a slot names its task**
+- [x] **T42b Hovering a slot names its task**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Mouse map (Slot meter: "Hover names it").
 
