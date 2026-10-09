@@ -225,6 +225,13 @@ pub struct Theme {
     ellipsis: &'static str,
     /// Before a child task, under its parent.
     tree: &'static str,
+    /// Pipeline links up to the current stage and after it, the current stage's mark, a passed
+    /// gate check, and a gauge's empty cells (`done` fills it).
+    done: &'static str,
+    todo: &'static str,
+    current: &'static str,
+    dot: &'static str,
+    rest: &'static str,
     spinner: &'static [&'static str],
 }
 
@@ -256,6 +263,11 @@ impl Theme {
             bar: glyphs("▌", ">"),
             ellipsis: glyphs("…", "~"),
             tree: glyphs("└ ", "- "),
+            done: glyphs("━", "="),
+            todo: glyphs("┄", "-"),
+            current: glyphs("◉", "(*)"),
+            dot: glyphs("●", "*"),
+            rest: glyphs("─", "-"),
             spinner: if ascii {
                 &["|", "/", "-", "\\"]
             } else {
@@ -372,6 +384,12 @@ struct App {
     split: u16,
     /// The divider is being dragged.
     dragging: bool,
+    /// The selected Running task's context in tokens, from its stream's latest message.
+    context: Option<u64>,
+    /// `[worker] budget_usd`, for a task without its own.
+    budget: f64,
+    /// `[watch] autocompact` and `handoff_at`, for the context gauge.
+    window: (u64, f64),
     /// Where the last frame drew things, for the mouse.
     hits: RefCell<Hits>,
 }
@@ -384,6 +402,8 @@ type Edit = (String, bool, PathBuf);
 struct Hits {
     list: Rect,
     detail: Rect,
+    /// The detail tabs, where the wheel cycles them.
+    tabs: Rect,
     targets: Vec<(Rect, Target)>,
 }
 
@@ -429,6 +449,11 @@ fn key_of(label: &str) -> Option<KeyEvent> {
         },
     };
     Some(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// The digit key for the `i`th detail tab.
+fn digit(i: usize) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char((b'1' + i as u8) as char), KeyModifiers::NONE)
 }
 
 /// The Run tab: the slot's ports and `[scripts]`, read when the task changes, and the run
@@ -485,6 +510,7 @@ pub fn run(repo: &Path) -> Result<()> {
     let state = task::state_dir(repo)?;
     reap(&state)?;
     let name = state.file_name().unwrap_or_default().to_string_lossy();
+    let cfg = config::load(repo).ok();
     let mut app = App {
         repo: repo.to_path_buf(),
         state: state.clone(),
@@ -534,6 +560,9 @@ pub fn run(repo: &Path) -> Result<()> {
         last_click: None,
         split: 45,
         dragging: false,
+        context: None,
+        budget: cfg.as_ref().map_or(0.0, |c| c.worker.budget_usd),
+        window: cfg.map_or((0, 1.0), |c| (c.watch.autocompact, c.watch.handoff_at)),
         hits: RefCell::default(),
     };
     let theme = Theme::detect();
@@ -1223,9 +1252,15 @@ impl App {
         let Some((id, since)) = self.task().map(|(t, since)| (t.id.clone(), *since)) else {
             return;
         };
+        let log = self.state.join(format!("logs/{id}.jsonl"));
         if self.tab == 1 {
-            let log = self.state.join(format!("logs/{id}.jsonl"));
             self.activity = activity(&log, &self.slot_dir().unwrap_or_default());
+        }
+        if self
+            .task()
+            .is_some_and(|(t, _)| t.status == Status::Running)
+        {
+            self.context = context(&log);
         }
         if self.tab == RUN {
             let slot = self.task().and_then(|(t, _)| t.slot);
@@ -1257,7 +1292,8 @@ impl App {
             self.run.log = String::from_utf8_lossy(&tail(&log, 64 << 10)).into_owned();
         }
         let key = Some((id.clone(), since));
-        if self.tab >= 2 && self.loaded != key {
+        // the verdict shows the gate, findings and diffstat on every tab
+        if self.loaded != key {
             let log = self.state.join(format!("logs/{id}.gate.log"));
             self.gate_log = fs::read_to_string(log).unwrap_or_default();
             let base = self.base().unwrap_or_default();
@@ -1538,12 +1574,13 @@ impl App {
         let modal =
             modal || self.preview || self.confirm || self.help || self.instruction.is_some();
         let at = Position::new(m.column, m.row);
-        let (in_list, in_detail, hit) = {
+        let (in_list, in_detail, in_tabs, hit) = {
             let hits = self.hits.borrow();
             let hit = hits.targets.iter().rev().find(|(r, _)| r.contains(at));
             (
                 hits.list.contains(at),
                 hits.detail.contains(at),
+                hits.tabs.contains(at),
                 hit.map(|(_, t)| *t),
             )
         };
@@ -1575,7 +1612,10 @@ impl App {
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Info)) => self.info = None,
             (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, _) if !modal => {
                 let down = m.kind == MouseEventKind::ScrollDown;
-                if in_detail {
+                if in_tabs {
+                    let n = TABS.len();
+                    return self.key(digit((self.tab + if down { 1 } else { n - 1 }) % n));
+                } else if in_detail {
                     self.scroll_by(down);
                 } else if in_list {
                     let rows = self.requests.len() + self.tasks.len();
@@ -1841,6 +1881,18 @@ fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Tokens in context at the latest assistant message in the tail of a Claude stream log.
+fn context(log: &Path) -> Option<u64> {
+    let bytes = tail(log, 256 << 10);
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .rev()
+        .find_map(|l| match serde_json::from_str(l).ok()? {
+            stream::Event::Assistant { message } => Some(message.usage.context()),
+            _ => None,
+        })
+}
+
 /// Up to the last `max` bytes of `file`; empty if it can't be read.
 fn tail(file: &Path, max: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -1940,7 +1992,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     {
         preview(f, body, d, app.instruction.as_ref(), theme);
     } else if app.zoom {
-        detail(f, body, app, theme, true);
+        detail(f, body, app, theme, true, tick, now);
     } else if body.width >= 100 {
         let [left, right] =
             Layout::horizontal([Constraint::Length(app.split), Constraint::Fill(1)]).areas(body);
@@ -1956,9 +2008,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             .targets
             .push((divider, Target::Divider));
         list(f, left, app, theme, !app.detail, tick, now);
-        detail(f, right, app, theme, app.detail);
+        detail(f, right, app, theme, app.detail, tick, now);
     } else if app.detail {
-        detail(f, body, app, theme, true);
+        detail(f, body, app, theme, true, tick, now);
     } else {
         list(f, body, app, theme, true, tick, now);
     }
@@ -2575,7 +2627,15 @@ fn row_line(
     ])
 }
 
-fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
+fn detail(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    focused: bool,
+    tick: usize,
+    now: SystemTime,
+) {
     app.hits.borrow_mut().detail = area;
     let compact = f.area().height < COMPACT;
     let (label, key) = match app.zoom {
@@ -2590,7 +2650,7 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     let target = Target::Key(KeyEvent::new(key, KeyModifiers::NONE));
     app.hits.borrow_mut().targets.push((rect, target));
     app.scroll.bar.set(None);
-    detail_body(f, inner, app, theme, compact);
+    detail_body(f, inner, app, theme, compact, tick, now);
     // the tab's scrollbar sits on the pane's right border; a click there jumps to that offset
     if let Some((rect, max, tail)) = app.scroll.bar.take() {
         let track = Rect::new(area.right() - 1, rect.y, 1, rect.height);
@@ -2609,7 +2669,15 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
 }
 
 /// The detail pane's tabs and the active tab, or the selected request.
-fn detail_body(f: &mut Frame, inner: Rect, app: &App, theme: &Theme, compact: bool) {
+fn detail_body(
+    f: &mut Frame,
+    inner: Rect,
+    app: &App,
+    theme: &Theme,
+    compact: bool,
+    tick: usize,
+    now: SystemTime,
+) {
     let Some((t, _)) = app.task() else {
         match app.request() {
             Some(r) => request(f, inner, r, app.answer.as_ref(), theme, &app.scroll),
@@ -2617,50 +2685,128 @@ fn detail_body(f: &mut Frame, inner: Rect, app: &App, theme: &Theme, compact: bo
         }
         return;
     };
-    let [tabs, _, body] = Layout::vertical([
+    let spinner = theme.spinner[tick % theme.spinner.len()];
+    // the spend cell gets a row of its own, so its gauge fits
+    let mut cells = verdict(app, t, theme, now);
+    let spend = cells.pop().unwrap_or_default();
+    let mut rows: Vec<_> = cells.chunks(2).map(<[_]>::to_vec).collect();
+    rows.push(vec![spend]);
+    let gap = Constraint::Length(if compact { 0 } else { 1 });
+    let shown = if compact { 1 } else { rows.len() as u16 };
+    let [strip, _, verdict_area, _, next, _, tabs, _, body] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(if compact { 0 } else { 1 }),
+        gap,
+        Constraint::Length(shown),
+        gap,
+        Constraint::Length(1),
+        gap,
+        Constraint::Length(1),
+        gap,
         Constraint::Fill(1),
     ])
     .areas(inner);
-    let tabs_line = TABS.iter().enumerate().flat_map(|(i, name)| {
-        let name = if i == app.tab {
-            Span::raw(*name).bold().underlined()
-        } else {
-            Span::raw(*name).dim()
+    f.render_widget(pipeline(t, theme, spinner), strip);
+    let cell = |(label, value): &(&str, Vec<Span<'static>>), pad: usize| {
+        let label = match label.is_empty() {
+            true => String::new(),
+            false => format!("{label:<pad$}"),
         };
-        [name, Span::raw("  ")]
-    });
-    let tabs_line = match compact {
-        true => Line::from(vec![Span::raw(TABS[app.tab]).bold(), Span::raw(" ▾").dim()]),
-        false => Line::from(tabs_line.collect::<Vec<_>>()),
+        [vec![Span::raw(label).dim()], value.clone()].concat()
     };
-    // each tab's name presses its digit; compact's one name presses the next tab's
-    let digit = |i: usize| {
-        Target::Key(KeyEvent::new(
-            KeyCode::Char((b'1' + i as u8) as char),
-            KeyModifiers::NONE,
-        ))
-    };
-    let mut hits = app.hits.borrow_mut();
     if compact {
-        let rect = Rect {
-            width: tabs_line.width() as u16,
-            ..tabs
-        }
-        .intersection(tabs);
-        hits.targets.push((rect, digit((app.tab + 1) % TABS.len())));
+        let sep = Span::raw("  ·  ").dim();
+        let spans = rows.concat().into_iter().enumerate().flat_map(|(i, c)| {
+            let lead = (i > 0).then(|| sep.clone());
+            lead.into_iter().chain(cell(&c, c.0.len() + 1))
+        });
+        f.render_widget(Line::from(spans.collect::<Vec<_>>()), verdict_area);
     } else {
-        let mut x = tabs.x;
-        for (i, name) in TABS.iter().enumerate() {
-            let w = name.width() as u16;
-            hits.targets
-                .push((Rect::new(x, tabs.y, w, 1).intersection(tabs), digit(i)));
-            x = x.saturating_add(w + 2);
+        let half = verdict_area.width / 2;
+        for (row, y) in rows.iter().zip(verdict_area.y..) {
+            for (c, x) in row.iter().zip([0, half]) {
+                let w = if row.len() > 1 {
+                    half - 1
+                } else {
+                    verdict_area.width
+                };
+                let rect = Rect::new(verdict_area.x + x, y, w, 1).intersection(verdict_area);
+                f.render_widget(Line::from(cell(c, 8)), rect);
+            }
         }
     }
+    // NEXT: the keys that move the task on, the first green, each a hit target for its key
+    let mut line = vec![Span::raw("NEXT  ").dim().bold()];
+    let mut x = next.x + 6;
+    let buttons = next_keys(t);
+    if buttons.is_empty() {
+        line.push(Span::raw("Nothing needed yet.").dim());
+    }
+    for (i, (key, label)) in buttons.iter().enumerate() {
+        let (chip, text) = match i {
+            0 => {
+                let s = Style::new().fg(theme.key).bg(theme.green);
+                (s.bold(), s)
+            }
+            _ => {
+                let s = Style::new().bg(theme.key);
+                (s.fg(theme.accent).bold(), s)
+            }
+        };
+        let button = [
+            Span::styled(format!(" {key} "), chip),
+            Span::styled(format!(" {label} "), text),
+        ];
+        let w = Line::from(button.to_vec()).width() as u16;
+        let rect = Rect::new(x, next.y, w, 1).intersection(next);
+        let target = key_of(key).map(|k| (rect, Target::Key(k)));
+        app.hits.borrow_mut().targets.extend(target);
+        x = x.saturating_add(w + 2);
+        line.extend(button);
+        line.push(Span::raw("  "));
+    }
+    f.render_widget(Line::from(line), next);
+    // tabs as pills, with badges; each presses its digit, compact's one the next tab's
+    let badge = |i: usize| match i {
+        1 if t.status == Status::Running => Some(Span::styled(spinner, theme.accent)),
+        2 => t.gate.as_ref().map(|_| match gate_passed(t) {
+            true => Span::styled(theme.pass, theme.green),
+            false => Span::styled(theme.fail, theme.red),
+        }),
+        FINDINGS => {
+            let n = app.findings.actionable().count();
+            (n > 0).then(|| Span::styled(n.to_string(), theme.amber))
+        }
+        _ => None,
+    };
+    let pill = |i: usize| {
+        let mut spans = vec![Span::raw(format!(" {}", TABS[i])).dim()];
+        spans.extend(badge(i).map(|b| Span::styled(format!(" {}", b.content), b.style)));
+        spans.push(Span::raw(if compact { " ▾ " } else { " " }));
+        if i == app.tab {
+            let on = Style::new().fg(theme.key).bg(theme.accent).bold();
+            spans = spans.into_iter().map(|s| s.style(on)).collect();
+        }
+        spans
+    };
+    let shown: Vec<usize> = match compact {
+        true => vec![app.tab],
+        false => (0..TABS.len()).collect(),
+    };
+    let mut line = Vec::new();
+    let mut x = tabs.x;
+    let mut hits = app.hits.borrow_mut();
+    hits.tabs = tabs;
+    for i in shown {
+        let spans = pill(i);
+        let w = Line::from(spans.clone()).width() as u16;
+        let key = if compact { (i + 1) % TABS.len() } else { i };
+        let rect = Rect::new(x, tabs.y, w, 1).intersection(tabs);
+        hits.targets.push((rect, Target::Key(digit(key))));
+        x = x.saturating_add(w);
+        line.extend(spans);
+    }
     drop(hits);
-    f.render_widget(tabs_line, tabs);
+    f.render_widget(Line::from(line), tabs);
     match app.tab {
         0 => {
             let parent = t.parent.as_ref().map(|p| {
@@ -2680,6 +2826,154 @@ fn detail_body(f: &mut Frame, inner: Rect, app: &App, theme: &Theme, compact: bo
             let cursor = app.on_diff().then_some(app.diff_file);
             diff_tab(f, body, &app.diff, cursor, theme, &app.scroll)
         }
+    }
+}
+
+/// `plan ━ queue ━ run ━ check ━ ◉ review ┄ pr`: done stages green, the current one bold in
+/// the accent, `✗` in red on a failure and `spinner` while running, later ones dim.
+fn pipeline(t: &Task, theme: &Theme, spinner: &'static str) -> Line<'static> {
+    let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
+    let at = match t.status {
+        Status::Proposed => 0,
+        Status::Approved => 1,
+        Status::Running => 2,
+        Status::Failed if !gate_failed => 2,
+        Status::Checking | Status::Failed => 3,
+        Status::Review => 4,
+        Status::PrOpen | Status::Discarded => 5,
+    };
+    let stages = ["plan", "queue", "run", "check", "review", "pr"];
+    let mut spans = Vec::new();
+    for (i, stage) in stages.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(match i <= at {
+                true => Span::styled(format!(" {} ", theme.done), theme.green),
+                false => Span::raw(format!(" {} ", theme.todo)).dim(),
+            });
+        }
+        let (mark, color) = match t.status {
+            Status::Failed => (theme.fail, theme.red),
+            Status::Running | Status::Checking => (spinner, theme.accent),
+            _ => (theme.current, theme.accent),
+        };
+        spans.push(match i.cmp(&at) {
+            std::cmp::Ordering::Less => Span::styled(stage, theme.green),
+            std::cmp::Ordering::Greater => Span::raw(stage).dim(),
+            std::cmp::Ordering::Equal => {
+                Span::styled(format!("{mark} {stage}"), Style::new().fg(color).bold())
+            }
+        });
+    }
+    Line::from(spans)
+}
+
+/// The verdict as (label, value) cells, spend last: gate dots, critic, diffstat, slot and model;
+/// a Running task's context gauge and quiet time in place of the first three.
+fn verdict(
+    app: &App,
+    t: &Task,
+    theme: &Theme,
+    now: SystemTime,
+) -> Vec<(&'static str, Vec<Span<'static>>)> {
+    let gauge = |ratio: f64, color: Color| {
+        let n = (ratio.clamp(0.0, 1.0) * 8.0).round() as usize;
+        vec![
+            Span::styled(theme.done.repeat(n), color),
+            Span::raw(theme.rest.repeat(8 - n)).dim(),
+        ]
+    };
+    let mut cells = Vec::new();
+    if t.status == Status::Running {
+        let (window, handoff_at) = app.window;
+        if let Some(used) = app.context.filter(|_| window > 0) {
+            let ratio = used as f64 / window as f64;
+            let color = if ratio > handoff_at {
+                theme.amber
+            } else {
+                theme.accent
+            };
+            let pct = Span::styled(format!(" {:.0}%", ratio * 100.0), color);
+            cells.push(("context", [gauge(ratio, color), vec![pct]].concat()));
+        }
+        if let Some((_, _, at)) = app.steps.iter().find(|s| s.0 == t.id) {
+            let quiet = now.duration_since(*at).unwrap_or_default();
+            let late = quiet > app.stall_after / 2;
+            let quiet = Span::raw(short(quiet));
+            cells.push((
+                "quiet",
+                vec![if late { quiet.fg(theme.amber) } else { quiet }],
+            ));
+        }
+    } else {
+        if let Some(checks) = &t.gate {
+            let mut dots: Vec<_> = (checks.iter())
+                .map(|c| match c.passed {
+                    true => Span::styled(theme.dot, theme.green),
+                    false => Span::styled(theme.fail, theme.red),
+                })
+                .collect();
+            let passed = checks.iter().filter(|c| c.passed).count();
+            let color = if gate_passed(t) {
+                theme.green
+            } else {
+                theme.red
+            };
+            dots.push(Span::styled(format!(" {passed}/{}", checks.len()), color));
+            cells.push(("gate", dots));
+        }
+        let fs = &app.findings;
+        if *fs != Findings::default() {
+            let open = fs.actionable().count();
+            let color = if open == 0 { theme.green } else { theme.amber };
+            cells.push((
+                "critic",
+                vec![
+                    Span::styled(format!("{open} open"), color),
+                    Span::raw(format!(" · {} fixed", fs.fixed.len())).dim(),
+                ],
+            ));
+        }
+        if !app.diff.is_empty() {
+            let (a, d) = (app.diff.iter()).fold((0, 0), |(a, d), f| (a + f.1, d + f.2));
+            cells.push((
+                "change",
+                vec![
+                    Span::styled(format!("+{a}"), theme.green),
+                    Span::styled(format!(" -{d}"), theme.red),
+                    Span::raw(format!(" · {} files", app.diff.len())).dim(),
+                ],
+            ));
+        }
+    }
+    let mut at: Vec<_> = t.slot.map(|n| format!("slot {n}")).into_iter().collect();
+    at.extend(t.model.as_ref().map(|m| match &t.effort {
+        Some(e) => format!("{m}/{e}"),
+        None => m.clone(),
+    }));
+    if !at.is_empty() {
+        cells.push(("", vec![Span::raw(at.join(" · ")).dim()]));
+    }
+    let (spent, budget) = (t.spent(), t.budget_usd.unwrap_or(app.budget));
+    let mut spend = match budget > 0.0 {
+        true => gauge(spent / budget, theme.accent),
+        false => Vec::new(),
+    };
+    spend.push(Span::raw(match budget > 0.0 {
+        true => format!(" ${spent:.2}/${budget:.2}"),
+        false => format!("${spent:.2}"),
+    }));
+    cells.push(("spend", spend));
+    cells
+}
+
+/// The keys that move `t` on, as (key, label), the first the one to press.
+fn next_keys(t: &Task) -> &'static [(&'static str, &'static str)] {
+    match t.status {
+        Status::Review if gate_passed(t) => &[("m", "open the PR"), ("r", "ask for changes")],
+        Status::Review => &[("r", "ask for changes"), ("c", "continue")],
+        Status::Failed => &[("t", "retry"), ("c", "continue")],
+        Status::Proposed => &[("a", "approve"), ("e", "edit")],
+        _ => &[],
     }
 }
 
@@ -3233,6 +3527,9 @@ mod tests {
             last_click: None,
             split: 45,
             dragging: false,
+            context: None,
+            budget: 5.0,
+            window: (200_000, 0.8),
             hits: RefCell::default(),
         };
         (app, now)
@@ -3250,7 +3547,7 @@ mod tests {
     fn tab_screen(mut app: App, tab: usize) -> Vec<String> {
         app.detail = true;
         app.tab = tab;
-        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 17)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
@@ -3267,7 +3564,10 @@ mod tests {
             tab_screen(app, 0),
             [
                 "╭ Task ──────────────────────────────────────────── z zoom ╮",
-                "│ Summary ▾                                                │",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ──────── $0. │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Summary ▾                                               │",
                 "│ Reject negative max_delay                                │",
                 "│ Review · u/reject-negative · slot 1 · session 2/3 ·      │",
                 "│ opus/high · CC-687                                       │",
@@ -3354,7 +3654,10 @@ mod tests {
             tab_screen(app, 1),
             [
                 "╭ Task ──────────────────────────────────────────── z zoom ╮",
-                "│ Activity ▾                                               │",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ──────── $0. │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Activity ▾                                              │",
                 "│ read    src/old.rs                                       │",
                 "│ read    src/config.rs                                    │",
                 "│ search  max_delay                                        │",
@@ -3392,7 +3695,10 @@ mod tests {
             tab_screen(app, 2),
             [
                 "╭ Task ──────────────────────────────────────────── z zoom ╮",
-                "│ Gate ▾                                                   │",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ●●✗ 2/3  ·  slot 1 · opus/high  ·  spend ──────── $ │",
+                "│ NEXT   r  ask for changes    c  continue                 │",
+                "│  Gate ✗ ▾                                                │",
                 "│ ✓  clean tree                                            │",
                 "│ ✓  fmt                                                   │",
                 "│ ✗  test                                                  │",
@@ -3424,7 +3730,10 @@ mod tests {
             tab_screen(app, RUN),
             [
                 "╭ Task ──────────────────────────────────────────── z zoom ╮",
-                "│ Run ▾                                                    │",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ──────── $0. │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Run ▾                                                   │",
                 "│ slot 1 · ports 1160-1239                                 │",
                 "│ ✓ setup  ◆ run running  ○ teardown when freed            │",
                 "│                                                          │",
@@ -3533,7 +3842,10 @@ mod tests {
             tab_screen(app, 4),
             [
                 "╭ Task ──────────────────────────────────────────── z zoom ╮",
-                "│ Diff ▾                                                   │",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  change +52 -3 · 3 files  ·  slot 1 · opus │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Diff ▾                                                  │",
                 "│ ▌ src/config.rs           +12    -3 ++++++--             │",
                 "│   crates/ledger/src/li…   +40    -0 ++++++++++++++++++++ │",
                 "│   assets/logo.png          +0    -0                      │",
@@ -3707,19 +4019,19 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│   ✓ Reject negative max_delay             ││ Summary ▾                                           │",
-                "│   ○ Validate max_delay at parse time      ││ Reject negative max_delay in the CLI                │",
-                "│ ▌ ○ └ Reject negative max_delay in the …  ││ Proposed · CC-687 · cli, config · after “Validate   │",
-                "│   ○ Bump sqlx to 0.9                      ││ max_delay at parse time”                            │",
+                "│   ✓ Reject negative max_delay             ││ ◉ plan ┄ queue ┄ run ┄ check ┄ review ┄ pr          │",
+                "│   ○ Validate max_delay at parse time      ││ spend ──────── $0.00/$5.00                          │",
+                "│ ▌ ○ └ Reject negative max_delay in the …  ││ NEXT   a  approve    e  edit                        │",
+                "│   ○ Bump sqlx to 0.9                      ││  Summary ▾                                          │",
+                "│                                           ││ Reject negative max_delay in the CLI                │",
+                "│                                           ││ Proposed · CC-687 · cli, config · after “Validate   │",
+                "│                                           ││ max_delay at parse time”                            │",
                 "│                                           ││                                                     │",
                 "│                                           ││ Reuse the config check in the CLI.                  │",
                 "│                                           ││                                                     │",
                 "│                                           ││ Done when                                           │",
                 "│                                           ││ - `yogan --max-delay -1` exits 2                    │",
                 "│                                           ││ - the error names the flag                          │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
                 " yogan · fuse-os  ✓ 1  ○ 3   a  approve  A  approve all  e  edit  r  reply to lead  ?  more         ",
             ]
@@ -3790,14 +4102,14 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│ ▌ ✓ Reject negative max_delay          4m ││ Summary ▾                                           │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││ Reject negative max_delay                           │",
-                "│   ⠋ Retry webhook sends     working · 12m ││ Review · u/reject-negative · slot 1 · opus/high     │",
-                "│       edit src/retry.rs          quiet 2m ││                                                     │",
-                "│   ⠋ Cache the rate table    working · 12m ││ max_delay below zero now fails at parse time.       │",
-                "│       run cargo test -p rates    quiet 9m ││                                                     │",
+                "│ ▌ ✓ Reject negative max_delay          4m ││ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr          │",
+                "│   ✗ Bump sqlx to 0.9                   1h ││ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ─────── │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ NEXT   m  open the PR    r  ask for changes         │",
+                "│       edit src/retry.rs          quiet 2m ││  Summary ▾                                          │",
+                "│   ⠋ Cache the rate table    working · 12m ││ Reject negative max_delay                           │",
+                "│       run cargo test -p rates    quiet 9m ││ Review · u/reject-negative · slot 1 · opus/high     │",
                 "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
-                "│                                           ││                                                     │",
+                "│                                           ││ max_delay below zero now fails at parse time.       │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 2  ○ 1   m  open PR  r  reply to worker  d  diff  ?  more             ",
@@ -3973,15 +4285,25 @@ mod tests {
         let (mut app, _) = app();
         app.findings = sample_findings();
         (app.finding, app.detail, app.tab) = (1, true, FINDINGS);
-        let mut term = Terminal::new(TestBackend::new(60, 22)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 32)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
         assert_eq!(
             screen(&term),
             [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ──────────────────────────────────────────── z zoom ╮",
-                "│ Findings ▾                                               │",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│                                                          │",
+                "│ gate    ● 1/1               critic  3 open · 0 fixed     │",
+                "│ slot 1 · opus/high                                       │",
+                "│ spend   ──────── $0.00/$5.00                             │",
+                "│                                                          │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│                                                          │",
+                "│  Summary  Activity  Gate ✓  Findings 3  Diff  Run        │",
+                "│                                                          │",
                 "│ Open                                                     │",
                 "│   ✗ src/config.rs:41 -1 still parses                     │",
                 "│     cargo test negative fails                            │",
@@ -4001,7 +4323,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k  finding  ?  more",
+                " j/k  finding  r  reply to worker  ?  more                  ",
             ]
         );
     }
@@ -4280,19 +4602,19 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff  Run        │",
+                "│ Review                                    ││ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr          │",
                 "│ ▌ ✓ Reject negative max_delay          4m ││                                                     │",
-                "│                                           ││ Reject negative max_delay                           │",
-                "│ Failed                                    ││ Review · u/reject-negative · slot 1 · opus/high     │",
+                "│                                           ││ gate    ● 1/1            slot 1 · opus/high         │",
+                "│ Failed                                    ││ spend   ──────── $0.00/$5.00                        │",
                 "│   ✗ Bump sqlx to 0.9                   1h ││                                                     │",
-                "│                                           ││ max_delay below zero now fails at parse time.       │",
+                "│                                           ││ NEXT   m  open the PR    r  ask for changes         │",
                 "│ Running                                   ││                                                     │",
-                "│   ⠋ Retry webhook sends     working · 12m ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││  Summary  Activity  Gate ✓  Findings  Diff  Run     │",
                 "│                                           ││                                                     │",
-                "│ Queued                                    ││                                                     │",
-                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
+                "│ Queued                                    ││ Reject negative max_delay                           │",
+                "│   ○ Split the ledger reconciliation j… 2m ││ Review · u/reject-negative · slot 1 · opus/high     │",
                 "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
+                "│                                           ││ max_delay below zero now fails at parse time.       │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
@@ -4373,12 +4695,12 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│ ▌ ✓ Reject negative max_delay          4m ││ Activity ▾                                          │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││ read    src/config.rs                               │",
-                "│   ⠋ Retry webhook sends     working · 12m ││ run     cargo test -p ledger                        │",
-                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
+                "│ ▌ ✓ Reject negative max_delay          4m ││ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr          │",
+                "│   ✗ Bump sqlx to 0.9                   1h ││ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ─────── │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ NEXT   m  open the PR    r  ask for changes         │",
+                "│   ○ Split the ledger reconciliation j… 2m ││  Activity ▾                                         │",
+                "│                                           ││ read    src/config.rs                               │",
+                "│                                           ││ run     cargo test -p ledger                        │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
@@ -4423,7 +4745,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             })
         };
-        assert!(click(&mut app, "Gate  Findings"));
+        assert!(click(&mut app, "Gate ✓"));
         assert_eq!(app.tab, 2);
 
         // a footer key opens the confirm; its esc button keeps the task, its y button dismisses
@@ -4444,6 +4766,210 @@ mod tests {
         assert!(click(&mut app, " y  Dismiss") && !app.confirm && app.notice.is_none());
         assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Dismissed);
         fs::remove_dir_all(&state).unwrap();
+    }
+
+    /// The selected task's states for the verdict: a ready Review, a failed gate, a Proposed
+    /// task and a Running one past `handoff_at`.
+    fn verdict_app(state: &str) -> (App, SystemTime) {
+        let (mut app, now) = app();
+        let check = |name: &str, passed| Check {
+            name: name.into(),
+            passed,
+        };
+        app.detail = true;
+        match state {
+            "review" => {
+                let t = &mut app.tasks[0].0;
+                let names = ["fmt", "clippy", "test", "doc", "sqlx", "deny"];
+                t.gate = Some(names.iter().map(|n| check(n, true)).collect());
+                t.usage = [("s1".into(), 1.2)].into();
+                app.findings = Findings {
+                    fixed: sample_findings().findings,
+                    ..Default::default()
+                };
+                app.diff = vec![
+                    ("src/config/retry.rs".into(), 31, 4),
+                    ("tests/config.rs".into(), 9, 2),
+                    ("CHANGELOG.md".into(), 2, 1),
+                ];
+            }
+            "failed" => {
+                app.selected = 1;
+                let t = &mut app.tasks[1].0;
+                t.gate = Some(vec![check("fmt", true), check("clippy", true), {
+                    check("test", false)
+                }]);
+                t.model = Some("sonnet".into());
+                t.usage = [("s1".into(), 2.1)].into();
+            }
+            "proposed" => {
+                app.selected = 1;
+                app.tasks[1].0.status = Status::Proposed;
+                app.tasks[1].0.model = Some("opus".into());
+            }
+            _ => {
+                app.selected = 2;
+                let t = &mut app.tasks[2].0;
+                (t.slot, t.model) = (Some(2), Some("opus".into()));
+                t.usage = [("s1".into(), 1.84)].into();
+                app.context = Some(170_000);
+                let call = ("Bash".into(), "cargo test".into());
+                app.steps = vec![("t3".into(), call, now - Duration::from_secs(8 * 60))];
+            }
+        }
+        (app, now)
+    }
+
+    /// The detail pane's top rows, without the header line the list's tickets change.
+    fn verdict_screen(app: &App, now: SystemTime, height: u16, theme: &Theme) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(60, height)).unwrap();
+        term.draw(|f| draw(f, app, theme, 0, now)).unwrap();
+        let skip = usize::from(height >= COMPACT);
+        screen(&term)[skip..skip + 11].to_vec()
+    }
+
+    #[test]
+    fn verdict_and_next() {
+        let theme = Theme::new(false, false);
+        let shots: Vec<_> = ["review", "failed", "proposed", "running"]
+            .into_iter()
+            .map(|s| {
+                let (app, now) = verdict_app(s);
+                (s, verdict_screen(&app, now, 24, &theme))
+            })
+            .collect();
+        let shots: Vec<(&str, Vec<&str>)> = (shots.iter())
+            .map(|(s, rows)| (*s, rows.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(
+            shots,
+            [
+                (
+                    "review",
+                    vec![
+                        "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                        "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                        "│                                                          │",
+                        "│ gate    ●●●●●● 6/6          critic  0 open · 1 fixed     │",
+                        "│ change  +42 -7 · 3 files    slot 1 · opus/high           │",
+                        "│ spend   ━━────── $1.20/$5.00                             │",
+                        "│                                                          │",
+                        "│ NEXT   m  open the PR    r  ask for changes              │",
+                        "│                                                          │",
+                        "│  Summary  Activity  Gate ✓  Findings  Diff  Run          │",
+                        "│                                                          │",
+                    ]
+                ),
+                (
+                    "failed",
+                    vec![
+                        "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                        "│ plan ━ queue ━ run ━ ✗ check ┄ review ┄ pr               │",
+                        "│                                                          │",
+                        "│ gate    ●●✗ 2/3             sonnet                       │",
+                        "│ spend   ━━━───── $2.10/$5.00                             │",
+                        "│                                                          │",
+                        "│ NEXT   t  retry    c  continue                           │",
+                        "│                                                          │",
+                        "│  Summary  Activity  Gate ✗  Findings  Diff  Run          │",
+                        "│                                                          │",
+                        "│ Bump sqlx to 0.9                                         │",
+                    ]
+                ),
+                (
+                    "proposed",
+                    vec![
+                        "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                        "│ ◉ plan ┄ queue ┄ run ┄ check ┄ review ┄ pr               │",
+                        "│                                                          │",
+                        "│ opus                                                     │",
+                        "│ spend   ──────── $0.00/$5.00                             │",
+                        "│                                                          │",
+                        "│ NEXT   a  approve    e  edit                             │",
+                        "│                                                          │",
+                        "│  Summary  Activity  Gate  Findings  Diff  Run            │",
+                        "│                                                          │",
+                        "│ Bump sqlx to 0.9                                         │",
+                    ]
+                ),
+                (
+                    "running",
+                    vec![
+                        "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                        "│ plan ━ queue ━ ⠋ run ┄ check ┄ review ┄ pr               │",
+                        "│                                                          │",
+                        "│ context ━━━━━━━─ 85%        quiet   8m                   │",
+                        "│ slot 2 · opus                                            │",
+                        "│ spend   ━━━───── $1.84/$5.00                             │",
+                        "│                                                          │",
+                        "│ NEXT  Nothing needed yet.                                │",
+                        "│                                                          │",
+                        "│  Summary  Activity ⠋  Gate  Findings  Diff  Run          │",
+                        "│                                                          │",
+                    ]
+                ),
+            ]
+        );
+        // compact and ASCII: one verdict line, only the active pill
+        let (app, now) = verdict_app("failed");
+        assert_eq!(
+            verdict_screen(&app, now, 12, &Theme::new(false, true))[..6],
+            [
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan = queue = run = x check - review - pr               │",
+                "│ gate **x 2/3  ·  sonnet  ·  spend ===----- $2.10/$5.00   │",
+                "│ NEXT   t  retry    c  continue                           │",
+                "│  Summary ▾                                               │",
+                "│ Bump sqlx to 0.9                                         │",
+            ]
+        );
+    }
+
+    #[test]
+    fn clicking_next_is_its_key() {
+        let theme = Theme::new(false, false);
+        // draws, then clicks the first cell of `text` above the footer
+        let click = |app: &mut App, now, text: &str| {
+            let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows[..23]
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let x = row[..row.find(text).unwrap()].chars().count();
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let press = |app: &mut App, c| app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        for (state, key, button) in [("failed", 't', " t  retry"), ("proposed", 'e', " e  edit")] {
+            let (mut pressed, _) = verdict_app(state);
+            press(&mut pressed, key);
+            let (mut clicked, now) = verdict_app(state);
+            assert!(click(&mut clicked, now, button));
+            assert_eq!(
+                (clicked.reply_for, clicked.edit),
+                (pressed.reply_for, pressed.edit)
+            );
+            assert!(clicked.reply_for == Some('t') || clicked.edit, "{state}");
+        }
+
+        // the wheel over the tab pills cycles the tabs
+        let (mut app, now) = verdict_app("review");
+        click(&mut app, now, " Summary ");
+        let y = app.hits.borrow().tabs.y;
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 30,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.tab, RUN);
     }
 
     #[test]
@@ -4482,19 +5008,19 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
                 "╭ Task ──────────────────────────────────────────────────────────────────────────────── esc unzoom ╮",
-                "│ Summary  Activity  Gate  Findings  Diff  Run                                                     │",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr                                                       │",
+                "│                                                                                                  │",
+                "│ gate    ● 1/1                                   slot 1 · opus/high                               │",
+                "│ spend   ──────── $0.00/$5.00                                                                     │",
+                "│                                                                                                  │",
+                "│ NEXT   m  open the PR    r  ask for changes                                                      │",
+                "│                                                                                                  │",
+                "│  Summary  Activity  Gate ✓  Findings  Diff  Run                                                  │",
                 "│                                                                                                  │",
                 "│ Reject negative max_delay                                                                        │",
                 "│ Review · u/reject-negative · slot 1 · opus/high                                                  │",
                 "│                                                                                                  │",
                 "│ max_delay below zero now fails at parse time.                                                    │",
-                "│                                                                                                  │",
-                "│                                                                                                  │",
-                "│                                                                                                  │",
-                "│                                                                                                  │",
-                "│                                                                                                  │",
-                "│                                                                                                  │",
-                "│                                                                                                  │",
                 "│                                                                                                  │",
                 "│                                                                                                  │",
                 "│                                                                                                  │",
@@ -4645,15 +5171,15 @@ mod tests {
             screen(&term),
             [
                 "╭ Task ──────────────────────────────────────────── z zoom ╮",
-                "│ Activity ▾                                               │",
-                "│ read    f11.rs                                           │",
-                "│ read    f12.rs                                           │",
-                "│ read    f13.rs                                           │",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ──────── $0. │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Activity ▾                                              │",
                 "│ read    f14.rs                                           │",
                 "│ read    f15.rs                                           │",
-                "│ read    f16.rs                                           ┃",
-                "│ read    f17.rs                                           ┃",
-                "│ read    f18.rs                                           ┃",
+                "│ read    f16.rs                                           │",
+                "│ read    f17.rs                                           │",
+                "│ read    f18.rs                                           │",
                 "│ read    f19.rs                                           ┃",
                 "│ read    f20.rs                                           ┃",
                 "╰──────────────────────────────────────────────────────────╯",
@@ -4665,12 +5191,12 @@ mod tests {
         app.mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 59,
-            row: 2,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.scroll.get(), 10);
+        assert_eq!(app.scroll.get(), 13);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
-        assert!(screen(&term)[2].contains("f1.rs"));
+        assert!(screen(&term)[5].contains("f1.rs"));
     }
 }
