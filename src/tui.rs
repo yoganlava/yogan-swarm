@@ -792,8 +792,8 @@ impl App {
         Some(self.state.join("slots").join(t.slot?.to_string()))
     }
 
-    /// Reads what the current tab shows for the selected task. The gate log and diff are
-    /// re-read only when the task's file changes; the activity tail every time.
+    /// Reads what the current tab shows for the selected task. The gate log, diff and ports are
+    /// re-read only when the task's file changes; the activity and run log tails every time.
     fn load_tab(&mut self) {
         let question = self.request().filter(|r| r.status == Phase::Done);
         let id = question.map(|r| r.id.clone());
@@ -813,9 +813,6 @@ impl App {
             self.activity = activity(&log, &self.slot_dir().unwrap_or_default());
         }
         if self.tab == RUN {
-            let ports = config::load(&self.repo).ok().and_then(|c| c.ports);
-            let n = self.task().and_then(|(t, _)| t.slot);
-            self.ports = ports.zip(n).map(|(p, n)| port_range(&p, n));
             self.run_pid = slot::running(&self.state, &id);
             self.run_log = run_log(&self.state.join(format!("logs/{id}.run.log")));
         }
@@ -831,6 +828,9 @@ impl App {
             self.findings = Findings::load(&self.state, &id).unwrap_or_default();
             let n = self.findings.actionable().count();
             self.finding = self.finding.min(n.saturating_sub(1));
+            let ports = config::load(&self.repo).ok().and_then(|c| c.ports);
+            let n = self.task().and_then(|(t, _)| t.slot);
+            self.ports = ports.zip(n).map(|(p, n)| port_range(&p, n));
             self.loaded = key;
         }
     }
@@ -2512,6 +2512,26 @@ mod tests {
         app.reload(&state).unwrap();
         assert!(app.serving.is_empty());
         fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn discard_stops_the_run_script() {
+        let (mut app, _) = app();
+        let root = std::env::temp_dir().join(format!("yogan-discard-run-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (state, dir) = (root.join("state"), root.join("slot"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        // a file where `tasks/` goes: the save fails, so the scheduler doesn't run here
+        fs::write(state.join("tasks"), "").unwrap();
+        app.state = state.clone();
+        app.tasks[0].0.slot = None;
+        slot::start_run(&state, "t1", "sleep 30", &dir, &[]).unwrap();
+        assert!(slot::running(&state, "t1").is_some());
+        assert!(app.discard().is_err());
+        assert!(slot::running(&state, "t1").is_none());
+        assert!(!state.join("logs/t1.run.pid").exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
