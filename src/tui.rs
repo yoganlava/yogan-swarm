@@ -457,6 +457,8 @@ struct App {
     hits: RefCell<Hits>,
     /// The mouse's cell, whose target gets a tint and its hint in its pane's bottom border.
     hover: Option<Position>,
+    /// Where a right-click opened the selection's actions menu.
+    menu: Option<Position>,
 }
 
 /// A file `e` edits, as (task id, whether it's the PR draft, path).
@@ -646,6 +648,7 @@ pub fn run(repo: &Path) -> Result<()> {
         window: cfg.map_or((0, 1.0), |c| (c.watch.autocompact, c.watch.handoff_at)),
         hits: RefCell::default(),
         hover: None,
+        menu: None,
     };
     let theme = Theme::detect();
     let mouse = config::load(repo).is_ok_and(|c| c.tui.mouse);
@@ -1078,6 +1081,10 @@ impl App {
             |c| key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c);
         if ctrl('c') {
             return false;
+        }
+        // any key closes the actions menu, and all but esc then act as usual
+        if self.menu.take().is_some() && key.code == KeyCode::Esc {
+            return true;
         }
         if key.code == KeyCode::Esc && self.notice.take().is_some() {
             return true;
@@ -1729,8 +1736,22 @@ impl App {
                 hits.at(at).map(|(_, t, _)| *t),
             )
         };
+        // a click on an actions menu item presses its key; any click closes the menu
+        if self.menu.is_some() {
+            if let MouseEventKind::Down(_) = m.kind {
+                self.menu = None;
+                if let Some(Target::Key(key)) = hit {
+                    return self.key(key);
+                }
+            }
+            return true;
+        }
         let before = self.selected;
         match (m.kind, hit) {
+            (MouseEventKind::Down(MouseButton::Right), Some(Target::Row(i))) if !modal => {
+                self.selected = i;
+                self.menu = Some(at);
+            }
             (MouseEventKind::Drag(MouseButton::Left), _) if self.dragging => {
                 self.split = (m.column + 1).clamp(30, 70);
             }
@@ -2196,8 +2217,6 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         f.render_widget(header_line(app, theme, header, false), header);
     }
     let selected = app.task().map(|(t, _)| t);
-    let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
-    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
     let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
         compose(f, body, c, theme);
@@ -2273,47 +2292,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         vec![push, ("g", "regenerate"), ("e", "edit"), ("esc", "back")]
     } else {
         // up to six keys that do something for the selection, the one that moves it on first
-        let valid = |k: &str| match k {
-            "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
-            "x" => selected.is_some() || failed || answered,
-            "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
-            "c" => selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed)),
-            "w" => selected.is_some_and(|t| t.status == Status::Review),
-            "p" | "y" => answered,
-            "1-6" => selected.is_some(),
-            "R" => {
-                selected.is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id))
-            }
-            "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
-            "r" => {
-                answered
-                    || selected
-                        .is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
-            }
-            "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
-            "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
-            _ => true,
-        };
-        let first: &[&str] = match selected.map(|t| t.status) {
-            Some(Status::Review) => &["m", "r", "d", "x", "c", "w", "R", "o"],
-            Some(Status::Failed) => &["t", "c", "x", "d", "o"],
-            Some(Status::Proposed) => &["a", "A", "e", "r", "x"],
-            _ if answered => &["p", "r", "y", "x"],
-            _ => &["t", "d", "o", "R", "x"],
-        };
-        let mut keys: Vec<_> = [first, &["n", "1-6", "j/k", "tab", "q"]]
-            .concat()
-            .into_iter()
-            .filter(|k| valid(k))
-            .filter_map(|k| KEYS.into_iter().find(|(key, _)| *key == k))
-            .map(|(k, label)| match (k, selected.map(|t| t.status)) {
-                ("x", Some(_)) => (k, "discard task"),
-                ("r", Some(Status::Review)) => (k, "reply to worker"),
-                ("r", _) => (k, "reply to lead"),
-                _ => (k, label),
-            })
-            .take(6)
-            .collect();
+        let mut keys = task_keys(app, &["n", "1-6", "j/k", "tab", "q"]);
+        keys.truncate(6);
         keys.push(("?", "more"));
         keys
     };
@@ -2368,6 +2348,59 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     };
     line.splice(0..0, prefix);
     f.render_widget(Line::from(line), footer);
+    if let Some(at) = app.menu {
+        // the selection's actions at the cursor; only its items respond
+        app.hits.borrow_mut().targets.clear();
+        let mut items = task_keys(app, &[]);
+        let own = items.len();
+        items.extend([("z", "zoom"), ("]", "next for you")]);
+        let all = f.area();
+        let (w, h) = (28.min(all.width), items.len() as u16 + 3);
+        let x = (at.x + 1).min(all.right().saturating_sub(w));
+        let y = (at.y + 1).min(all.bottom().saturating_sub(h));
+        let area = Rect::new(x, y, w, h).intersection(all);
+        let title = match (app.request(), selected) {
+            (Some(r), _) => r.text.lines().next().unwrap_or_default(),
+            (None, Some(t)) => t.title.as_str(),
+            _ => "",
+        };
+        let block = pane(title, true, theme);
+        let inner = block.inner(area);
+        f.render_widget(Clear, area);
+        f.render_widget(block, area);
+        for (i, (key, label)) in items.into_iter().enumerate() {
+            // a rule between the task's keys and the global ones
+            let row = inner.y + i as u16 + u16::from(i >= own);
+            // discard is red; it still goes through the confirm
+            let color = if key == "x" { theme.red } else { theme.accent };
+            let line = Line::from(vec![
+                Span::styled(format!("{key:<4}"), color).bold(),
+                Span::raw(label).fg(if key == "x" { theme.red } else { Color::Reset }),
+            ]);
+            let rect =
+                Rect::new(area.x + 1, row, area.width.saturating_sub(2), 1).intersection(all);
+            let text = Rect {
+                y: row,
+                height: 1,
+                ..inner
+            }
+            .intersection(all);
+            f.render_widget(line, text);
+            let hint = format!("{key} · {label}");
+            let target = key_of(key).map(|k| (rect, Target::Key(k), hint));
+            app.hits.borrow_mut().targets.extend(target);
+        }
+        let rule = Rect {
+            y: inner.y + own as u16,
+            height: 1,
+            ..inner
+        }
+        .intersection(all);
+        f.render_widget(
+            Line::raw(theme.rule.repeat(inner.width as usize)).dim(),
+            rule,
+        );
+    }
     if app.help || app.confirm || app.reply.is_some() {
         // only an open modal's own targets respond
         app.hits.borrow_mut().targets.clear();
@@ -2508,6 +2541,51 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         let area = pane.unwrap_or(body).inner(Margin::new(1, 0));
         f.render_widget(Block::new().title_bottom(hint), area);
     }
+}
+
+/// Keys valid for the selection as (key, label): its state's, the one that moves it on first,
+/// then whichever of `rest` are valid.
+fn task_keys(app: &App, rest: &[&str]) -> Vec<(&'static str, &'static str)> {
+    let selected = app.task().map(|(t, _)| t);
+    let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
+    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
+    let valid = |k: &str| match k {
+        "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
+        "x" => selected.is_some() || failed || answered,
+        "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
+        "c" => selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed)),
+        "w" => selected.is_some_and(|t| t.status == Status::Review),
+        "p" | "y" => answered,
+        "1-6" => selected.is_some(),
+        "R" => selected.is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id)),
+        "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
+        "r" => {
+            answered
+                || selected.is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
+        }
+        "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
+        "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
+        _ => true,
+    };
+    let first: &[&str] = match selected.map(|t| t.status) {
+        Some(Status::Review) => &["m", "r", "d", "x", "c", "w", "R", "o"],
+        Some(Status::Failed) => &["t", "c", "x", "d", "o"],
+        Some(Status::Proposed) => &["a", "A", "e", "r", "x"],
+        _ if answered => &["p", "r", "y", "x"],
+        _ => &["t", "d", "o", "R", "x"],
+    };
+    [first, rest]
+        .concat()
+        .into_iter()
+        .filter(|k| valid(k))
+        .filter_map(|k| KEYS.into_iter().find(|(key, _)| *key == k))
+        .map(|(k, label)| match (k, selected.map(|t| t.status)) {
+            ("x", Some(_)) => (k, "discard task"),
+            ("r", Some(Status::Review)) => (k, "reply to worker"),
+            ("r", _) => (k, "reply to lead"),
+            _ => (k, label),
+        })
+        .collect()
 }
 
 fn gate_passed(t: &Task) -> bool {
@@ -4003,6 +4081,7 @@ mod tests {
             slots: 3,
             hits: RefCell::default(),
             hover: None,
+            menu: None,
         };
         (app, now)
     }
@@ -5598,6 +5677,70 @@ mod tests {
                 "│ Bump sqlx to 0.9                                         │",
             ]
         );
+    }
+
+    #[test]
+    fn right_click_opens_the_actions_menu() {
+        let theme = Theme::new(false, false);
+        let failed = || {
+            let (mut app, now) = app();
+            app.tasks[1].0.slot = Some(2);
+            (app, now)
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // draws, then sends `kind` at the first cell of `text`
+        let mut send = |app: &mut App, now, kind, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows.iter().enumerate().find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let x = row[..row.find(text).unwrap()].chars().count();
+            let m = MouseEvent {
+                kind,
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            };
+            (app.mouse(m), rows)
+        };
+        let right = MouseEventKind::Down(MouseButton::Right);
+        let left = MouseEventKind::Down(MouseButton::Left);
+        let (mut app, now) = failed();
+        send(&mut app, now, right, "Bump sqlx");
+        assert_eq!((app.selected, app.menu.is_some()), (1, true));
+
+        // the menu over the Failed task, then a click on `t` does what pressing it does
+        let (_, rows) = send(&mut app, now, left, "t   retry");
+        assert_eq!(
+            rows[4..15],
+            [
+                "│ ▌ ✗ Bump sqlx to 0.9           failed  1h ││ slot 2                                              │",
+                "│      ╭ Bump sqlx to 0.9 ────────╮         ││ spend   ──────── $0.00/$5.00                        │",
+                "│ ▾ WOR│ t   retry                │──────── ││                                                     │",
+                "│   ⠋ R│ c   continue             │ng · 12m ││ NEXT   t  retry    c  continue                      │",
+                "│      │ x   discard task         │         ││                                                     │",
+                "│ ▾ LAT│ d   diff                 │──────── ││  Summary  Activity  Gate  Findings  Diff  Run       │",
+                "│   ○ S│ o   open                 │s a slot ││                                                     │",
+                "│      │ ──────────────────────── │         ││ Bump sqlx to 0.9                                    │",
+                "│      │ z   zoom                 │         ││ Failed · slot 2                                     │",
+                "│      │ ]   next for you         │         ││                                                     │",
+                "│      ╰──────────────────────────╯         ││                                                     │",
+            ]
+        );
+        let (mut pressed, _) = failed();
+        pressed.selected = 1;
+        pressed.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.reply_for, pressed.reply_for);
+        assert_eq!((app.reply_for, app.menu), (Some('t'), None));
+
+        // another key closes it and acts; a click outside only closes it
+        let (mut app, now) = failed();
+        send(&mut app, now, right, "Bump sqlx");
+        app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!((app.menu, app.tab), (None, 2));
+        send(&mut app, now, right, "Bump sqlx");
+        send(&mut app, now, left, "NEXT");
+        assert_eq!((app.menu, app.reply_for, app.selected), (None, None, 1));
     }
 
     #[test]
