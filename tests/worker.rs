@@ -261,13 +261,16 @@ fn worker_runs_setup_then_claude() {
         Some("unexpected MCP servers: notion")
     );
 
-    // a denied tool means the work is incomplete
-    let denial = r#"{"tool_name":"Write","tool_input":{}}"#;
+    // a denied call still goes through the gate to Review, listed in the summary
+    let denial = r#"{"tool_name":"Bash","tool_input":{"command":"sed -i x a.txt"}}"#;
     let (ok, t4) = worker("t4", "true", "graft", denial, None);
-    assert!(!ok);
-    assert_eq!(t4.status, Status::Failed);
+    assert!(ok);
+    assert_eq!(t4.status, Status::Review);
     let summary = t4.summary.unwrap();
-    assert_eq!(summary, "incomplete: permission denied for Write");
+    assert!(
+        summary.starts_with("Permission denied:\n- Bash sed -i x a.txt"),
+        "{summary}"
+    );
 
     // an unknown effort fails before Claude starts
     let (ok, t5) = worker("t5", "true", "graft", "", Some("bogus"));

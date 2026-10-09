@@ -611,8 +611,8 @@ fn lifecycle(
                         reply = r.structured_output;
                         denied = r
                             .permission_denials
-                            .into_iter()
-                            .map(|d| d.tool_name)
+                            .iter()
+                            .map(|d| call(&d.tool_name, &d.tool_input))
                             .collect();
                     }
                     _ => {}
@@ -667,11 +667,17 @@ fn lifecycle(
                 continue;
             }
             res?;
-            ensure!(
-                denied.is_empty(),
-                "incomplete: permission denied for {}",
-                denied.join(", ")
-            );
+            // the worker may have found another way, so the gate decides; Review shows what was
+            // denied, usually something allowed_tools is missing
+            if !denied.is_empty() {
+                let note = redact(&format!("Permission denied:\n- {}", denied.join("\n- ")));
+                let summary = task
+                    .summary
+                    .take()
+                    .map_or(note.clone(), |s| format!("{s}\n\n{note}"));
+                task.summary = Some(summary);
+                task.save(state)?;
+            }
             return Ok(reply);
         }
     };
