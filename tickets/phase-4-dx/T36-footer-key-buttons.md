@@ -1,4 +1,4 @@
-- [ ] **T36 The footer fits, as key buttons**
+- [x] **T36 The footer fits, as key buttons**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Try it (footer); Visual language › Buttons and keys.
 
