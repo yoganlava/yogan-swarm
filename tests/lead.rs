@@ -7,12 +7,19 @@ use yogan_swarm::task::{self, Status};
 
 /// Stand-in for Claude: records its args, then files one task through `yogan` on its PATH, a
 /// revised one when resumed. A request of `fail` exits 1, and `die` exits 1 after starting its
-/// session. Asked a question (it has WebSearch), it answers and files nothing.
+/// session; `flaky` fails once. Asked a question (it has WebSearch), it answers and files
+/// nothing. Like claude, it rejects a prompt that isn't last after `--`.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$YOGAN_DIR/claude.args"
-[ "$2" = fail ] && exit 1
+for prompt; do :; done
+eval "sep=\${$(($# - 1))}"
+[ "$sep" = "--" ] || { echo "error: unknown option '$prompt'" >&2; exit 1; }
+[ "$prompt" = fail ] && exit 1
 echo '{"type":"system","subtype":"init","session_id":"s-lead","model":"m","tools":[],"mcp_servers":[]}'
-[ "$2" = die ] && exit 1
+[ "$prompt" = die ] && exit 1
+if [ "$prompt" = flaky ] && [ ! -e "$YOGAN_DIR/flaky.done" ]; then
+  touch "$YOGAN_DIR/flaky.done"; exit 1
+fi
 answer="See src/lib.rs:1 for it."
 case "$*" in *--resume*) answer="Because." ;; esac
 case "$*" in *WebSearch*)
@@ -92,7 +99,7 @@ fn lead_files_proposals() {
 
     let args = fs::read_to_string(state.join("claude.args")).unwrap();
     for want in [
-        "-p\nReject a negative max_delay\n",
+        "--\nReject a negative max_delay\n",
         "--model\nclaude-opus-5-5\n--effort\nxhigh\n",
         "--allowedTools\nRead\nGrep\nGlob\nBash(yogan task propose:*)\n",
         "--disallowedTools\nEdit\nWrite\nNotebookEdit\n--append-system-prompt\n",
@@ -174,13 +181,28 @@ fn lead_files_proposals() {
     assert!(!args.contains("yogan task propose"), "{args}");
 
     // r: a follow-up resumes the session, and its answer goes under the question
-    lead::follow_up(&repo, &state, "r4").unwrap();
+    lead::follow_up(&repo, &state, "r4", "- and why?").unwrap();
     let (ok, r4) = yogan(&["r4", "--reply", "- and why?"]);
     assert!(ok);
     assert_eq!(r4.status, Phase::Done);
     assert_eq!(
         answer(),
         "See src/lib.rs:1 for it.\n\n---\n\n**- and why?**\n\nBecause.\n"
+    );
+
+    // t after a failed follow-up asks that follow-up again, keeping the answers so far
+    lead::follow_up(&repo, &state, "r4", "flaky").unwrap();
+    let (ok, r4) = yogan(&["r4", "--reply", "flaky"]);
+    assert!(!ok);
+    assert_eq!(r4.status, Phase::Failed);
+    assert_eq!(lead::retry(&state, "r4").unwrap().as_deref(), Some("flaky"));
+    let (ok, r4) = yogan(&["r4", "--reply", "flaky"]);
+    assert!(ok);
+    assert_eq!((r4.status, r4.follow_up), (Phase::Done, None));
+    assert!(
+        answer().ends_with("**- and why?**\n\nBecause.\n\n---\n\n**flaky**\n\nBecause.\n"),
+        "{}",
+        answer()
     );
 
     fs::remove_dir_all(&root).unwrap();

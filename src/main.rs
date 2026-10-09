@@ -41,7 +41,7 @@ enum Command {
 enum TaskCommand {
     /// File a proposed task and print its id
     Propose {
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
         /// Id of the task this one builds on
         #[arg(long)]
@@ -49,8 +49,9 @@ enum TaskCommand {
         #[arg(long, value_delimiter = ',')]
         crates: Vec<String>,
         /// A testable criterion, 1 to 5 times
-        #[arg(long, required = true)]
+        #[arg(long, required = true, allow_hyphen_values = true)]
         accept: Vec<String>,
+        #[arg(allow_hyphen_values = true)]
         body: String,
     },
 }

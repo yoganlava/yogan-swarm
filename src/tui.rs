@@ -408,9 +408,15 @@ fn reap(state: &Path) -> Result<()> {
             t.save(state)?;
         }
     }
-    // a lead records its pid when it starts, so none yet means it hasn't
+    // a lead records its pid when it starts; none a minute on means it never did
+    let never_started = |r: &Request| {
+        let file = state.join(format!("requests/{}.toml", r.id));
+        let since = fs::metadata(file).and_then(|m| m.modified()).ok();
+        let age = since.and_then(|s| s.elapsed().ok()).unwrap_or_default();
+        r.pid.is_none() && age > Duration::from_secs(60)
+    };
     for mut r in lead::load_all(state)? {
-        if r.status == Phase::Planning && r.pid.is_some_and(|p| !alive(p)) {
+        if r.status == Phase::Planning && (r.pid.is_some_and(|p| !alive(p)) || never_started(&r)) {
             r.status = Phase::Failed;
             r.summary = Some("the lead exited without finishing".into());
             r.save(state)?;
@@ -464,10 +470,11 @@ impl App {
         self.requests.get(self.selected)
     }
 
-    /// The selected task's base; see `task::base`.
-    fn base(&self) -> Option<String> {
-        let (t, _) = self.task()?;
-        Some(task::base(t, self.tasks.iter().map(|(t, _)| t)))
+    /// The selected task's base; see `task::base`. Read from every task, since a discarded
+    /// parent isn't listed but its child still targets its branch.
+    fn base(&self) -> Result<String> {
+        let (t, _) = self.task().context("no task selected")?;
+        Ok(task::base(t, task::load_all(&self.state)?.iter()))
     }
 
     /// The selected row's task, if it's one.
@@ -688,7 +695,7 @@ impl App {
     fn retry(&mut self) -> Result<()> {
         let id = self.request().context("no request selected")?.id.clone();
         let prompt = lead::retry(&self.state, &id)?;
-        lead::spawn(&self.repo, &id, prompt.as_deref())?;
+        lead::spawn(&self.repo, &self.state, &id, prompt.as_deref())?;
         self.info = Some("the lead is planning again".into());
         Ok(())
     }
@@ -745,6 +752,11 @@ impl App {
         let Some((id, old, _)) = &self.awaiting else {
             return;
         };
+        // never move the selection under an open modal, whose keys would then act on it
+        let modal = self.confirm || self.help || self.reply.is_some() || self.compose.is_some();
+        if modal || self.instruction.is_some() {
+            return;
+        }
         let Some(i) = self.tasks.iter().position(|(t, _)| &t.id == id) else {
             self.awaiting = None; // discarded meanwhile
             return;
@@ -777,7 +789,7 @@ impl App {
         let (title, body) = text.trim().split_once('\n').unwrap_or((text.trim(), ""));
         (draft.title, draft.body) = (pr::clean(title.trim()), pr::clean(body.trim()));
         let cfg = config::load(&self.repo)?;
-        let migration = pr::migration(&dir, &self.base().context("no task selected")?)?;
+        let migration = pr::migration(&dir, &self.base()?)?;
         draft.problem = pr::check_title(&draft.title, &cfg.pr.types, migration).err();
         t.save(&self.state)
     }
@@ -797,8 +809,7 @@ impl App {
             "the branch changed since this draft; press m to redraft"
         );
         let cfg = config::load(&self.repo)?;
-        let base = self.base().context("no task selected")?;
-        let url = pr::open(&t, &dir, &base, cfg.pr.draft)?;
+        let url = pr::open(&t, &dir, &self.base()?, cfg.pr.draft)?;
         t.pr_url = Some(url.clone());
         t.status = Status::PrOpen;
         self.preview = false;
@@ -856,8 +867,8 @@ impl App {
         ensure!(!text.trim().is_empty(), "write a reply first");
         if let Some(r) = self.request() {
             let id = r.id.clone();
-            lead::follow_up(&self.repo, &self.state, &id)?;
-            lead::spawn(&self.repo, &id, Some(text.trim()))?;
+            lead::follow_up(&self.repo, &self.state, &id, text.trim())?;
+            lead::spawn(&self.repo, &self.state, &id, Some(text.trim()))?;
             self.info = Some("the lead is answering the follow-up".into());
             return Ok(());
         }
@@ -867,7 +878,7 @@ impl App {
             "this task has no lead to reply to"
         );
         let prompt = lead::reply(&self.state, &t.plan, text.trim())?;
-        lead::spawn(&self.repo, &t.plan, Some(&prompt))?;
+        lead::spawn(&self.repo, &self.state, &t.plan, Some(&prompt))?;
         self.info = Some("the lead is revising the plan".into());
         Ok(())
     }
@@ -1365,7 +1376,6 @@ fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-/// A request: its first line, status and ticket, why its lead failed, then the full request.
 /// A request: its first line, status and ticket, why its lead failed, then the full request;
 /// for a question, the answer and the files it cites instead.
 fn request(
@@ -1847,9 +1857,13 @@ mod tests {
         let err = app.draft(None).unwrap_err().to_string();
         assert_eq!(err, "a PR draft is on its way");
 
-        // a new draft opens the preview on its task
+        // a new draft opens the preview on its task, once no modal would act on it
         app.selected = 2;
         app.tasks[0].0.pr_draft = Some(draft.clone());
+        app.confirm = true;
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_some() && !app.preview && app.selected == 2);
+        app.confirm = false;
         app.check_awaiting(false);
         assert!(app.awaiting.is_none() && app.preview && app.selected == 0);
 
@@ -2133,6 +2147,31 @@ mod tests {
     }
 
     #[test]
+    fn child_of_a_discarded_parent_keeps_its_base() {
+        let (mut app, _) = app();
+        let state = std::env::temp_dir().join(format!("yogan-base-{}", std::process::id()));
+        let parent = Task {
+            id: "p1".into(),
+            branch: "u/parent".into(),
+            status: Status::Discarded,
+            ..Default::default()
+        };
+        let child = Task {
+            id: "c1".into(),
+            parent: Some("p1".into()),
+            status: Status::Review,
+            ..Default::default()
+        };
+        parent.save(&state).unwrap();
+        child.save(&state).unwrap();
+        app.state = state.clone();
+        app.reload(&state).unwrap();
+        assert_eq!(app.task().unwrap().0.id, "c1", "the parent isn't listed");
+        assert_eq!(app.base().unwrap(), "origin/u/parent");
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
     fn reaps_dead_leads() {
         let state = std::env::temp_dir().join(format!("yogan-reap-{}", std::process::id()));
         let mut child = Command::new("true").spawn().unwrap();
@@ -2144,6 +2183,14 @@ mod tests {
         };
         request("dead", Some(child.id())).save(&state).unwrap();
         request("starting", None).save(&state).unwrap();
+        request("never-started", None).save(&state).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(120);
+        File::options()
+            .write(true)
+            .open(state.join("requests/never-started.toml"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         request("alive", Some(std::process::id()))
             .save(&state)
             .unwrap();
@@ -2156,6 +2203,7 @@ mod tests {
             Some("the lead exited without finishing")
         );
         assert_eq!(status("starting").status, Phase::Planning);
+        assert_eq!(status("never-started").status, Phase::Failed);
         assert_eq!(status("alive").status, Phase::Planning);
         fs::remove_dir_all(&state).unwrap();
     }

@@ -255,6 +255,16 @@ fn worker_runs_setup_then_claude() {
     assert!(!root.join("claude.status").exists(), "no session ran");
     assert!(!state.join("logs/t1.gate.log").exists(), "no gate ran");
 
+    // so does a fetch that fails, with origin unreachable
+    let gone = root.join("origin.gone");
+    fs::rename(&origin, &gone).unwrap();
+    let (ok, t1) = yogan(&["worker", "t1", "--pr"], "graft", "");
+    fs::rename(&gone, &origin).unwrap();
+    assert!(!ok);
+    assert_eq!(t1.status, Status::Review);
+    let err = fs::read_to_string(state.join("logs/t1.pr.log")).unwrap();
+    assert!(err.contains("fetch"), "{err}");
+
     // m after a clean upstream change: rebased, re-gated and drafted for the new head
     fs::remove_file(home.join("draft.fail")).unwrap();
     fs::write(repo.join("b.txt"), "b").unwrap();

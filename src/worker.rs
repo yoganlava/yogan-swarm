@@ -6,7 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use rustix::process::{
     Pid, Resource, Rlimit, Signal, getrlimit, kill_process_group, setrlimit, setsid,
 };
@@ -56,6 +56,52 @@ pub fn spawn(repo: &Path, id: &str, extra: &[&str]) -> Result<u32> {
     detach(cmd)
 }
 
+/// Runs `cmd`, a `claude` with its role's flags, as `claude -p` on `prompt`, which goes last
+/// after `--` so one starting with `-` isn't read as an option. The event stream goes redacted
+/// to `log` and parsed to `on_event`, whose error kills claude; stderr goes redacted to
+/// `err_log`.
+pub(crate) fn claude(
+    cmd: &mut Command,
+    prompt: &str,
+    log: &mut File,
+    err_log: &File,
+    mut on_event: impl FnMut(Event) -> Result<()>,
+) -> Result<()> {
+    let mut claude = cmd
+        .args(["-p", "--output-format", "stream-json", "--verbose"])
+        .args(["--setting-sources", "project", "--strict-mcp-config"])
+        .args(["--", prompt])
+        .env_remove("CLAUDE_CODE_EFFORT_LEVEL") // it would override --effort
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting claude")?;
+    let stderr = claude.stderr.take().context("claude stderr")?;
+    let mut err_log = err_log.try_clone()?;
+    let stderr = std::thread::spawn(move || -> std::io::Result<()> {
+        for line in BufReader::new(stderr).lines() {
+            writeln!(err_log, "{}", redact(&line?))?;
+        }
+        Ok(())
+    });
+    let stdout = claude.stdout.take().context("claude stdout")?;
+    for line in BufReader::new(stdout).lines() {
+        let line = line?;
+        writeln!(log, "{}", redact(&line))?;
+        if let Ok(event) = serde_json::from_str(&line)
+            && let Err(e) = on_event(event)
+        {
+            claude.kill()?;
+            return Err(e);
+        }
+    }
+    let status = claude.wait()?;
+    let _ = stderr.join();
+    ensure!(status.success(), "claude exited with {status}");
+    Ok(())
+}
+
 /// Claude only warns on an unknown effort and runs on its default, so yogan fails instead.
 pub(crate) fn check_effort(effort: &str) -> Result<()> {
     ensure!(
@@ -100,7 +146,7 @@ pub fn run(repo: &Path, id: &str, pr: Option<&str>) -> Result<()> {
         && pr.is_some()
         && task.status == Status::Review
     {
-        // the work is intact: only the draft failed, or another worker holds the slot
+        // the work is intact: the fetch, rebase or draft failed, or another worker holds the slot
         fs::create_dir_all(state.join("logs"))?;
         fs::write(state.join(format!("logs/{id}.pr.log")), format!("{e:#}\n"))?;
     } else if let Err(e) = &res {
@@ -137,11 +183,10 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
     check_effort(&effort)?;
     task.model = Some(model.clone());
     task.effort = Some(effort.clone());
-    task.status = if pr.is_some() {
-        Status::Checking
-    } else {
-        Status::Running
-    };
+    // --pr leaves the task in Review until something runs, so a failed fetch keeps it there
+    if pr.is_none() {
+        task.status = Status::Running;
+    }
     task.slot = Some(n);
     task.pid = Some(std::process::id());
     task.save(state)?;
@@ -199,20 +244,8 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
         task.pr_draft = None;
         task.save(state)?;
         let mut cmd = Command::new("claude");
-        cmd.args(["-p", prompt, "--output-format", "stream-json", "--verbose"])
-            .args([
-                "--permission-mode",
-                "acceptEdits",
-                "--setting-sources",
-                "project",
-            ])
-            .args([
-                "--model",
-                &model,
-                "--effort",
-                &effort,
-                "--strict-mcp-config",
-            ]);
+        cmd.args(["--permission-mode", "acceptEdits"])
+            .args(["--model", &model, "--effort", &effort]);
         if let Some(file) = &w.mcp_config {
             cmd.args(["--mcp-config", file]);
         }
@@ -222,41 +255,23 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
                 task.sessions.last().context("no session to resume")?,
             ]);
         }
-        let mut claude = cmd
-            .arg("--allowedTools")
+        cmd.arg("--allowedTools")
             .args(&allowed)
             .arg("--disallowedTools")
             .args(DENY)
             .args(&w.deny)
             .args(["--append-system-prompt", RULES])
             .current_dir(&dir)
-            .env_remove("CLAUDE_CODE_EFFORT_LEVEL") // it would override --effort
             .env("GIT_EDITOR", "true") // `rebase --continue` must not wait on an editor
-            .envs(env.iter().cloned())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("starting claude")?;
-        let stderr = claude.stderr.take().context("claude stderr")?;
-        let mut err_log = err_log.try_clone()?;
-        let stderr = std::thread::spawn(move || -> std::io::Result<()> {
-            for line in BufReader::new(stderr).lines() {
-                writeln!(err_log, "{}", redact(&line?))?;
-            }
-            Ok(())
-        });
-        let stdout = claude.stdout.take().context("claude stdout")?;
+            .envs(env.iter().cloned());
         let mut denied = Vec::new();
-        for line in BufReader::new(stdout).lines() {
-            let line = line?;
-            writeln!(log, "{}", redact(&line))?;
-            match serde_json::from_str(&line) {
-                Ok(Event::System(System::Init {
+        claude(&mut cmd, prompt, &mut log, &err_log, |event| {
+            match event {
+                Event::System(System::Init {
                     session_id,
                     mcp_servers,
                     ..
-                })) => {
+                }) => {
                     if !task.sessions.contains(&session_id) {
                         task.sessions.push(session_id);
                         task.save(state)?;
@@ -266,12 +281,13 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
                         .filter(|s| !servers.contains(&s.name))
                         .map(|s| s.name)
                         .collect();
-                    if !extra.is_empty() {
-                        claude.kill()?;
-                        bail!("unexpected MCP servers: {}", extra.join(", "));
-                    }
+                    ensure!(
+                        extra.is_empty(),
+                        "unexpected MCP servers: {}",
+                        extra.join(", ")
+                    );
                 }
-                Ok(Event::Result(r)) => {
+                Event::Result(r) => {
                     task.summary = Some(r.result).filter(|s| !s.is_empty());
                     denied = r
                         .permission_denials
@@ -281,10 +297,8 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
                 }
                 _ => {}
             }
-        }
-        let status = claude.wait()?;
-        let _ = stderr.join();
-        ensure!(status.success(), "claude exited with {status}");
+            Ok(())
+        })?;
         ensure!(
             denied.is_empty(),
             "incomplete: permission denied for {}",

@@ -1,14 +1,13 @@
 //! The lead: one read-only Claude session per request, filing tasks with `yogan task propose`.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::redact::redact;
 use crate::stream::{Event, System};
 use crate::task::{self, Status};
 use crate::{config, worker};
@@ -49,6 +48,8 @@ pub struct Request {
     pub pid: Option<u32>,
     /// The lead's final message, or why it failed.
     pub summary: Option<String>,
+    /// The follow-up being answered, so a retry asks it again.
+    pub follow_up: Option<String>,
 }
 
 const RULES: &str = "\
@@ -112,19 +113,36 @@ pub fn submit(
         ..Default::default()
     };
     req.save(state)?;
-    spawn(repo, &req.id, None)?;
+    spawn(repo, state, &req.id, None)?;
     Ok(req)
 }
 
-/// Starts `yogan lead <id> [--reply <prompt>]` detached in `repo`.
-pub fn spawn(repo: &Path, id: &str, reply: Option<&str>) -> Result<()> {
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.args(["lead", id]).current_dir(repo);
-    if let Some(prompt) = reply {
-        cmd.args(["--reply", prompt]);
+/// Starts `yogan lead <id> [--reply <prompt>]` detached in `repo`. If it can't start, the
+/// request fails with the reason, rather than staying in Planning with no lead.
+pub fn spawn(repo: &Path, state: &Path, id: &str, reply: Option<&str>) -> Result<()> {
+    let started = std::env::current_exe().and_then(|exe| {
+        let mut cmd = Command::new(exe);
+        cmd.args(["lead", id]).current_dir(repo);
+        if let Some(prompt) = reply {
+            cmd.args(["--reply", prompt]);
+        }
+        worker::detach(cmd).map_err(std::io::Error::other)
+    });
+    if let Err(e) = started {
+        let mut req = load(state, id)?;
+        req.status = Phase::Failed;
+        req.summary = Some(format!("the lead didn't start: {e}"));
+        req.save(state)?;
+        return Err(e.into());
     }
-    worker::detach(cmd)?;
     Ok(())
+}
+
+/// Back to Planning for another run of its lead.
+fn restart(state: &Path, req: &mut Request) -> Result<()> {
+    req.status = Phase::Planning;
+    (req.summary, req.pid) = (None, None);
+    req.save(state)
 }
 
 /// Readies request `id` for a reply: withdraws its pending proposals, since the lead refiles
@@ -146,9 +164,7 @@ pub fn reply(state: &Path, id: &str, feedback: &str) -> Result<String> {
             _ => kept.push(line),
         }
     }
-    req.status = Phase::Planning;
-    (req.summary, req.pid) = (None, None);
-    req.save(state)?;
+    restart(state, &mut req)?;
     let mut prompt = format!(
         "{feedback}\n\nRevise the plan. Your pending proposals were withdrawn, so file every \
          task of the revised plan again with `yogan task propose`.\n\nWithdrawn:\n{}\n",
@@ -183,8 +199,8 @@ fn room(requests: &[Request], limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// Readies answered request `id` to take a follow-up, which resumes its session.
-pub fn follow_up(repo: &Path, state: &Path, id: &str) -> Result<()> {
+/// Readies answered request `id` to take `question`, which resumes its session.
+pub fn follow_up(repo: &Path, state: &Path, id: &str, question: &str) -> Result<()> {
     let mut req = load(state, id)?;
     ensure!(
         req.status == Phase::Done && req.session.is_some(),
@@ -193,9 +209,8 @@ pub fn follow_up(repo: &Path, state: &Path, id: &str) -> Result<()> {
     if req.mode == Mode::Ask {
         check_room(repo, state)?;
     }
-    req.status = Phase::Planning;
-    (req.summary, req.pid) = (None, None);
-    req.save(state)
+    req.follow_up = Some(question.into());
+    restart(state, &mut req)
 }
 
 /// Readies failed request `id` for another run. Returns the prompt that resumes its session,
@@ -206,10 +221,11 @@ pub fn retry(state: &Path, id: &str) -> Result<Option<String>> {
         req.status == Phase::Failed,
         "only a failed request can be retried"
     );
-    let why = req.summary.take().unwrap_or_default();
-    req.status = Phase::Planning;
-    req.pid = None;
-    req.save(state)?;
+    let why = req.summary.clone().unwrap_or_default();
+    restart(state, &mut req)?;
+    if req.follow_up.is_some() && req.session.is_some() {
+        return Ok(req.follow_up);
+    }
     // a question just asks again; the resume prompt is about filing tasks
     if req.session.is_none() || req.mode == Mode::Ask {
         return Ok(None);
@@ -245,12 +261,17 @@ pub fn run(repo: &Path, id: &str, reply: Option<&str>) -> Result<()> {
     } else {
         Phase::Failed
     };
+    let asked = if res.is_ok() {
+        req.follow_up.take()
+    } else {
+        None
+    };
     if let Err(e) = &res {
         req.summary = Some(format!("{e:#}"));
     }
     req.save(&state)?;
     res?;
-    save_answer(&state, &req, reply)
+    save_answer(&state, &req, asked.as_deref())
 }
 
 pub fn answer_path(state: &Path, id: &str) -> PathBuf {
@@ -259,14 +280,14 @@ pub fn answer_path(state: &Path, id: &str) -> PathBuf {
 
 /// Saves the lead's final message to `answers/<id>.md` when it answered rather than planned;
 /// a follow-up's answer goes under its question.
-fn save_answer(state: &Path, req: &Request, reply: Option<&str>) -> Result<()> {
+fn save_answer(state: &Path, req: &Request, follow_up: Option<&str>) -> Result<()> {
     let planned = task::load_all(state)?.iter().any(|t| t.plan == req.id);
     let (Some(answer), false) = (&req.summary, planned || req.mode == Mode::Plan) else {
         return Ok(());
     };
     let path = answer_path(state, &req.id);
     fs::create_dir_all(state.join("answers"))?;
-    match reply {
+    match follow_up {
         Some(question) if path.exists() => {
             let mut file = File::options().append(true).open(&path)?;
             write!(file, "\n---\n\n**{}**\n\n{answer}\n", question.trim())?;
@@ -311,13 +332,10 @@ fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Re
         let path = logs.join(format!("{}.{name}", req.id));
         File::options().create(true).append(true).open(path)
     };
-    let (mut log, mut err_log) = (append("jsonl")?, append("stderr.log")?);
+    let (mut log, err_log) = (append("jsonl")?, append("stderr.log")?);
 
     let mut cmd = Command::new("claude");
-    let prompt = reply.unwrap_or(&req.text);
-    cmd.args(["-p", prompt, "--output-format", "stream-json", "--verbose"])
-        .args(["--setting-sources", "project", "--strict-mcp-config"])
-        .args(["--model", model, "--effort", effort]);
+    cmd.args(["--model", model, "--effort", effort]);
     if let Some(file) = &w.mcp_config {
         cmd.args(["--mcp-config", file]);
     }
@@ -327,46 +345,27 @@ fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Re
             req.session.as_deref().context("no session to resume")?,
         ]);
     }
-    let mut claude = cmd
-        .arg("--allowedTools")
+    cmd.arg("--allowedTools")
         .args(&allowed)
         .arg("--disallowedTools")
         .args(&deny)
         .args(["--append-system-prompt", &rules])
         .current_dir(repo)
-        .env_remove("CLAUDE_CODE_EFFORT_LEVEL") // it would override --effort
         .env("PATH", path)
         .env("YOGAN_DIR", state)
-        .env("YOGAN_REQUEST", &req.id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("starting claude")?;
-    let stderr = claude.stderr.take().context("claude stderr")?;
-    let stderr = std::thread::spawn(move || -> std::io::Result<()> {
-        for line in BufReader::new(stderr).lines() {
-            writeln!(err_log, "{}", redact(&line?))?;
-        }
-        Ok(())
-    });
-    let stdout = claude.stdout.take().context("claude stdout")?;
-    for line in BufReader::new(stdout).lines() {
-        let line = line?;
-        writeln!(log, "{}", redact(&line))?;
-        match serde_json::from_str(&line) {
-            Ok(Event::System(System::Init { session_id, .. })) => {
+        .env("YOGAN_REQUEST", &req.id);
+    let prompt = reply.map_or_else(|| req.text.clone(), String::from);
+    worker::claude(&mut cmd, &prompt, &mut log, &err_log, |event| {
+        match event {
+            Event::System(System::Init { session_id, .. }) => {
                 req.session = Some(session_id);
                 req.save(state)?;
             }
-            Ok(Event::Result(r)) => req.summary = Some(r.result).filter(|s| !s.is_empty()),
+            Event::Result(r) => req.summary = Some(r.result).filter(|s| !s.is_empty()),
             _ => {}
         }
-    }
-    let status = claude.wait()?;
-    let _ = stderr.join();
-    ensure!(status.success(), "claude exited with {status}");
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
