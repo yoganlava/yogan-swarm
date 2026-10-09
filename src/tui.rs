@@ -363,12 +363,34 @@ struct App {
 /// A file `e` edits, as (task id, whether it's the PR draft, path).
 type Edit = (String, bool, PathBuf);
 
-/// The list and detail panes, and each list row's screen line and row index.
+/// The list and detail panes, for the wheel, and each clickable rect in drawing order.
 #[derive(Default)]
 struct Hits {
     list: Rect,
     detail: Rect,
-    rows: Vec<(u16, usize)>,
+    targets: Vec<(Rect, Target)>,
+}
+
+/// What a click does: press a key, or select a list row, which has no key.
+#[derive(Clone, Copy)]
+enum Target {
+    Key(KeyEvent),
+    Row(usize),
+}
+
+/// The key a footer label stands for; pairs like `j/k` stand for none.
+fn key_of(label: &str) -> Option<KeyEvent> {
+    let code = match label {
+        "enter" => KeyCode::Enter,
+        "esc" => KeyCode::Esc,
+        "tab" => KeyCode::Tab,
+        "ctrl-s" => return Some(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        _ => match label.chars().collect::<Vec<_>>()[..] {
+            [c] => KeyCode::Char(c),
+            _ => return None,
+        },
+    };
+    Some(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 /// The Run tab: the slot's ports and `[scripts]`, read when the task changes, and the run
@@ -507,7 +529,7 @@ pub fn run(repo: &Path) -> Result<()> {
                     Event::Key(key) if key.kind == KeyEventKind::Press && !app.key(key) => {
                         return Ok(());
                     }
-                    Event::Mouse(m) => app.mouse(m),
+                    Event::Mouse(m) if !app.mouse(m) => return Ok(()),
                     _ => {}
                 }
             }
@@ -1434,26 +1456,31 @@ impl App {
         ])
     }
 
-    /// Click selects a row; the wheel scrolls the detail pane or moves through the list.
-    fn mouse(&mut self, m: MouseEvent) {
+    /// A click presses the key of the target under it or selects its row; the wheel scrolls the
+    /// detail pane or moves through the list. Returns false to quit.
+    fn mouse(&mut self, m: MouseEvent) -> bool {
         let modal = self.compose.is_some() || self.settings.is_some() || self.reply.is_some();
-        if modal || self.preview || self.confirm || self.help || self.instruction.is_some() {
-            return;
-        }
+        let modal =
+            modal || self.preview || self.confirm || self.help || self.instruction.is_some();
         let at = Position::new(m.column, m.row);
-        let (in_list, in_detail, row) = {
+        let (in_list, in_detail, hit) = {
             let hits = self.hits.borrow();
-            let row = hits.rows.iter().find(|(y, _)| *y == m.row).map(|(_, i)| *i);
-            (hits.list.contains(at), hits.detail.contains(at), row)
+            let hit = hits.targets.iter().rev().find(|(r, _)| r.contains(at));
+            (
+                hits.list.contains(at),
+                hits.detail.contains(at),
+                hit.map(|(_, t)| *t),
+            )
         };
         let before = self.selected;
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) if in_list => {
-                if let Some(i) = row {
-                    self.selected = i;
-                }
+        match (m.kind, hit) {
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Key(key))) => {
+                return self.key(key);
             }
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Row(i))) if !modal => {
+                self.selected = i;
+            }
+            (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, _) if !modal => {
                 let down = m.kind == MouseEventKind::ScrollDown;
                 if in_detail {
                     self.scroll_by(down);
@@ -1471,6 +1498,7 @@ impl App {
             self.scroll.set(0);
             self.diff_file = 0;
         }
+        true
     }
 
     /// `enter` in the preview: pushes, opens the PR, then tears down and frees the slot.
@@ -1909,10 +1937,24 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
                 theme.accent,
             )]
         }
-        (None, None) => keys.iter().flat_map(chip).collect(),
+        (None, None) => {
+            let mut x = footer.x + Line::from(prefix.clone()).width() as u16;
+            for k in &keys {
+                let w = Line::from(chip(k).to_vec()).width() as u16;
+                let rect = Rect::new(x, footer.y, w, 1).intersection(footer);
+                let target = key_of(k.0).map(|key| (rect, Target::Key(key)));
+                app.hits.borrow_mut().targets.extend(target);
+                x = x.saturating_add(w);
+            }
+            keys.iter().flat_map(chip).collect()
+        }
     };
     line.splice(0..0, prefix);
     f.render_widget(Line::from(line), footer);
+    if app.help || app.confirm || app.reply.is_some() {
+        // only an open modal's own targets respond
+        app.hits.borrow_mut().targets.clear();
+    }
     if app.help {
         help(f, theme);
     }
@@ -1931,19 +1973,38 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         // a modal over the dimmed screen
         let all = f.area();
         f.buffer_mut().set_style(all, Style::new().dim());
-        let area = centered(f.area(), 52, 5);
-        let text = vec![
+        let area = centered(f.area(), 52, 6);
+        let block = pane(verb, true, theme);
+        let [text, buttons] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(block.inner(area));
+        let lines = vec![
             Line::raw(format!("{verb} “{title}”?")),
-            Line::from(vec![
-                Span::styled("y ", theme.accent),
-                Span::raw(format!("{does}   ")).dim(),
-                Span::styled("any key ", theme.accent),
-                Span::raw("cancel").dim(),
-            ]),
+            Line::raw(does).dim(),
         ];
         f.render_widget(Clear, area);
-        let text = Paragraph::new(text).wrap(Wrap { trim: true });
-        f.render_widget(text.block(pane(verb, true, theme)), area);
+        f.render_widget(block, area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
+        let mut x = buttons.x;
+        let mut row = Vec::new();
+        for (key, label, code) in [
+            ("y", verb, KeyCode::Char('y')),
+            ("esc", "Keep it", KeyCode::Esc),
+        ] {
+            let button = [
+                Span::styled(format!(" {key} "), theme.accent)
+                    .bold()
+                    .bg(theme.key),
+                Span::raw(format!(" {label} ")).bg(theme.key),
+                Span::raw("   "),
+            ];
+            let w = Line::from(button[..2].to_vec()).width() as u16;
+            let rect = Rect::new(x, buttons.y, w, 1).intersection(buttons);
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            app.hits.borrow_mut().targets.push((rect, Target::Key(key)));
+            x = x.saturating_add(w + 3);
+            row.extend(button);
+        }
+        f.render_widget(Line::from(row), buttons);
     }
     if let Some(input) = &app.reply {
         let all = f.area();
@@ -2234,7 +2295,17 @@ fn list(
         .into_iter()
         .skip(state.offset())
         .zip(inner.y..inner.bottom());
-    hits.rows = shown.filter_map(|(i, y)| Some((y, i?))).collect();
+    let rows = shown.filter_map(|(i, y)| {
+        Some((
+            Rect {
+                y,
+                height: 1,
+                ..area
+            },
+            Target::Row(i?),
+        ))
+    });
+    hits.targets.extend(rows);
 }
 
 /// `▌ ⠋ title…          working · 4m`: never wraps, the title gives way.
@@ -2322,6 +2393,31 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
         true => Line::from(vec![Span::raw(TABS[app.tab]).bold(), Span::raw(" ▾").dim()]),
         false => Line::from(tabs_line.collect::<Vec<_>>()),
     };
+    // each tab's name presses its digit; compact's one name presses the next tab's
+    let digit = |i: usize| {
+        Target::Key(KeyEvent::new(
+            KeyCode::Char((b'1' + i as u8) as char),
+            KeyModifiers::NONE,
+        ))
+    };
+    let mut hits = app.hits.borrow_mut();
+    if compact {
+        let rect = Rect {
+            width: tabs_line.width() as u16,
+            ..tabs
+        }
+        .intersection(tabs);
+        hits.targets.push((rect, digit((app.tab + 1) % TABS.len())));
+    } else {
+        let mut x = tabs.x;
+        for (i, name) in TABS.iter().enumerate() {
+            let w = name.width() as u16;
+            hits.targets
+                .push((Rect::new(x, tabs.y, w, 1).intersection(tabs), digit(i)));
+            x = x.saturating_add(w + 2);
+        }
+    }
+    drop(hits);
     f.render_widget(tabs_line, tabs);
     match app.tab {
         0 => {
@@ -3995,6 +4091,48 @@ mod tests {
         assert_eq!(app.task().unwrap().0.id, "t2");
         app.mouse(at(0)); // the border: nothing
         assert_eq!(app.task().unwrap().0.id, "t2");
+    }
+
+    #[test]
+    fn a_click_is_a_key() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // draws, then clicks the first cell of `text`
+        let mut click = |app: &mut App, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows.iter().enumerate().find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let x = row[..row.find(text).unwrap()].chars().count();
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert!(click(&mut app, "Gate  Findings"));
+        assert_eq!(app.tab, 2);
+
+        // a footer key opens the confirm; its esc button keeps the task, its y button dismisses
+        let state = std::env::temp_dir().join(format!("yogan-click-{}", std::process::id()));
+        let failed = Request {
+            id: "r2".into(),
+            text: "Reject a negative max_delay".into(),
+            status: Phase::Failed,
+            ..Default::default()
+        };
+        failed.save(&state).unwrap();
+        app.state = state.clone();
+        app.reload(&state).unwrap();
+        app.selected = 0;
+        assert!(click(&mut app, " x  discard") && app.confirm);
+        assert!(click(&mut app, " esc  Keep it") && !app.confirm);
+        assert!(click(&mut app, " x  discard") && app.confirm);
+        assert!(click(&mut app, " y  Dismiss") && !app.confirm && app.notice.is_none());
+        assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Dismissed);
+        fs::remove_dir_all(&state).unwrap();
     }
 
     #[test]
