@@ -44,7 +44,7 @@ const RUN: usize = 5;
 /// Lines a scroll key moves the detail pane.
 const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 20] = [
+const KEYS: [(&str, &str); 21] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -64,8 +64,139 @@ const KEYS: [(&str, &str); 20] = [
     ("c", "continue"),
     ("w", "rewind"),
     ("R", "run"),
+    (",", "settings"),
     ("pgup/pgdn", "scroll"),
 ];
+
+/// How a Settings field changes: cycling through choices, or stepping a number within bounds.
+#[derive(Clone, Copy)]
+enum Field {
+    Pick(&'static [&'static str]),
+    Step(f64, f64, f64),
+}
+
+const MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    "claude-fable-5-1",
+];
+
+/// What Settings edits, as (table, key, label, field); an empty label continues the row above.
+const SETTINGS: [(&str, &str, &str, Field); 16] = [
+    ("lead", "model", "lead", Field::Pick(MODELS)),
+    ("lead", "effort", "", Field::Pick(worker::EFFORTS)),
+    ("ask", "model", "questions", Field::Pick(MODELS)),
+    ("ask", "effort", "", Field::Pick(worker::EFFORTS)),
+    ("critic", "model", "critic", Field::Pick(MODELS)),
+    ("critic", "effort", "", Field::Pick(worker::EFFORTS)),
+    ("worker", "model", "workers", Field::Pick(MODELS)),
+    ("worker", "effort", "", Field::Pick(worker::EFFORTS)),
+    ("pr", "model", "PR drafts", Field::Pick(MODELS)),
+    ("pr", "effort", "", Field::Pick(worker::EFFORTS)),
+    (
+        "watch",
+        "stall_after",
+        "stall after",
+        Field::Pick(&["5m", "10m", "15m", "20m", "30m", "45m", "1h"]),
+    ),
+    ("watch", "nudges", "nudges", Field::Step(1.0, 0.0, 9.0)),
+    (
+        "watch",
+        "loop_repeats",
+        "loop repeats",
+        Field::Step(1.0, 2.0, 20.0),
+    ),
+    (
+        "watch",
+        "autocompact",
+        "autocompact",
+        Field::Step(10_000.0, 50_000.0, 1_000_000.0),
+    ),
+    (
+        "watch",
+        "handoff_at",
+        "handoff at",
+        Field::Step(0.05, 0.5, 0.95),
+    ),
+    (
+        "watch",
+        "max_handoffs",
+        "max handoffs",
+        Field::Step(1.0, 0.0, 9.0),
+    ),
+];
+/// The first watch row.
+const WATCH: usize = 10;
+
+/// The `,` screen: the `SETTINGS` values in effect for the file it saves to, as loaded and as
+/// edited.
+struct Settings {
+    global: bool,
+    /// The file it saves to, under `~` when it's in the home directory.
+    path: String,
+    loaded: Vec<toml::Value>,
+    values: Vec<toml::Value>,
+    row: usize,
+}
+
+impl Settings {
+    fn load(repo: &Path, home: &Path, global: bool) -> Result<Settings> {
+        let (path, table) = config::settings(repo, home, global)?;
+        let path = match path.strip_prefix(home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        };
+        let values: Vec<_> = SETTINGS
+            .iter()
+            .map(|(t, k, ..)| table.get(*t).and_then(|t| t.get(*k)).cloned())
+            .map(|v| v.unwrap_or_else(|| "".into()))
+            .collect();
+        Ok(Settings {
+            global,
+            path,
+            loaded: values.clone(),
+            values,
+            row: 0,
+        })
+    }
+
+    /// Moves the selected value to the next choice or step, or back.
+    fn cycle(&mut self, forward: bool) {
+        let v = &mut self.values[self.row];
+        let sign = if forward { 1.0 } else { -1.0 };
+        *v = match (SETTINGS[self.row].3, &*v) {
+            (Field::Pick(choices), v) => {
+                let n = choices.len();
+                let next = match choices.iter().position(|c| Some(*c) == v.as_str()) {
+                    Some(i) if forward => (i + 1) % n,
+                    Some(i) => (i + n - 1) % n,
+                    None => 0,
+                };
+                choices[next].into()
+            }
+            (Field::Step(step, min, max), toml::Value::Integer(i)) => {
+                ((*i as f64 + sign * step).clamp(min, max) as i64).into()
+            }
+            (Field::Step(step, min, max), toml::Value::Float(x)) => {
+                (((x + sign * step).clamp(min, max) * 100.0).round() / 100.0).into()
+            }
+            (_, v) => v.clone(),
+        };
+    }
+
+    /// Writes the values changed since loading; returns the file.
+    fn save(&mut self, repo: &Path, home: &Path) -> Result<PathBuf> {
+        let changed: Vec<_> = (SETTINGS.iter().zip(&self.values).zip(&self.loaded))
+            .filter(|((_, v), was)| v != was)
+            .map(|(((t, k, ..), v), _)| (*t, *k, v.clone()))
+            .collect();
+        ensure!(!changed.is_empty(), "nothing changed");
+        let path = config::save(repo, home, self.global, &changed)?;
+        self.loaded = self.values.clone();
+        Ok(path)
+    }
+}
 
 /// Every color and glyph, so a light-terminal or ASCII variant is one swap. Nothing paints a
 /// background: the terminal's own theme shows through.
@@ -202,6 +333,7 @@ struct App {
     run: RunTab,
     /// Tasks whose run script is running.
     serving: Vec<String>,
+    settings: Option<Settings>,
 }
 
 /// The Run tab: the slot's ports and `[scripts]`, read when the task changes, and the run
@@ -295,6 +427,7 @@ pub fn run(repo: &Path) -> Result<()> {
         sessions: config::load(repo).map_or(0, |c| c.watch.max_handoffs + 1),
         run: RunTab::default(),
         serving: Vec::new(),
+        settings: None,
     };
     let theme = Theme::detect();
     let mut terminal = ratatui::init();
@@ -595,6 +728,25 @@ impl App {
             }
             return true;
         }
+        if let Some(s) = &mut self.settings {
+            match key.code {
+                KeyCode::Esc => self.settings = None,
+                KeyCode::Up | KeyCode::Char('k') => s.row = s.row.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => s.row = (s.row + 1).min(SETTINGS.len() - 1),
+                KeyCode::Left | KeyCode::Char('h') => s.cycle(false),
+                KeyCode::Right | KeyCode::Char('l') => s.cycle(true),
+                KeyCode::Char('g') => {
+                    let global = !s.global;
+                    self.open_settings(global);
+                }
+                _ if ctrl('s') => match self.save_settings() {
+                    Ok(path) => self.info = Some(format!("saved {}", path.display())),
+                    Err(e) => self.notice = Some(format!("{e:#}")),
+                },
+                _ => {}
+            }
+            return true;
+        }
         if let Some(input) = &mut self.reply {
             match key.code {
                 KeyCode::Esc => (self.reply, self.reply_for) = (None, None),
@@ -697,6 +849,7 @@ impl App {
             // before `d`, which would take ctrl-d too
             _ if ctrl('d') || ctrl('u') => self.scroll_by(ctrl('d')),
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char(',') => self.open_settings(false),
             KeyCode::Char('n') => self.compose = Some(Compose::new(Mode::Auto, "")),
             KeyCode::Char('p') if answered => {
                 let (r, answer) = (self.request(), self.answer.as_ref());
@@ -888,6 +1041,21 @@ impl App {
         lead::spawn(&self.repo, &self.state, &id, prompt.as_deref())?;
         self.info = Some("the lead is planning again".into());
         Ok(())
+    }
+
+    /// Opens Settings on the project file, or the global one.
+    fn open_settings(&mut self, global: bool) {
+        match config::home().and_then(|home| Settings::load(&self.repo, &home, global)) {
+            Ok(s) => self.settings = Some(s),
+            Err(e) => self.notice = Some(format!("{e:#}")),
+        }
+    }
+
+    fn save_settings(&mut self) -> Result<PathBuf> {
+        let s = self.settings.as_mut().context("Settings isn't open")?;
+        let path = s.save(&self.repo, &config::home()?)?;
+        self.sessions = config::load(&self.repo)?.watch.max_handoffs + 1;
+        Ok(path)
     }
 
     /// `R`: stops the selected task's run script, or starts `[scripts] run` in its slot.
@@ -1338,6 +1506,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
         compose(f, body, c, theme);
+    } else if let Some(s) = &app.settings {
+        settings(f, body, s, theme);
     } else if app.preview
         && let Some(d) = draft
     {
@@ -1352,7 +1522,15 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     } else {
         list(f, body, app, theme, true, tick, now);
     }
-    let keys: Vec<(&str, &str)> = if app.compose.is_some() {
+    let keys: Vec<(&str, &str)> = if let Some(s) = &app.settings {
+        let other = if s.global {
+            "project file"
+        } else {
+            "global file"
+        };
+        let keys = [("j/k", "field"), ("←→", "change"), ("g", other)];
+        [&keys[..], &[("ctrl-s", "save"), ("esc", "close")]].concat()
+    } else if app.compose.is_some() {
         vec![("tab", "field"), ("ctrl-s", "submit"), ("esc", "cancel")]
     } else if app.reply.is_some() {
         vec![("ctrl-s", "send"), ("esc", "cancel")]
@@ -1518,6 +1696,44 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
+}
+
+/// Each role's model and effort, then the watch thresholds; `•` marks an unsaved change.
+fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
+    let file = if s.global { "global" } else { "project" };
+    let mut lines = vec![
+        Line::raw(s.path.clone()).dim(),
+        Line::raw(""),
+        Line::raw("Models").dim(),
+    ];
+    for (i, ((_, key, label, _), v)) in SETTINGS.iter().zip(&s.values).enumerate() {
+        if i == WATCH {
+            lines.extend([Line::raw(""), Line::raw("Watch").dim()]);
+        }
+        let sel = i == s.row;
+        let value = match v {
+            toml::Value::String(s) => s.clone(),
+            v => v.to_string(),
+        };
+        let value = match sel {
+            true => Span::raw(format!("‹ {value} ›")).bold(),
+            false => Span::raw(value),
+        };
+        let name = match i < WATCH {
+            true => format!("{label:<11}{key:<8}"),
+            false => format!("{label:<19}"),
+        };
+        let mut row = vec![
+            Span::styled(if sel { theme.bar } else { " " }, theme.accent),
+            Span::raw(" "),
+            Span::raw(name).dim(),
+            value,
+        ];
+        row.extend((*v != s.loaded[i]).then(|| Span::styled(" •", theme.amber)));
+        lines.push(Line::from(row));
+    }
+    let block = pane(&format!("Settings · {file} file"), true, theme);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
@@ -2278,6 +2494,7 @@ mod tests {
             sessions: 3,
             run: RunTab::default(),
             serving: Vec::new(),
+            settings: None,
         };
         (app, now)
     }
@@ -2483,6 +2700,74 @@ mod tests {
                 " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
             ]
         );
+    }
+
+    #[test]
+    fn settings_save_and_reload() {
+        let root = std::env::temp_dir().join(format!("yogan-tui-settings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (home, checkout) = (root.join("home"), root.join("work/trader"));
+        fs::create_dir_all(&checkout).unwrap();
+        let mut s = Settings::load(&checkout, &home, false).unwrap();
+        let err = s.save(&checkout, &home).unwrap_err().to_string();
+        assert_eq!(err, "nothing changed");
+        s.row = 7;
+        s.cycle(true); // workers' effort: high to xhigh
+        s.row = WATCH;
+        s.cycle(true); // stall after: 15m to 20m
+        s.row = 14;
+        s.cycle(false); // handoff at: 0.8 to 0.75
+        s.row = 4;
+        s.cycle(true); // critic: fable wraps round to opus
+
+        let (mut app, _) = app();
+        app.settings = Some(s);
+        let mut term = Terminal::new(TestBackend::new(60, 26)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
+                "╭ Settings · project file ─────────────────────────────────╮",
+                "│ ~/.config/yogan/projects/trader.toml                     │",
+                "│                                                          │",
+                "│ Models                                                   │",
+                "│   lead       model   claude-opus-5-5                     │",
+                "│              effort  xhigh                               │",
+                "│   questions  model   claude-opus-5-5                     │",
+                "│              effort  high                                │",
+                "│ ▌ critic     model   ‹ claude-opus-5-5 › •               │",
+                "│              effort  max                                 │",
+                "│   workers    model   claude-opus-5-5                     │",
+                "│              effort  xhigh •                             │",
+                "│   PR drafts  model   claude-opus-5-5                     │",
+                "│              effort  medium                              │",
+                "│                                                          │",
+                "│ Watch                                                    │",
+                "│   stall after        20m •                               │",
+                "│   nudges             1                                   │",
+                "│   loop repeats       4                                   │",
+                "│   autocompact        200000                              │",
+                "│   handoff at         0.75 •                              │",
+                "│   max handoffs       2                                   │",
+                "│                                                          │",
+                "╰──────────────────────────────────────────────────────────╯",
+                " j/k field  ←→ change  g global file  ctrl-s save  esc close",
+            ]
+        );
+
+        let mut s = app.settings.take().unwrap();
+        let path = s.save(&checkout, &home).unwrap();
+        let again = Settings::load(&checkout, &home, false).unwrap();
+        assert_eq!(again.values, s.values);
+        assert_eq!(again.loaded, again.values);
+        // only the changed keys are written
+        let written: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(written["worker"].as_table().unwrap().len(), 1);
+        assert!(written.get("lead").is_none());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2726,7 +3011,7 @@ mod tests {
                 "│                                           ││ It panics in the retry loop.                        │",
                 "│ Failed                                    ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  t retry  x discard  ? help  q quit  pgup/pgdn scroll               ",
+                " n new task  j/k move  tab pane  t retry  x discard  ? help  q quit  , settings  pgup/pgdn scroll   ",
             ]
         );
         assert!(app.task().is_none());
@@ -2789,7 +3074,7 @@ mod tests {
                 "│                                           ││ - src/task.rs:72                                    │",
                 "│ Running                                   ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  r reply  p plan it  y copy  x discard  ? help  q quit  pgup/pgdn sc",
+                " n new task  j/k move  tab pane  r reply  p plan it  y copy  x discard  ? help  q quit  , settings  ",
             ]
         );
 

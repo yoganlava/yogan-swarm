@@ -1,4 +1,4 @@
-- [ ] **T34 Settings**
+- [x] **T34 Settings**
 
 Plan: TUI › Screens › 10. Settings; Configuration.
 

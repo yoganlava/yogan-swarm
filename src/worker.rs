@@ -26,7 +26,7 @@ use crate::stream::{self, Content, Event, RunResult};
 use crate::task::{self, Status, Task};
 use crate::{config, gate, git, pr, sched, shim, slot};
 
-const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub(crate) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// Built-in worker denies; a project's `[worker] deny` adds to them.
 const DENY: &[&str] = &[

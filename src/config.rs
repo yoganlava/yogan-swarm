@@ -172,30 +172,114 @@ pub struct Scripts {
 
 /// Defaults, then `~/.config/yogan/config.toml`, then the project file for `checkout`.
 pub fn load(checkout: &Path) -> Result<Config> {
-    let home = std::env::home_dir().context("no home directory")?;
-    let global = read_toml(&home.join(".config/yogan/config.toml"))?.unwrap_or_default();
+    load_in(checkout, &home()?)
+}
+
+fn load_in(checkout: &Path, home: &Path) -> Result<Config> {
+    let (global, project) = tables(checkout, home)?;
+    layered(global, project.map(|(_, t)| t))
+}
+
+pub fn home() -> Result<PathBuf> {
+    std::env::home_dir().context("no home directory")
+}
+
+fn global_path(home: &Path) -> PathBuf {
+    home.join(".config/yogan/config.toml")
+}
+
+/// The global file's table and, when `[projects]` maps `checkout`, its project file and table.
+fn tables(checkout: &Path, home: &Path) -> Result<(Table, Option<(PathBuf, Table)>)> {
+    let global = read_toml(&global_path(home))?.unwrap_or_default();
     let projects: BTreeMap<String, String> = match global.get("projects") {
         Some(p) => p.clone().try_into().context("[projects]")?,
         None => BTreeMap::new(),
     };
-    let project = match find_project(&projects, origin_name(checkout).as_deref(), checkout, &home) {
+    let project = match find_project(&projects, origin_name(checkout).as_deref(), checkout, home) {
         Some(file) => {
-            let path = expand(file, &home);
+            let path = expand(file, home);
             let table = read_toml(&path)?;
-            Some(table.with_context(|| format!("project file {} not found", path.display()))?)
+            let table =
+                table.with_context(|| format!("project file {} not found", path.display()))?;
+            Some((path, table))
         }
         None => None,
     };
-    layered(global, project)
+    Ok((global, project))
+}
+
+/// The file Settings saves to, and the values in effect for it: the defaults and the global
+/// file merged with, unless `global`, this checkout's project file.
+pub fn settings(checkout: &Path, home: &Path, global: bool) -> Result<(PathBuf, Table)> {
+    let (table, project) = tables(checkout, home)?;
+    let (path, project) = match (global, project) {
+        (true, _) => (global_path(home), None),
+        (false, Some((path, project))) => (path, Some(project)),
+        (false, None) => (new_project(checkout, home), None),
+    };
+    Ok((path, merged(table, project)))
+}
+
+/// Sets each `(table, key, value)` in the file Settings saves to, keeping the rest of it. A new
+/// project file is also added to the global file's `[projects]`. Returns the file.
+pub fn save(
+    checkout: &Path,
+    home: &Path,
+    global: bool,
+    values: &[(&str, &str, Value)],
+) -> Result<PathBuf> {
+    let (mut table, project) = tables(checkout, home)?;
+    let (path, mut file) = match (global, project) {
+        (true, _) => (global_path(home), table),
+        (false, Some(project)) => project,
+        (false, None) => {
+            let path = new_project(checkout, home);
+            let key = origin_name(checkout).unwrap_or_else(|| checkout.display().to_string());
+            let projects = table.entry("projects").or_insert(Table::new().into());
+            let projects = projects
+                .as_table_mut()
+                .context("[projects] is not a table")?;
+            projects.insert(key, path.display().to_string().into());
+            write(&global_path(home), &table)?;
+            (path.clone(), read_toml(&path)?.unwrap_or_default())
+        }
+    };
+    for (name, key, value) in values {
+        let t = file.entry(*name).or_insert(Table::new().into());
+        let t = t
+            .as_table_mut()
+            .with_context(|| format!("[{name}] is not a table"))?;
+        t.insert(key.to_string(), value.clone());
+    }
+    write(&path, &file)?;
+    Ok(path)
+}
+
+/// `~/.config/yogan/projects/<origin repo name, or checkout folder>.toml`.
+fn new_project(checkout: &Path, home: &Path) -> PathBuf {
+    let folder = checkout.file_name().unwrap_or_default().to_string_lossy();
+    let name = origin_name(checkout).unwrap_or_else(|| folder.into_owned());
+    home.join(format!(".config/yogan/projects/{name}.toml"))
+}
+
+fn write(path: &Path, table: &Table) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, toml::to_string(table)?).with_context(|| path.display().to_string())
 }
 
 fn layered(global: Table, project: Option<Table>) -> Result<Config> {
+    Ok(merged(global, project).try_into()?)
+}
+
+fn merged(global: Table, project: Option<Table>) -> Table {
     let mut table: Table = DEFAULTS.parse().expect("defaults.toml parses");
     merge(&mut table, global);
     if let Some(project) = project {
         merge(&mut table, project);
     }
-    Ok(table.try_into()?)
+    table
 }
 
 fn merge(base: &mut Table, over: Table) {
@@ -285,6 +369,52 @@ mod tests {
         let project = table("[scripts]\nsetup = \"make db\"");
         let cfg = layered(Table::new(), Some(project)).unwrap();
         assert!(cfg.scripts.unwrap().run.is_none());
+    }
+
+    #[test]
+    fn settings_save_reloads_identically() {
+        let root = std::env::temp_dir().join(format!("yogan-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, checkout) = (root.join("home"), root.join("work/trader"));
+        std::fs::create_dir_all(&checkout).unwrap();
+        let global = global_path(&home);
+        write(&global, &table("[worker]\nmodel = \"g\"")).unwrap();
+
+        // no project file yet: saving creates one and maps the checkout to it
+        let (path, _) = settings(&checkout, &home, false).unwrap();
+        assert_eq!(path, home.join(".config/yogan/projects/trader.toml"));
+        let values = [
+            ("worker", "effort", Value::from("max")),
+            ("watch", "stall_after", Value::from("30m")),
+            ("watch", "handoff_at", Value::from(0.85)),
+        ];
+        assert_eq!(save(&checkout, &home, false, &values).unwrap(), path);
+        let cfg = load_in(&checkout, &home).unwrap();
+        assert_eq!(
+            (cfg.worker.model.as_str(), cfg.worker.effort.as_str()),
+            ("g", "max")
+        );
+        assert_eq!(cfg.watch.stall_after, Duration::from_secs(30 * 60));
+        assert_eq!(cfg.watch.handoff_at, 0.85);
+        let (_, shown) = settings(&checkout, &home, false).unwrap();
+        for (name, key, value) in &values {
+            assert_eq!(shown[*name][*key], *value);
+        }
+
+        // hand-written tables survive a save, and the global file is a separate target
+        let mut file = read_toml(&path).unwrap().unwrap();
+        file.insert("scripts".into(), table("run = \"make dev\"").into());
+        write(&path, &file).unwrap();
+        save(&checkout, &home, false, &[("lead", "model", "p".into())]).unwrap();
+        save(&checkout, &home, true, &[("lead", "model", "g2".into())]).unwrap();
+        let cfg = load_in(&checkout, &home).unwrap();
+        assert_eq!(cfg.lead.model, "p");
+        assert_eq!(cfg.scripts.unwrap().run.as_deref(), Some("make dev"));
+        let (_, global_view) = settings(&checkout, &home, true).unwrap();
+        assert_eq!(global_view["lead"]["model"].as_str(), Some("g2"));
+        assert_eq!(global_view["worker"]["effort"].as_str(), Some("high"));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
