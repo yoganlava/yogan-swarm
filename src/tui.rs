@@ -32,16 +32,40 @@ use crate::stream::{self, Content};
 use crate::task::{self, Status, Task};
 use crate::{config, git, pr, sched, slot, worker};
 
-/// List order, what needs you first; `Discarded` isn't shown.
-const GROUPS: [(Status, &str); 7] = [
-    (Status::Review, "Review"),
-    (Status::Failed, "Failed"),
-    (Status::Proposed, "Proposed"),
-    (Status::Running, "Running"),
-    (Status::Checking, "Checking"),
-    (Status::Approved, "Queued"),
-    (Status::PrOpen, "PR open"),
+/// The inbox: each group's statuses in list order, with their labels; `Discarded` isn't shown.
+/// Answered questions and failed requests need you too, and planning requests are working.
+const GROUPS: [(&str, &[(Status, &str)]); 3] = [
+    (
+        "Needs you",
+        &[
+            (Status::Review, "Review"),
+            (Status::Failed, "Failed"),
+            (Status::Proposed, "Proposed"),
+        ],
+    ),
+    (
+        "Working",
+        &[(Status::Running, "Running"), (Status::Checking, "Checking")],
+    ),
+    (
+        "Later",
+        &[(Status::Approved, "Queued"), (Status::PrOpen, "PR open")],
+    ),
 ];
+
+/// A status's position in list order and its label.
+fn status_rank(s: Status) -> Option<(usize, &'static str)> {
+    let mut all = GROUPS.iter().flat_map(|g| g.1).enumerate();
+    all.find(|(_, (g, _))| *g == s).map(|(i, (_, l))| (i, *l))
+}
+
+/// The inbox group a status is in.
+fn group_of(s: Status) -> usize {
+    GROUPS
+        .iter()
+        .position(|g| g.1.iter().any(|(g, _)| *g == s))
+        .unwrap_or(GROUPS.len() - 1)
+}
 
 const TABS: [&str; 6] = ["Summary", "Activity", "Gate", "Findings", "Diff", "Run"];
 const FINDINGS: usize = 3;
@@ -206,12 +230,14 @@ impl Settings {
     }
 }
 
-/// Every color and glyph, so a light-terminal or ASCII variant is one swap. Only key chips paint
-/// a background: elsewhere the terminal's own theme shows through.
+/// Every color and glyph, so a light-terminal or ASCII variant is one swap. Only key and reason
+/// chips paint a background: elsewhere the terminal's own theme shows through.
 pub struct Theme {
     accent: Color,
     /// Behind a footer key.
     key: Color,
+    /// Text on a reason chip.
+    ink: Color,
     /// Shell commands in Activity.
     shell: Color,
     green: Color,
@@ -226,6 +252,13 @@ pub struct Theme {
     /// Before a child task, under its parent.
     tree: &'static str,
     spinner: &'static [&'static str],
+    /// A slot meter's held and free cells.
+    slot: (&'static str, &'static str),
+    /// A group heading's unfolded and folded marks, and its rule.
+    fold: (&'static str, &'static str),
+    rule: &'static str,
+    need: &'static str,
+    ascii: bool,
 }
 
 impl Theme {
@@ -245,6 +278,7 @@ impl Theme {
         Theme {
             accent: rgb(122, 162, 247, Color::Blue),
             key: rgb(42, 47, 69, Color::Black),
+            ink: rgb(26, 27, 38, Color::Black),
             shell: rgb(125, 207, 255, Color::Cyan),
             green: rgb(158, 206, 106, Color::Green),
             amber: rgb(224, 175, 104, Color::Yellow),
@@ -261,6 +295,19 @@ impl Theme {
             } else {
                 &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             },
+            slot: if ascii { ("#", ".") } else { ("▰", "▱") },
+            fold: if ascii { ("v", ">") } else { ("▾", "▸") },
+            rule: glyphs("─", "-"),
+            need: glyphs("●", "*"),
+            ascii,
+        }
+    }
+
+    /// ` ready ` on `color`, or `[ready]` in ASCII.
+    fn chip(&self, text: &str, color: Color) -> Span<'static> {
+        match self.ascii {
+            true => Span::styled(format!("[{text}]"), color).bold(),
+            false => Span::styled(format!(" {text} "), self.ink).bg(color).bold(),
         }
     }
 
@@ -372,6 +419,10 @@ struct App {
     split: u16,
     /// The divider is being dragged.
     dragging: bool,
+    /// Which `GROUPS` are folded, for the session.
+    folded: [bool; 3],
+    /// `[worker] slots`, one cell each in the header's slot meter.
+    slots: u32,
     /// Where the last frame drew things, for the mouse.
     hits: RefCell<Hits>,
 }
@@ -387,8 +438,9 @@ struct Hits {
     targets: Vec<(Rect, Target)>,
 }
 
-/// What a click does: press a key, or one of the things with no key: select a list row, dismiss
-/// the info toast, start dragging the divider, or scroll the detail pane to an offset.
+/// What a click does: press a key, or one of the things with no key: select a list row, fold
+/// a group, dismiss the info toast, start dragging the divider, or scroll the detail pane to
+/// an offset.
 #[derive(Clone, Copy)]
 enum Target {
     Key(KeyEvent),
@@ -396,6 +448,7 @@ enum Target {
     Info,
     Divider,
     Scroll(u16),
+    Fold(usize),
 }
 
 /// The detail pane's scroll offset, and the scrollbar its tab asked for this frame as (area,
@@ -534,6 +587,8 @@ pub fn run(repo: &Path) -> Result<()> {
         last_click: None,
         split: 45,
         dragging: false,
+        folded: [false; 3],
+        slots: config::load(repo).map_or(0, |c| c.worker.slots),
         hits: RefCell::default(),
     };
     let theme = Theme::detect();
@@ -826,7 +881,7 @@ impl App {
         // planning and failed first, then the questions
         requests.sort_by_key(|r| (r.status == Phase::Done, r.id.clone()));
         self.requests = requests;
-        let rank = |s: Status| GROUPS.iter().position(|(g, _)| *g == s);
+        let rank = |s| status_rank(s).map(|r| r.0);
         let tasks: Vec<_> = task::load_all(state)?
             .into_iter()
             .filter(|t| rank(t.status).is_some())
@@ -881,6 +936,35 @@ impl App {
     /// Whether `j/k` and `enter` act on the Diff tab's files.
     fn on_diff(&self) -> bool {
         self.detail && self.tab == DIFF && self.task().is_some()
+    }
+
+    /// Each of `GROUPS`' rows in list order, as indexes into requests then tasks; a group's
+    /// requests come after its tasks.
+    fn groups(&self) -> [Vec<usize>; 3] {
+        let mut groups: [Vec<usize>; 3] = Default::default();
+        let n = self.requests.len();
+        for (i, (t, _)) in self.tasks.iter().enumerate() {
+            groups[group_of(t.status)].push(n + i);
+        }
+        for (i, r) in self.requests.iter().enumerate() {
+            groups[usize::from(r.status == Phase::Planning)].push(i);
+        }
+        groups
+    }
+
+    /// Moves the selection to the next shown row down, or up; folded groups are skipped.
+    fn move_by(&mut self, down: bool) {
+        let groups = self.groups().into_iter().zip(self.folded);
+        let rows: Vec<_> = groups.filter(|g| !g.1).flat_map(|g| g.0).collect();
+        let at = rows.iter().position(|&r| r == self.selected);
+        let i = match (at, down) {
+            (None, _) => 0,
+            (Some(i), true) => (i + 1).min(rows.len() - 1),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        if let Some(&r) = rows.get(i) {
+            self.selected = r;
+        }
     }
 
     /// The selected row's request, if it's one.
@@ -1173,11 +1257,8 @@ impl App {
             KeyCode::Char('r') if status == Some(Status::Review) => {
                 self.reply = Some(field("What should the worker change?"));
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let rows = self.requests.len() + self.tasks.len();
-                self.selected = (self.selected + 1).min(rows.saturating_sub(1));
-            }
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_by(true),
+            KeyCode::Up | KeyCode::Char('k') => self.move_by(false),
             KeyCode::Tab => self.detail = !self.detail,
             KeyCode::PageDown | KeyCode::PageUp => self.scroll_by(key.code == KeyCode::PageDown),
             _ => {}
@@ -1578,12 +1659,11 @@ impl App {
                 if in_detail {
                     self.scroll_by(down);
                 } else if in_list {
-                    let rows = self.requests.len() + self.tasks.len();
-                    self.selected = match down {
-                        true => (self.selected + 1).min(rows.saturating_sub(1)),
-                        false => self.selected.saturating_sub(1),
-                    };
+                    self.move_by(down);
                 }
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Fold(g))) if !modal => {
+                self.folded[g] = !self.folded[g];
             }
             _ => {}
         }
@@ -1926,7 +2006,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         Constraint::Length(1),
     ])
     .areas(f.area());
-    f.render_widget(header_line(app, theme), header);
+    if !compact {
+        f.render_widget(header_line(app, theme, header, false), header);
+    }
     let selected = app.task().map(|(t, _)| t);
     let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
     let answered = app.request().is_some_and(|r| r.status == Phase::Done);
@@ -2053,7 +2135,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         ]
     };
     let prefix = if compact {
-        header_line(app, theme).spans
+        header_line(app, theme, footer, true).spans
     } else {
         Vec::new()
     };
@@ -2332,17 +2414,70 @@ fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
     }
 }
 
-fn header_line(app: &App, theme: &Theme) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(" yogan", theme.accent).bold(),
-        Span::raw(format!(" · {}  ", app.name)).dim(),
-    ];
-    for (status, _) in GROUPS {
-        let n = app.tasks.iter().filter(|(t, _)| t.status == status).count();
-        if n > 0 {
-            spans.extend([theme.glyph(status, false, 0), Span::raw(format!(" {n}  "))]);
-        }
+/// ` yogan · repo  ● 2 need you  ⠋ 1 working  ○ 1 queued`, with the slot meter and spend flush
+/// right; `compact` keeps ` yogan  ● 2 `. The chip presses `]` and a slot selects its task.
+fn header_line(app: &App, theme: &Theme, area: Rect, compact: bool) -> Line<'static> {
+    let groups = app.groups();
+    let need = groups[0].len();
+    let mut spans = vec![Span::styled(" yogan", theme.accent).bold()];
+    if !compact {
+        spans.push(Span::raw(format!(" · {}", app.name)).dim());
     }
+    spans.push(Span::raw("  "));
+    let x = area.x + Line::from(spans.clone()).width() as u16;
+    let chip = match (need, compact) {
+        (0, _) => Span::styled(format!("{} nothing needs you", theme.pass), theme.green),
+        (n, true) => theme.chip(&format!("{} {n}", theme.need), theme.amber),
+        (n, false) => theme.chip(&format!("{} {n} need you", theme.need), theme.amber),
+    };
+    let rect = Rect::new(x, area.y, chip.width() as u16, 1).intersection(area);
+    let key = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE);
+    app.hits.borrow_mut().targets.push((rect, Target::Key(key)));
+    spans.push(chip);
+    if compact {
+        spans.push(Span::raw("  "));
+        return Line::from(spans);
+    }
+    let queued = app
+        .tasks
+        .iter()
+        .filter(|(t, _)| t.status == Status::Approved);
+    spans.extend([
+        Span::raw("  "),
+        theme.glyph(Status::Running, false, 0),
+        Span::raw(format!(" {} working  ", groups[1].len())),
+        Span::raw(format!("{} {} queued", theme.queued, queued.count())).dim(),
+    ]);
+    let spent = app.tasks.iter().fold(0.0, |n, (t, _)| n + t.spent());
+    let spend = format!("   ${spent:.2} ");
+    let meter = 6 + app.slots as usize + spend.width();
+    let left = Line::from(spans.clone()).width();
+    if left + meter > area.width as usize {
+        return Line::from(spans);
+    }
+    let pad = area.width as usize - left - meter;
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::raw("slots ").dim());
+    let mut x = area.x.saturating_add((left + pad + 6) as u16);
+    let n = app.requests.len();
+    for slot in 1..=app.slots {
+        let held = app.tasks.iter().position(|(t, _)| t.slot == Some(slot));
+        spans.push(match held {
+            Some(i) => {
+                let t = &app.tasks[i].0;
+                let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
+                let rect = Rect::new(x, area.y, 1, 1).intersection(area);
+                app.hits
+                    .borrow_mut()
+                    .targets
+                    .push((rect, Target::Row(n + i)));
+                Span::styled(theme.slot.0, theme.glyph(t.status, gate_failed, 0).style)
+            }
+            None => Span::raw(theme.slot.1).dim(),
+        });
+        x = x.saturating_add(1);
+    }
+    spans.push(Span::raw(spend));
     Line::from(spans)
 }
 
@@ -2373,90 +2508,129 @@ fn list(
     let width = inner.width as usize;
     // compact drops headings and the blank lines between groups; the glyphs carry the status
     let compact = f.area().height < COMPACT;
-    let (mut items, mut selected, mut i) = (Vec::new(), None, 0);
-    // the row index of each item, for the mouse; None for headings and blanks
+    let (mut items, mut selected) = (Vec::new(), None);
+    // what a click on each item does, for the mouse; None for blanks
     let mut rows = Vec::new();
-    let heading = |items: &mut Vec<ListItem>, rows: &mut Vec<_>, label| {
-        if compact {
-            return;
-        }
-        if !items.is_empty() {
-            items.push(ListItem::new(""));
-            rows.push(None);
-        }
-        items.push(ListItem::new(Line::raw(label).dim()));
-        rows.push(None);
-    };
-    let mut group = None;
-    for r in &app.requests {
-        let question = r.status == Phase::Done;
-        if group != Some(question) {
-            let label = if question { "Questions" } else { "Planning" };
-            heading(&mut items, &mut rows, label);
-            group = Some(question);
-        }
-        let sel = i == app.selected;
-        if sel {
-            selected = Some(items.len());
-        }
-        rows.push(Some(i));
-        let (glyph, right) = match r.status {
-            Phase::Failed => (Span::styled(theme.fail, theme.red), "failed"),
-            Phase::Done => (Span::styled(theme.pass, theme.green), "answered"),
-            _ => {
-                let spin = theme.spinner[tick % theme.spinner.len()];
-                let doing = if r.mode == Mode::Ask {
-                    "answering"
-                } else {
-                    "planning"
-                };
-                (Span::styled(spin, theme.accent), doing)
-            }
-        };
-        let title = r.text.lines().next().unwrap_or_default();
-        items.push(ListItem::new(row_line(
-            glyph, title, right, sel, width, theme,
-        )));
-        i += 1;
-    }
-    for (status, label) in GROUPS {
-        let group: Vec<_> = app
-            .tasks
-            .iter()
-            .filter(|(t, _)| t.status == status)
-            .collect();
+    for (g, group) in app.groups().into_iter().enumerate() {
         if group.is_empty() {
             continue;
         }
-        heading(&mut items, &mut rows, label);
-        for (t, since) in group {
+        if !compact {
+            if !items.is_empty() {
+                items.push(ListItem::new(""));
+                rows.push(None);
+            }
+            let fold = if app.folded[g] {
+                theme.fold.1
+            } else {
+                theme.fold.0
+            };
+            let name = format!("{fold} {} ", GROUPS[g].0.to_uppercase());
+            let count = format!("{} ", group.len());
+            let rule = theme
+                .rule
+                .repeat(width.saturating_sub(name.width() + count.width()));
+            let name = match g {
+                0 => Span::styled(name, theme.amber).bold(),
+                _ => Span::raw(name).dim().bold(),
+            };
+            let line = Line::from(vec![name, Span::raw(count).dim(), Span::raw(rule).dim()]);
+            items.push(ListItem::new(line));
+            rows.push(Some(Target::Fold(g)));
+        }
+        if app.folded[g] {
+            continue;
+        }
+        for i in group {
             let sel = i == app.selected;
             if sel {
                 selected = Some(items.len());
             }
-            rows.push(Some(i));
+            rows.push(Some(Target::Row(i)));
+            let Some((t, since)) = i.checked_sub(app.requests.len()).map(|i| &app.tasks[i]) else {
+                let r = &app.requests[i];
+                let (glyph, right) = match r.status {
+                    Phase::Failed => (
+                        Span::styled(theme.fail, theme.red),
+                        vec![theme.chip("failed", theme.red)],
+                    ),
+                    Phase::Done => (
+                        Span::styled(theme.pass, theme.green),
+                        vec![theme.chip("answered", theme.amber)],
+                    ),
+                    _ => {
+                        let spin = theme.spinner[tick % theme.spinner.len()];
+                        let doing = match r.mode {
+                            Mode::Ask => "answering",
+                            _ => "planning",
+                        };
+                        (
+                            Span::styled(spin, theme.accent),
+                            vec![Span::raw(doing).dim()],
+                        )
+                    }
+                };
+                let title = r.text.lines().next().unwrap_or_default();
+                items.push(ListItem::new(row_line(
+                    glyph, title, right, sel, width, theme,
+                )));
+                continue;
+            };
             let age = since.and_then(|s| now.duration_since(s).ok());
             let age = age.map(short).unwrap_or_default();
-            let right = match t.status {
+            let serving = app.serving.contains(&t.id).then_some("serving · ");
+            let path = lineage(t, &app.tasks);
+            let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
+            let reason = match t.status {
+                Status::Review if app.disputed.contains(&t.id) => {
+                    Some(("disputed".into(), theme.amber))
+                }
+                Status::Review | Status::Failed if gate_failed => {
+                    Some(("gate failed".into(), theme.red))
+                }
+                Status::Review => Some(("ready".into(), theme.green)),
+                Status::Failed => Some(("failed".into(), theme.red)),
+                // a tree's root counts its proposals; its children read as the tree
+                Status::Proposed if path.len() == 1 => {
+                    let tree = app.tasks.iter().filter(|(o, _)| {
+                        o.status == Status::Proposed && lineage(o, &app.tasks)[0] == t.id
+                    });
+                    Some((format!("{} to approve", tree.count()), theme.amber))
+                }
+                _ => None,
+            };
+            let dim = match t.status {
                 Status::Running => format!("working · {age}"),
                 Status::Checking => format!("gate · {age}"),
-                _ => {
-                    let tags = [("disputed", &app.disputed), ("serving", &app.serving)];
-                    let tags = tags.iter().filter(|(_, ids)| ids.contains(&t.id));
-                    tags.map(|(tag, _)| format!("{tag} · ")).collect::<String>() + &age
-                }
+                Status::Approved => "needs a slot".into(),
+                Status::PrOpen => match t.pr_url.as_deref().and_then(|u| u.rsplit('/').next()) {
+                    Some(n) => format!("PR #{n}"),
+                    None => "PR open".into(),
+                },
+                _ => format!("{}{age}", serving.unwrap_or_default()),
             };
-            let depth = lineage(t, &app.tasks).len() - 1;
+            let mut right: Vec<_> = reason.map(|(r, c)| theme.chip(&r, c)).into_iter().collect();
+            let gap = if right.is_empty() || dim.is_empty() {
+                ""
+            } else {
+                " "
+            };
+            right.push(Span::raw(format!("{gap}{dim}")).dim());
             items.push(ListItem::new(row(
-                t, depth, &right, sel, width, theme, tick,
+                t,
+                path.len() - 1,
+                right,
+                sel,
+                width,
+                theme,
+                tick,
             )));
             if let Some((_, (tool, target), at)) = app.steps.iter().find(|s| s.0 == t.id) {
                 let quiet = now.duration_since(*at).unwrap_or_default();
                 let late = quiet > app.stall_after / 2;
                 items.push(ListItem::new(step(tool, target, quiet, late, width, theme)));
-                rows.push(Some(i));
+                rows.push(Some(Target::Row(i)));
             }
-            i += 1;
         }
     }
     let len = items.len();
@@ -2472,7 +2646,10 @@ fn list(
         }
     };
     let bar: Vec<_> = (bar.into_iter())
-        .filter_map(|(r, top)| Some((r, Target::Row(rows[top..].iter().find_map(|i| *i)?))))
+        .filter_map(|(r, top)| {
+            let mut below = rows[top..].iter().flatten();
+            Some((r, *below.find(|t| matches!(t, Target::Row(_)))?))
+        })
         .collect();
     let mut hits = app.hits.borrow_mut();
     hits.list = area;
@@ -2480,14 +2657,14 @@ fn list(
         .into_iter()
         .skip(state.offset())
         .zip(inner.y..inner.bottom());
-    let rows = shown.filter_map(|(i, y)| {
+    let rows = shown.filter_map(|(target, y)| {
         Some((
             Rect {
                 y,
                 height: 1,
                 ..area
             },
-            Target::Row(i?),
+            target?,
         ))
     });
     hits.targets.extend(rows);
@@ -2525,7 +2702,7 @@ fn step(
 fn row(
     t: &Task,
     depth: usize,
-    right: &str,
+    right: Vec<Span<'static>>,
     sel: bool,
     width: usize,
     theme: &Theme,
@@ -2541,23 +2718,20 @@ fn row(
     row_line(glyph, &title, right, sel, width, theme)
 }
 
-/// A list row from its parts: selection bar, glyph, title and dim right-hand text.
+/// A list row from its parts: selection bar, glyph, title and right-hand spans.
 fn row_line(
     glyph: Span<'static>,
     title: &str,
-    right: &str,
+    right: Vec<Span<'static>>,
     sel: bool,
     width: usize,
     theme: &Theme,
 ) -> Line<'static> {
-    let title = truncate(
-        title,
-        width.saturating_sub(5 + right.width()),
-        theme.ellipsis,
-    );
-    let pad = width.saturating_sub(4 + title.width() + right.width());
+    let right_width = right.iter().map(Span::width).sum::<usize>();
+    let title = truncate(title, width.saturating_sub(5 + right_width), theme.ellipsis);
+    let pad = width.saturating_sub(4 + title.width() + right_width);
     let bar = if sel { theme.bar } else { " " };
-    Line::from(vec![
+    let mut line = Line::from(vec![
         Span::styled(bar, theme.accent),
         Span::raw(" "),
         glyph,
@@ -2571,8 +2745,9 @@ fn row_line(
             },
         ),
         Span::raw(" ".repeat(pad)),
-        Span::raw(right.to_string()).dim(),
-    ])
+    ]);
+    line.spans.extend(right);
+    line
 }
 
 fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
@@ -2742,10 +2917,7 @@ fn summary(
     sessions: u32,
     scroll: &Scroll,
 ) {
-    let label = GROUPS
-        .iter()
-        .find(|(s, _)| *s == t.status)
-        .map_or("", |g| g.1);
+    let label = status_rank(t.status).map_or("", |r| r.1);
     let mut meta = vec![label.to_string()];
     meta.extend((!t.branch.is_empty()).then(|| t.branch.clone()));
     meta.extend(t.slot.map(|n| format!("slot {n}")));
@@ -3233,6 +3405,8 @@ mod tests {
             last_click: None,
             split: 45,
             dragging: false,
+            folded: [false; 3],
+            slots: 3,
             hits: RefCell::default(),
         };
         (app, now)
@@ -3279,7 +3453,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  ?  more  ",
+                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
     }
@@ -3366,7 +3540,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  ?  more  ",
+                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
     }
@@ -3404,7 +3578,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   r  reply  ?  more    ",
+                " yogan   ● 2    r  reply to worker  d  diff  ?  more        ",
             ]
         );
     }
@@ -3436,7 +3610,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  ?  more  ",
+                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
     }
@@ -3468,7 +3642,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued   ",
                 "╭ Settings · project file ─────────────────────────────────╮",
                 "│ ~/.config/yogan/projects/trader.toml                     │",
                 "│                                                          │",
@@ -3545,7 +3719,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k  file  ?  more   ",
+                " yogan   ● 2    j/k  file  enter  file diff  ?  more        ",
             ]
         );
     }
@@ -3707,10 +3881,10 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│   ✓ Reject negative max_delay             ││ Summary ▾                                           │",
-                "│   ○ Validate max_delay at parse time      ││ Reject negative max_delay in the CLI                │",
+                "│   ✓ Reject negative max_delay      ready  ││ Summary ▾                                           │",
+                "│   ○ Validate max_delay at…  2 to approve  ││ Reject negative max_delay in the CLI                │",
                 "│ ▌ ○ └ Reject negative max_delay in the …  ││ Proposed · CC-687 · cli, config · after “Validate   │",
-                "│   ○ Bump sqlx to 0.9                      ││ max_delay at parse time”                            │",
+                "│   ○ Bump sqlx to 0.9        1 to approve  ││ max_delay at parse time”                            │",
                 "│                                           ││                                                     │",
                 "│                                           ││ Reuse the config check in the CLI.                  │",
                 "│                                           ││                                                     │",
@@ -3721,7 +3895,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ○ 3   a  approve  A  approve all  e  edit  r  reply to lead  ?  more         ",
+                " yogan   ● 4    a  approve  A  approve all  e  edit  r  reply to lead  x  discard task  ?  more     ",
             ]
         );
     }
@@ -3752,17 +3926,17 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│   ⠋ Split the ledger job into p… planning ││ Reject a negative max_delay                         │",
-                "│ ▌ ✗ Reject a negative max_delay    failed ││ Failed · CC-687                                     │",
-                "│   ✓ Reject negative max_delay          4m ││                                                     │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││ claude exited with exit status: 1                   │",
-                "│   ⠋ Retry webhook sends     working · 12m ││                                                     │",
-                "│   ○ Split the ledger reconciliation j… 2m ││ Reject a negative max_delay                         │",
+                "│   ✓ Reject negative max_delay   ready  4m ││ Reject a negative max_delay                         │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ Failed · CC-687                                     │",
+                "│ ▌ ✗ Reject a negative max_delay   failed  ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ claude exited with exit status: 1                   │",
+                "│   ⠋ Split the ledger job into p… planning ││                                                     │",
+                "│   ○ Split the ledger reconc… needs a slot ││ Reject a negative max_delay                         │",
                 "│                                           ││ It panics in the retry loop.                        │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   t  retry  x  discard  n  new task  j/k  move  ?  more        ",
+                " yogan   ● 3    t  retry  x  discard  n  new task  j/k  move  tab  pane  q  quit  ?  more           ",
             ]
         );
         assert!(app.task().is_none());
@@ -3790,17 +3964,17 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│ ▌ ✓ Reject negative max_delay          4m ││ Summary ▾                                           │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││ Reject negative max_delay                           │",
+                "│ ▌ ✓ Reject negative max_delay   ready  4m ││ Summary ▾                                           │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ Reject negative max_delay                           │",
                 "│   ⠋ Retry webhook sends     working · 12m ││ Review · u/reject-negative · slot 1 · opus/high     │",
                 "│       edit src/retry.rs          quiet 2m ││                                                     │",
                 "│   ⠋ Cache the rate table    working · 12m ││ max_delay below zero now fails at parse time.       │",
                 "│       run cargo test -p rates    quiet 9m ││                                                     │",
-                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
+                "│   ○ Split the ledger reconc… needs a slot ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 2  ○ 1   m  open PR  r  reply to worker  d  diff  ?  more             ",
+                " yogan   ● 2    m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more      ",
             ]
         );
         // past half of the 15m stall_after, the quiet time turns amber
@@ -3852,11 +4026,11 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│ ▌ ✓ How are tasks saved?         answered ││ How are tasks saved?                                │",
-                "│   ✓ Reject negative max_delay          4m ││ Question                                            │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││                                                     │",
+                "│   ✓ Reject negative max_delay   ready  4m ││ How are tasks saved?                                │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ Question                                            │",
+                "│ ▌ ✓ How are tasks saved?        answered  ││                                                     │",
                 "│   ⠋ Retry webhook sends     working · 12m ││ Atomically                                          │",
-                "│   ○ Split the ledger reconciliation j… 2m ││ A tmp file, then a rename:                          │",
+                "│   ○ Split the ledger reconc… needs a slot ││ A tmp file, then a rename:                          │",
                 "│                                           ││   fs::rename(&tmp, &path)                           │",
                 "│                                           ││                                                     │",
                 "│                                           ││ Cites                                               │",
@@ -3864,7 +4038,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   p  plan it  r  reply to lead  y  copy  x  discard  ?  more   ",
+                " yogan   ● 3    p  plan it  r  reply to lead  y  copy  x  discard  n  new task  j/k  move  ?  more  ",
             ]
         );
 
@@ -4001,7 +4175,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k  finding  ?  more",
+                " yogan   ● 2    j/k  finding  r  reply to worker  ?  more   ",
             ]
         );
     }
@@ -4235,7 +4409,7 @@ mod tests {
                 "│ - adds a check                                           │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   enter  push and open ",
+                " yogan   ● 2    enter  push and open PR  g  regenerate  e  e",
             ]
         );
     }
@@ -4271,26 +4445,27 @@ mod tests {
 
     #[test]
     fn main_screen() {
-        let (app, now) = app();
+        let (mut app, now) = app();
+        app.tasks[2].0.slot = Some(2);
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued                         slots ▰▰▱   $0.00 ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff  Run        │",
-                "│ ▌ ✓ Reject negative max_delay          4m ││                                                     │",
-                "│                                           ││ Reject negative max_delay                           │",
-                "│ Failed                                    ││ Review · u/reject-negative · slot 1 · opus/high     │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││                                                     │",
-                "│                                           ││ max_delay below zero now fails at parse time.       │",
-                "│ Running                                   ││                                                     │",
-                "│   ⠋ Retry webhook sends     working · 12m ││                                                     │",
+                "│ ▾ NEEDS YOU 2 ─────────────────────────── ││ Summary  Activity  Gate  Findings  Diff  Run        │",
+                "│ ▌ ✓ Reject negative max_delay   ready  4m ││                                                     │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ Reject negative max_delay                           │",
+                "│                                           ││ Review · u/reject-negative · slot 1 · opus/high     │",
+                "│ ▾ WORKING 1 ───────────────────────────── ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ max_delay below zero now fails at parse time.       │",
                 "│                                           ││                                                     │",
-                "│ Queued                                    ││                                                     │",
-                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
+                "│ ▾ LATER 1 ─────────────────────────────── ││                                                     │",
+                "│   ○ Split the ledger reconc… needs a slot ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
@@ -4304,6 +4479,48 @@ mod tests {
                 " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
             ]
         );
+    }
+
+    #[test]
+    fn a_heading_folds_and_a_slot_selects() {
+        let (mut app, now) = app();
+        app.tasks[2].0.slot = Some(2);
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // draws, then clicks cell `nth` of `text`; returns the screen it clicked
+        let mut click = |app: &mut App, text: &str, nth: usize| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(text))
+                .unwrap();
+            let x = row[..row.find(text).unwrap()].chars().count() + nth;
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            });
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            screen(&term)
+        };
+        let rows = click(&mut app, "NEEDS YOU", 0);
+        assert!(rows.iter().any(|r| r.contains("▸ NEEDS YOU 2")));
+        assert!(!rows.iter().any(|r| r.contains("Bump sqlx")));
+        // k skips the folded group
+        app.selected = 2;
+        app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 2);
+        let rows = click(&mut app, "NEEDS YOU", 0);
+        assert!(rows.iter().any(|r| r.contains("Bump sqlx")));
+
+        // the second slot holds the running task
+        click(&mut app, "slots ▰▰▱", 7);
+        assert_eq!(app.task().unwrap().0.id, "t3");
+        click(&mut app, "slots ▰▰▱", 6);
+        assert_eq!(app.task().unwrap().0.id, "t1");
     }
 
     #[test]
@@ -4373,17 +4590,17 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│ ▌ ✓ Reject negative max_delay          4m ││ Activity ▾                                          │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││ read    src/config.rs                               │",
+                "│ ▌ ✓ Reject negative max_delay   ready  4m ││ Activity ▾                                          │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ read    src/config.rs                               │",
                 "│   ⠋ Retry webhook sends     working · 12m ││ run     cargo test -p ledger                        │",
-                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
+                "│   ○ Split the ledger reconc… needs a slot ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  r  reply to worker  d  diff  ?  more             ",
+                " yogan   ● 2    m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more      ",
             ]
         );
 
@@ -4480,7 +4697,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued                         slots ▰▱▱   $0.00 ",
                 "╭ Task ──────────────────────────────────────────────────────────────────────────────── esc unzoom ╮",
                 "│ Summary  Activity  Gate  Findings  Diff  Run                                                     │",
                 "│                                                                                                  │",
@@ -4583,13 +4800,13 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ───────────────────────────────────────────────────╮",
-                "│   + Reject negative max_delay                         4m │",
-                "│   x Bump sqlx to 0.9                                  1h │",
+                "│   + Reject negative max_delay                 [ready] 4m │",
+                "│   x Bump sqlx to 0.9                         [failed] 1h │",
                 "│ > / Retry webhook sends                    working · 12m │",
-                "│   o Split the ledger reconciliation job into per-acc~ 2m │",
+                "│   o Split the ledger reconciliation job in~ needs a slot │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  + 1  x 1  | 1  o 1   x  discard  ?  more  ",
+                " yogan  [* 2]   x  discard task  n  new task  ?  more       ",
             ]
         );
     }
@@ -4657,7 +4874,7 @@ mod tests {
                 "│ read    f19.rs                                           ┃",
                 "│ read    f20.rs                                           ┃",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  ?  more  ",
+                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
 

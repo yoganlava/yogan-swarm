@@ -1,4 +1,4 @@
-- [ ] **T42 Inbox with reason chips**
+- [x] **T42 Inbox with reason chips**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Try it (Inbox, header); Visual language › Reason chip, Slot meter.
 
