@@ -1,4 +1,4 @@
-- [ ] **T22 Proposal review**
+- [x] **T22 Proposal review**
 
 Plan: Lead agent (proposal actions); Task lifecycle › Scheduling rules (same-crate warning); TUI › Screens › 2. Planning.
 

@@ -38,13 +38,17 @@ const GROUPS: [(Status, &str); 7] = [
 
 const TABS: [&str; 4] = ["Summary", "Activity", "Gate", "Diff"];
 
-const KEYS: [(&str, &str); 9] = [
+const KEYS: [(&str, &str); 13] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
     ("1-4", "tabs"),
     ("d", "diff"),
     ("m", "open PR"),
+    ("a", "approve"),
+    ("A", "approve all"),
+    ("e", "edit"),
+    ("r", "reply"),
     ("x", "discard"),
     ("?", "help"),
     ("q", "quit"),
@@ -68,6 +72,8 @@ pub struct Theme {
     queued: &'static str,
     bar: &'static str,
     ellipsis: &'static str,
+    /// Before a child task, under its parent.
+    tree: &'static str,
     spinner: &'static [&'static str],
 }
 
@@ -96,6 +102,7 @@ impl Theme {
             queued: glyphs("○", "o"),
             bar: glyphs("▌", ">"),
             ellipsis: glyphs("…", "~"),
+            tree: glyphs("└ ", "- "),
             spinner: if ascii {
                 &["|", "/", "-", "\\"]
             } else {
@@ -154,8 +161,11 @@ struct App {
     awaiting: Option<(String, Option<pr::Draft>, u32)>,
     /// The instruction for `g` in the preview, while it's being typed.
     instruction: Option<TextArea<'static>>,
-    /// Edit the PR draft in `$EDITOR` once the TUI is suspended.
+    /// Edit the PR draft, or else the selected proposal, in `$EDITOR` once the TUI is
+    /// suspended.
     edit: bool,
+    /// The reply to the selected proposal's lead, while it's being typed.
+    reply: Option<TextArea<'static>>,
 }
 
 /// The `n` screen: a request for the lead, and an optional ticket.
@@ -210,6 +220,7 @@ pub fn run(repo: &Path) -> Result<()> {
         awaiting: None,
         instruction: None,
         edit: false,
+        reply: None,
     };
     let theme = Theme::detect();
     let mut terminal = ratatui::init();
@@ -253,7 +264,11 @@ pub fn run(repo: &Path) -> Result<()> {
             }
             if std::mem::take(&mut app.edit) {
                 ratatui::restore();
-                let edited = app.edit_draft();
+                let edited = if app.preview {
+                    app.edit_draft()
+                } else {
+                    app.edit_task()
+                };
                 terminal = ratatui::init();
                 if let Err(e) = edited {
                     app.notice = Some(format!("{e:#}"));
@@ -267,6 +282,97 @@ pub fn run(repo: &Path) -> Result<()> {
 
 fn alive(pid: u32) -> bool {
     Pid::from_raw(pid as i32).is_some_and(|p| test_kill_process(p) != Err(Errno::SRCH))
+}
+
+/// Approves `ids` in `tasks`. Errs when one's parent would stay unapproved; returns a warning
+/// when an approved task names a crate that another task in flight also names.
+fn approve(tasks: &mut [Task], ids: &[String]) -> Result<Option<String>> {
+    for t in tasks.iter_mut().filter(|t| ids.contains(&t.id)) {
+        t.status = Status::Approved;
+    }
+    let in_flight = |s| {
+        matches!(
+            s,
+            Status::Approved | Status::Running | Status::Checking | Status::Review
+        )
+    };
+    let mut warning = None;
+    for t in tasks.iter().filter(|t| ids.contains(&t.id)) {
+        // a child starts once its parent's PR is open, so it would wait forever
+        if let Some(p) = &t.parent {
+            let parent = tasks.iter().find(|o| &o.id == p);
+            ensure!(
+                parent.is_some_and(|p| !matches!(p.status, Status::Proposed | Status::Discarded)),
+                "approve the parent of “{}” first",
+                t.title
+            );
+        }
+        let shared = tasks.iter().find(|o| {
+            o.id != t.id && in_flight(o.status) && o.crates.iter().any(|c| t.crates.contains(c))
+        });
+        if let Some(o) = shared {
+            warning.get_or_insert(format!(
+                "“{}” shares a crate with “{}”, so expect a rebase",
+                t.title, o.title
+            ));
+        }
+    }
+    Ok(warning)
+}
+
+/// The fields `e` shows for a proposal; the rest of the task file is yogan's.
+const EDITABLE: [&str; 8] = [
+    "title",
+    "body",
+    "ticket",
+    "acceptance",
+    "parent",
+    "crates",
+    "model",
+    "effort",
+];
+
+/// `t` with its editable fields replaced by those in `text`; others in `text` are ignored.
+fn edited(t: &Task, text: &str) -> Result<Task> {
+    let mut table: toml::Table = toml::from_str(&toml::to_string(t)?)?;
+    let edited: toml::Table = toml::from_str(text)?;
+    table.retain(|k, _| !EDITABLE.contains(&k));
+    table.extend(
+        edited
+            .into_iter()
+            .filter(|(k, _)| EDITABLE.contains(&k.as_str())),
+    );
+    Ok(toml::Value::Table(table).try_into()?)
+}
+
+/// Opens `file` in `$EDITOR` (default `vi`) and waits for it to exit.
+fn editor(file: &Path) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let edited = Command::new("sh")
+        .args(["-c", &format!("{editor} \"$1\""), "sh"])
+        .arg(file)
+        .status()?;
+    ensure!(edited.success(), "{editor} exited with {edited}");
+    Ok(())
+}
+
+/// Ids from `t`'s furthest ancestor with the same status down to `t`.
+fn lineage(t: &Task, tasks: &[(Task, Option<SystemTime>)]) -> Vec<String> {
+    let mut path = vec![t.id.clone()];
+    let mut cur = t;
+    while let Some(p) = cur.parent.as_ref().and_then(|p| {
+        tasks
+            .iter()
+            .map(|(o, _)| o)
+            .find(|o| &o.id == p && o.status == t.status)
+    }) {
+        if path.contains(&p.id) {
+            break; // an edit made a cycle
+        }
+        path.insert(0, p.id.clone());
+        cur = p;
+    }
+    path
 }
 
 fn running(t: &Task) -> bool {
@@ -290,7 +396,7 @@ impl App {
     fn reload(&mut self, state: &Path) -> Result<()> {
         let id = self.tasks.get(self.selected).map(|(t, _)| t.id.clone());
         let rank = |s: Status| GROUPS.iter().position(|(g, _)| *g == s);
-        let mut tasks: Vec<_> = task::load_all(state)?
+        let tasks: Vec<_> = task::load_all(state)?
             .into_iter()
             .filter(|t| rank(t.status).is_some())
             .map(|t| {
@@ -299,8 +405,11 @@ impl App {
                 (t, since)
             })
             .collect();
-        tasks.sort_by_key(|(t, _)| (rank(t.status), t.id.clone()));
-        self.tasks = tasks;
+        let paths: Vec<_> = tasks.iter().map(|(t, _)| lineage(t, &tasks)).collect();
+        let mut tasks: Vec<_> = tasks.into_iter().zip(paths).collect();
+        // children right after their parent, so the list reads as a tree
+        tasks.sort_by(|(a, pa), (b, pb)| (rank(a.0.status), pa).cmp(&(rank(b.0.status), pb)));
+        self.tasks = tasks.into_iter().map(|(t, _)| t).collect();
         let same = id.and_then(|id| self.tasks.iter().position(|(t, _)| t.id == id));
         self.selected = same.unwrap_or(self.selected.min(self.tasks.len().saturating_sub(1)));
         Ok(())
@@ -327,6 +436,20 @@ impl App {
                 KeyCode::Enter if c.on_ticket => {}
                 _ if c.on_ticket => _ = c.ticket.input(key),
                 _ => _ = c.request.input(key),
+            }
+            return true;
+        }
+        if let Some(input) = &mut self.reply {
+            match key.code {
+                KeyCode::Esc => self.reply = None,
+                _ if ctrl('s') => {
+                    let text = input.lines().join("\n");
+                    self.reply = None;
+                    if let Err(e) = self.send_reply(&text) {
+                        self.notice = Some(format!("{e:#}"));
+                    }
+                }
+                _ => _ = input.input(key),
             }
             return true;
         }
@@ -376,6 +499,10 @@ impl App {
             self.help = false;
             return true;
         }
+        let proposed = self
+            .tasks
+            .get(self.selected)
+            .is_some_and(|(t, _)| t.status == Status::Proposed);
         match key.code {
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('n') => self.compose = Some(Compose::new()),
@@ -389,6 +516,15 @@ impl App {
                 if let Err(e) = self.draft(None) {
                     self.notice = Some(format!("{e:#}"));
                 }
+            }
+            KeyCode::Char(c @ ('a' | 'A')) => {
+                if let Err(e) = self.approve(c == 'A') {
+                    self.notice = Some(format!("{e:#}"));
+                }
+            }
+            KeyCode::Char('e') => self.edit = proposed,
+            KeyCode::Char('r') if proposed => {
+                self.reply = Some(field("What should the lead change?"));
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.tasks.len().saturating_sub(1));
@@ -519,12 +655,7 @@ impl App {
         let draft = t.pr_draft.as_mut().context("no PR draft")?;
         let file = self.state.join(format!("logs/{}.pr.md", t.id));
         fs::write(&file, format!("{}\n\n{}\n", draft.title, draft.body))?;
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-        let edited = Command::new("sh")
-            .args(["-c", &format!("{editor} \"$1\""), "sh"])
-            .arg(&file)
-            .status()?;
-        ensure!(edited.success(), "{editor} exited with {edited}");
+        editor(&file)?;
         let text = fs::read_to_string(&file)?;
         let (title, body) = text.trim().split_once('\n').unwrap_or((text.trim(), ""));
         (draft.title, draft.body) = (pr::clean(title.trim()), pr::clean(body.trim()));
@@ -555,6 +686,65 @@ impl App {
         self.preview = false;
         self.free_slot(t, &format!("PR opened ({url})"))?;
         Ok(url)
+    }
+
+    /// `a`/`A`: approves the selected proposal, or all of them, and starts whatever is ready.
+    fn approve(&mut self, all: bool) -> Result<()> {
+        let selected = self.tasks.get(self.selected).map(|(t, _)| t.id.clone());
+        let mut tasks = task::load_all(&self.state)?;
+        let ids: Vec<String> = tasks
+            .iter()
+            .filter(|t| t.status == Status::Proposed && (all || Some(&t.id) == selected.as_ref()))
+            .map(|t| t.id.clone())
+            .collect();
+        ensure!(!ids.is_empty(), "no proposal to approve");
+        let warning = approve(&mut tasks, &ids)?;
+        for t in tasks.iter().filter(|t| ids.contains(&t.id)) {
+            t.save(&self.state)?;
+        }
+        sched::run(&self.repo)?;
+        self.info = Some(match warning {
+            Some(w) => format!("approved; {w}"),
+            None if ids.len() == 1 => "approved".into(),
+            None => format!("approved {} tasks", ids.len()),
+        });
+        Ok(())
+    }
+
+    /// `e` on a proposal: its editable fields as TOML in `$EDITOR`, checked like a new proposal.
+    fn edit_task(&mut self) -> Result<()> {
+        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        ensure!(
+            t.status == Status::Proposed,
+            "only a proposal can be edited"
+        );
+        let table: toml::Table = toml::from_str(&toml::to_string(t)?)?;
+        let shown: toml::Table = table
+            .into_iter()
+            .filter(|(k, _)| EDITABLE.contains(&k.as_str()))
+            .collect();
+        let file = self.state.join(format!("logs/{}.task.toml", t.id));
+        fs::create_dir_all(self.state.join("logs"))?;
+        let header = format!("# Editable: {}\n", EDITABLE.join(", "));
+        fs::write(&file, format!("{header}{}", toml::to_string(&shown)?))?;
+        editor(&file)?;
+        let t = edited(t, &fs::read_to_string(&file)?)?;
+        task::check_proposal(&t, &task::load_all(&self.state)?)?;
+        t.save(&self.state)
+    }
+
+    /// Sends `text` to the selected proposal's lead, which refiles its revised plan.
+    fn send_reply(&mut self, text: &str) -> Result<()> {
+        ensure!(!text.trim().is_empty(), "write a reply first");
+        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        ensure!(
+            t.status == Status::Proposed && !t.plan.is_empty(),
+            "this task has no lead to reply to"
+        );
+        let prompt = lead::reply(&self.state, &t.plan, text.trim())?;
+        lead::spawn(&self.repo, &t.plan, Some(&prompt))?;
+        self.info = Some("the lead is revising the plan".into());
+        Ok(())
     }
 
     /// Hands the composed request to a lead, whose proposals arrive as `Proposed` tasks.
@@ -661,6 +851,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     }
     let keys: Vec<(&str, &str)> = if app.compose.is_some() {
         vec![("tab", "field"), ("ctrl-s", "submit"), ("esc", "cancel")]
+    } else if app.reply.is_some() {
+        vec![("ctrl-s", "send"), ("esc", "cancel")]
     } else if app.instruction.is_some() {
         vec![("enter", "redraft"), ("esc", "cancel")]
     } else if app.preview {
@@ -673,6 +865,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
                 "d" => selected.is_some_and(|t| t.slot.is_some()),
                 "x" | "1-4" => selected.is_some(),
                 "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
+                "a" | "e" | "r" => selected.is_some_and(|t| t.status == Status::Proposed),
+                "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
                 _ => true,
             })
             .collect()
@@ -711,6 +905,15 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         f.render_widget(Clear, area);
         let text = Paragraph::new(text).wrap(Wrap { trim: true });
         f.render_widget(text.block(pane("Discard", true, theme)), area);
+    }
+    if let Some(input) = &app.reply {
+        let all = f.area();
+        f.buffer_mut().set_style(all, Style::new().dim());
+        let area = centered(all, 64, 8);
+        let block = pane("Reply to the lead", true, theme);
+        f.render_widget(Clear, area);
+        f.render_widget(input, block.inner(area));
+        f.render_widget(block, area);
     }
 }
 
@@ -826,7 +1029,8 @@ fn list(
                 selected = Some(items.len());
             }
             let age = since.and_then(|s| now.duration_since(s).ok());
-            items.push(ListItem::new(row(t, age, sel, width, theme, tick)));
+            let depth = lineage(t, &app.tasks).len() - 1;
+            items.push(ListItem::new(row(t, depth, age, sel, width, theme, tick)));
             i += 1;
         }
     }
@@ -837,6 +1041,7 @@ fn list(
 /// `▌ ⠋ title…          working · 4m`: never wraps, the title gives way.
 fn row(
     t: &Task,
+    depth: usize,
     age: Option<Duration>,
     sel: bool,
     width: usize,
@@ -851,8 +1056,12 @@ fn row(
         _ => age,
     };
     let title = if t.title.is_empty() { &t.id } else { &t.title };
+    let title = match depth {
+        0 => title.clone(),
+        d => format!("{}{}{title}", "  ".repeat(d - 1), theme.tree),
+    };
     let title = truncate(
-        title,
+        &title,
         width.saturating_sub(5 + right.width()),
         theme.ellipsis,
     );
@@ -901,14 +1110,21 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     });
     f.render_widget(Line::from(tabs_line.collect::<Vec<_>>()), tabs);
     match app.tab {
-        0 => summary(f, body, t),
+        0 => {
+            let parent = t.parent.as_ref().map(|p| {
+                let shown = app.tasks.iter().find(|(o, _)| &o.id == p);
+                shown.map_or(p.clone(), |(o, _)| o.title.clone())
+            });
+            summary(f, body, t, parent)
+        }
         1 => activity_tab(f, body, &app.activity, theme),
         2 => gate_tab(f, body, t, &app.gate_log, theme),
         _ => diff_tab(f, body, &app.diff, theme),
     }
 }
 
-fn summary(f: &mut Frame, area: Rect, t: &Task) {
+/// `parent` is the parent task's title.
+fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>) {
     let label = GROUPS
         .iter()
         .find(|(s, _)| *s == t.status)
@@ -921,6 +1137,8 @@ fn summary(f: &mut Frame, area: Rect, t: &Task) {
         None => m.clone(),
     }));
     meta.extend(t.ticket.clone());
+    meta.extend((!t.crates.is_empty()).then(|| t.crates.join(", ")));
+    meta.extend(parent.map(|p| format!("after “{p}”")));
     meta.extend(t.pr_url.clone());
     let mut lines = vec![
         Line::raw(t.title.clone()).bold(),
@@ -932,6 +1150,10 @@ fn summary(f: &mut Frame, area: Rect, t: &Task) {
         lines.push(Line::raw(""));
     }
     lines.extend(t.body.lines().map(|l| Line::raw(l.to_string()).dim()));
+    if !t.acceptance.is_empty() {
+        lines.extend([Line::raw(""), Line::raw("Done when").bold()]);
+        lines.extend(t.acceptance.iter().map(|a| Line::raw(format!("- {a}"))));
+    }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
@@ -1129,6 +1351,7 @@ mod tests {
             awaiting: None,
             instruction: None,
             edit: false,
+            reply: None,
         };
         (app, now)
     }
@@ -1328,6 +1551,130 @@ mod tests {
         app.awaiting = Some(("gone".into(), None, 1));
         app.check_awaiting(false);
         assert!(app.awaiting.is_none() && app.notice.is_none());
+    }
+
+    #[test]
+    fn approving_proposals() {
+        let task = |id: &str, status, parent: Option<&str>, krate: &str| Task {
+            id: id.into(),
+            title: id.into(),
+            status,
+            parent: parent.map(Into::into),
+            crates: vec![krate.into()],
+            ..Default::default()
+        };
+        let mut tasks = vec![
+            task("run", Status::Running, None, "ledger"),
+            task("p1", Status::Proposed, None, "config"),
+            task("p2", Status::Proposed, Some("p1"), "cli"),
+            task("p3", Status::Proposed, None, "ledger"),
+        ];
+        let err = approve(&mut tasks.clone(), &["p2".into()]).unwrap_err();
+        assert_eq!(err.to_string(), "approve the parent of “p2” first");
+        let warning = approve(&mut tasks, &["p1".into(), "p2".into()]).unwrap();
+        assert_eq!(warning, None);
+        assert_eq!(
+            (tasks[1].status, tasks[2].status),
+            (Status::Approved, Status::Approved)
+        );
+        let warning = approve(&mut tasks, &["p3".into()]).unwrap();
+        assert_eq!(
+            warning.as_deref(),
+            Some("“p3” shares a crate with “run”, so expect a rebase")
+        );
+    }
+
+    #[test]
+    fn editing_a_proposal() {
+        let t = Task {
+            id: "p1".into(),
+            title: "Old".into(),
+            status: Status::Proposed,
+            branch: "u/old".into(),
+            acceptance: vec!["a".into()],
+            ..Default::default()
+        };
+        let text = "title = \"New\"\nbody = \"\"\nacceptance = [\"a\", \"b\"]\ncrates = []\n\
+                    model = \"sonnet\"\nstatus = \"approved\"\nbranch = \"x\"\n";
+        let e = edited(&t, text).unwrap();
+        assert_eq!(
+            (e.title.as_str(), e.acceptance.len(), e.model.as_deref()),
+            ("New", 2, Some("sonnet"))
+        );
+        // yogan's own fields ignore the editor
+        assert_eq!(
+            (e.id.as_str(), e.status, e.branch.as_str()),
+            ("p1", Status::Proposed, "u/old")
+        );
+        assert!(edited(&t, "title = [").is_err());
+        let err = edited(&t, "title = \"New\"").unwrap_err().to_string();
+        assert!(err.contains("missing field"), "{err}");
+    }
+
+    #[test]
+    fn planning_screen() {
+        let (mut app, _) = app();
+        let state = std::env::temp_dir().join(format!("yogan-planning-{}", std::process::id()));
+        let proposal = |id: &str, title: &str, parent: Option<&str>, crates: &[&str]| Task {
+            id: id.into(),
+            title: title.into(),
+            status: Status::Proposed,
+            plan: "r1".into(),
+            ticket: Some("CC-687".into()),
+            parent: parent.map(Into::into),
+            crates: crates.iter().map(|c| c.to_string()).collect(),
+            ..Default::default()
+        };
+        let mut child = proposal(
+            "p3",
+            "Reject negative max_delay in the CLI",
+            Some("p1"),
+            &["cli", "config"],
+        );
+        child.body = "Reuse the config check in the CLI.".into();
+        child.acceptance = vec![
+            "`yogan --max-delay -1` exits 2".into(),
+            "the error names the flag".into(),
+        ];
+        // ids sort p1, p2, p3, but the child p3 goes right under its parent p1
+        let tasks = [
+            app.tasks[0].0.clone(),
+            proposal("p1", "Validate max_delay at parse time", None, &["config"]),
+            proposal("p2", "Bump sqlx to 0.9", None, &["db"]),
+            child,
+        ];
+        for t in &tasks {
+            t.save(&state).unwrap();
+        }
+        app.reload(&state).unwrap();
+        fs::remove_dir_all(&state).unwrap();
+        app.selected = 2;
+        let mut term = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        let theme = Theme::new(false, false);
+        // file ages are later than this `now`, so no ages show
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os  ✓ 1  ○ 3                                                                          ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "│ Review                                    ││ Summary  Activity  Gate  Diff                       │",
+                "│   ✓ Reject negative max_delay             ││                                                     │",
+                "│                                           ││ Reject negative max_delay in the CLI                │",
+                "│ Proposed                                  ││ Proposed · CC-687 · cli, config · after “Validate   │",
+                "│   ○ Validate max_delay at parse time      ││ max_delay at parse time”                            │",
+                "│ ▌ ○ └ Reject negative max_delay in the …  ││                                                     │",
+                "│   ○ Bump sqlx to 0.9                      ││ Reuse the config check in the CLI.                  │",
+                "│                                           ││                                                     │",
+                "│                                           ││ Done when                                           │",
+                "│                                           ││ - `yogan --max-delay -1` exits 2                    │",
+                "│                                           ││ - the error names the flag                          │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " n new task  j/k move  tab pane  1-4 tabs  a approve  A approve all  e edit  r reply  x discard  ? h",
+            ]
+        );
     }
 
     #[test]

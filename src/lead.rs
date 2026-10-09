@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::redact::redact;
 use crate::stream::{Event, System};
-use crate::{config, task, worker};
+use crate::task::{self, Status};
+use crate::{config, worker};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,17 +74,63 @@ pub fn submit(repo: &Path, state: &Path, text: &str, ticket: Option<String>) -> 
         ..Default::default()
     };
     req.save(state)?;
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.args(["lead", &req.id]).current_dir(repo);
-    worker::detach(cmd)?;
+    spawn(repo, &req.id, None)?;
     Ok(req)
 }
 
-/// The lead's main: records the session, then `Done` or `Failed` with the reason.
-pub fn run(repo: &Path, id: &str) -> Result<()> {
+/// Starts `yogan lead <id> [--reply <prompt>]` detached in `repo`.
+pub fn spawn(repo: &Path, id: &str, reply: Option<&str>) -> Result<()> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(["lead", id]).current_dir(repo);
+    if let Some(prompt) = reply {
+        cmd.args(["--reply", prompt]);
+    }
+    worker::detach(cmd)?;
+    Ok(())
+}
+
+/// Readies request `id` for a reply: withdraws its pending proposals, since the lead refiles
+/// the whole revised plan, and returns the prompt that resumes its session.
+pub fn reply(state: &Path, id: &str, feedback: &str) -> Result<String> {
+    let mut req = load(state, id)?;
+    ensure!(req.status != Phase::Planning, "the lead is still planning");
+    ensure!(req.session.is_some(), "the lead has no session to resume");
+    let (mut withdrawn, mut kept) = (Vec::new(), Vec::new());
+    for mut t in task::load_all(state)?.into_iter().filter(|t| t.plan == id) {
+        let line = format!("- {} “{}”", t.id, t.title);
+        match t.status {
+            Status::Proposed => {
+                t.status = Status::Discarded;
+                t.save(state)?;
+                withdrawn.push(line);
+            }
+            Status::Discarded => {}
+            _ => kept.push(line),
+        }
+    }
+    req.status = Phase::Planning;
+    req.summary = None;
+    req.save(state)?;
+    let mut prompt = format!(
+        "{feedback}\n\nRevise the plan. Your pending proposals were withdrawn, so file every \
+         task of the revised plan again with `yogan task propose`.\n\nWithdrawn:\n{}\n",
+        withdrawn.join("\n")
+    );
+    if !kept.is_empty() {
+        prompt.push_str(&format!(
+            "\nAlready approved; don't refile these, but you can use them as --parent:\n{}\n",
+            kept.join("\n")
+        ));
+    }
+    Ok(prompt)
+}
+
+/// The lead's main: plans the request, or resumes its session with a `reply`. Records the
+/// session, then `Done` or `Failed` with the reason.
+pub fn run(repo: &Path, id: &str, reply: Option<&str>) -> Result<()> {
     let state = task::state_dir(repo)?;
     let mut req = load(&state, id)?;
-    let res = plan(repo, &state, &mut req);
+    let res = plan(repo, &state, &mut req, reply);
     req.status = if res.is_ok() {
         Phase::Done
     } else {
@@ -96,7 +143,7 @@ pub fn run(repo: &Path, id: &str) -> Result<()> {
     res
 }
 
-fn plan(repo: &Path, state: &Path, req: &mut Request) -> Result<()> {
+fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Result<()> {
     let cfg = config::load(repo)?;
     let (lead, w) = (&cfg.lead, &cfg.worker);
     worker::check_effort(&lead.effort)?;
@@ -118,17 +165,18 @@ fn plan(repo: &Path, state: &Path, req: &mut Request) -> Result<()> {
     let (mut log, mut err_log) = (append("jsonl")?, append("stderr.log")?);
 
     let mut cmd = Command::new("claude");
-    cmd.args([
-        "-p",
-        &req.text,
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ])
-    .args(["--setting-sources", "project", "--strict-mcp-config"])
-    .args(["--model", &lead.model, "--effort", &lead.effort]);
+    let prompt = reply.unwrap_or(&req.text);
+    cmd.args(["-p", prompt, "--output-format", "stream-json", "--verbose"])
+        .args(["--setting-sources", "project", "--strict-mcp-config"])
+        .args(["--model", &lead.model, "--effort", &lead.effort]);
     if let Some(file) = &w.mcp_config {
         cmd.args(["--mcp-config", file]);
+    }
+    if reply.is_some() {
+        cmd.args([
+            "--resume",
+            req.session.as_deref().context("no session to resume")?,
+        ]);
     }
     let mut claude = cmd
         .arg("--allowedTools")

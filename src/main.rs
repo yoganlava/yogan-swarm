@@ -24,7 +24,12 @@ enum Command {
         instruction: Option<String>,
     },
     /// Run one request's lead session (internal, spawned detached)
-    Lead { id: String },
+    Lead {
+        id: String,
+        /// Resume the lead's session with this prompt instead of planning afresh
+        #[arg(long, allow_hyphen_values = true)]
+        reply: Option<String>,
+    },
     /// Task commands for the lead (internal)
     Task {
         #[command(subcommand)]
@@ -66,7 +71,9 @@ fn main() -> anyhow::Result<()> {
             let pr = pr.then(|| instruction.unwrap_or_default());
             yogan_swarm::worker::run(&std::env::current_dir()?, &id, pr.as_deref())
         }
-        Some(Command::Lead { id }) => yogan_swarm::lead::run(&std::env::current_dir()?, &id),
+        Some(Command::Lead { id, reply }) => {
+            yogan_swarm::lead::run(&std::env::current_dir()?, &id, reply.as_deref())
+        }
         Some(Command::Task {
             command:
                 TaskCommand::Propose {

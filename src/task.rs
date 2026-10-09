@@ -138,23 +138,8 @@ pub fn new_task(
 
 /// Files a lead proposal as `Proposed` with a fresh id and branch, and returns its id.
 pub fn propose(dir: &Path, prefix: &str, proposal: Task) -> Result<String> {
-    let accept = &proposal.acceptance;
-    ensure!(
-        (1..=5).contains(&accept.len()),
-        "give 1 to 5 --accept criteria, got {}",
-        accept.len()
-    );
-    ensure!(
-        accept.iter().all(|a| !a.trim().is_empty()),
-        "an --accept criterion is empty"
-    );
     let task = file_new(dir, |tasks| {
-        if let Some(p) = &proposal.parent {
-            ensure!(
-                tasks.iter().any(|t| &t.id == p),
-                "no task {p} to use as --parent"
-            );
-        }
+        check_proposal(&proposal, tasks)?;
         let ticket = proposal.ticket.as_deref().unwrap_or_default();
         let new = new_task(
             &proposal.title,
@@ -178,6 +163,27 @@ pub fn propose(dir: &Path, prefix: &str, proposal: Task) -> Result<String> {
         })
     })?;
     Ok(task.id)
+}
+
+/// What filing or editing a proposal requires: a title, 1 to 5 criteria and a known parent.
+pub fn check_proposal(t: &Task, tasks: &[Task]) -> Result<()> {
+    ensure!(!t.title.trim().is_empty(), "the title is empty");
+    let n = t.acceptance.len();
+    ensure!(
+        (1..=5).contains(&n),
+        "give 1 to 5 acceptance criteria, got {n}"
+    );
+    ensure!(
+        t.acceptance.iter().all(|a| !a.trim().is_empty()),
+        "an acceptance criterion is empty"
+    );
+    if let Some(p) = &t.parent {
+        ensure!(
+            p != &t.id && tasks.iter().any(|o| &o.id == p),
+            "no task {p} to use as the parent"
+        );
+    }
+    Ok(())
 }
 
 /// Builds a task from the current ones and saves it under `tasks.lock`, so concurrent
