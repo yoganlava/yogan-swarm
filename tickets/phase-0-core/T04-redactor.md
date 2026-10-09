@@ -1,4 +1,4 @@
-- [ ] **T04 Redactor**
+- [x] **T04 Redactor**
 
 Plan: Architecture › Redaction.
 
