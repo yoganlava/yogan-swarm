@@ -1,4 +1,4 @@
-- [ ] **T33 Run tab**
+- [x] **T33 Run tab**
 
 Plan: Workers › Slot scripts and ports (`R` bullet); TUI › Screens › 7. Run tab.
 

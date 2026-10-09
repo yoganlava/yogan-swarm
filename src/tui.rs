@@ -38,16 +38,17 @@ const GROUPS: [(Status, &str); 7] = [
     (Status::PrOpen, "PR open"),
 ];
 
-const TABS: [&str; 5] = ["Summary", "Activity", "Gate", "Findings", "Diff"];
+const TABS: [&str; 6] = ["Summary", "Activity", "Gate", "Findings", "Diff", "Run"];
 const FINDINGS: usize = 3;
+const RUN: usize = 5;
 /// Lines a scroll key moves the detail pane.
 const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 19] = [
+const KEYS: [(&str, &str); 20] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
-    ("1-5", "tabs"),
+    ("1-6", "tabs"),
     ("d", "diff"),
     ("m", "open PR"),
     ("a", "approve"),
@@ -62,6 +63,7 @@ const KEYS: [(&str, &str); 19] = [
     ("q", "quit"),
     ("c", "continue"),
     ("w", "rewind"),
+    ("R", "run"),
     ("pgup/pgdn", "scroll"),
 ];
 
@@ -197,6 +199,23 @@ struct App {
     disputed: Vec<String>,
     /// The selected question's id, answer and the repo files the answer cites.
     answer: Option<(String, String, Vec<String>)>,
+    run: RunTab,
+    /// Tasks whose run script is running.
+    serving: Vec<String>,
+}
+
+/// The Run tab: the slot's ports and `[scripts]`, read when the task changes, and the run
+/// script's pid and output, read every frame.
+#[derive(Default)]
+struct RunTab {
+    /// The task the ports and scripts were read for.
+    loaded: Option<String>,
+    /// The first port and how many.
+    ports: Option<(u32, u32)>,
+    /// The configured `[scripts]` by name.
+    scripts: Vec<&'static str>,
+    pid: Option<u32>,
+    log: String,
 }
 
 /// The `n` screen: a request for the lead, and an optional ticket.
@@ -274,6 +293,8 @@ pub fn run(repo: &Path) -> Result<()> {
         finding: 0,
         disputed: Vec::new(),
         sessions: config::load(repo).map_or(0, |c| c.watch.max_handoffs + 1),
+        run: RunTab::default(),
+        serving: Vec::new(),
     };
     let theme = Theme::detect();
     let mut terminal = ratatui::init();
@@ -514,6 +535,10 @@ impl App {
             .filter(|(t, _)| disputes(t))
             .map(|(t, _)| t.id.clone())
             .collect();
+        self.serving = (self.tasks.iter())
+            .filter(|(t, _)| t.slot.is_some() && slot::running(state, &t.id).is_some())
+            .map(|(t, _)| t.id.clone())
+            .collect();
         Ok(())
     }
 
@@ -686,7 +711,12 @@ impl App {
                     Err(e) => self.notice = Some(format!("{e:#}")),
                 }
             }
-            KeyCode::Char(c @ '1'..='5') => self.tab = c as usize - '1' as usize,
+            KeyCode::Char(c @ '1'..='6') => self.tab = c as usize - '1' as usize,
+            KeyCode::Char('R') => {
+                if let Err(e) = self.toggle_run() {
+                    self.notice = Some(format!("{e:#}"));
+                }
+            }
             KeyCode::Char('d') => match self.slot_dir() {
                 Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default())),
                 None => self.notice = Some("this task has no worktree".into()),
@@ -757,7 +787,7 @@ impl App {
     /// Scrolls the detail pane a step toward the end of its text (`down`) or back; Activity and
     /// the Gate output count from their tail, so down there means newer.
     fn scroll_by(&mut self, down: bool) {
-        let tail = self.task().is_some() && (self.tab == 1 || self.tab == 2);
+        let tail = self.task().is_some() && matches!(self.tab, 1 | 2 | RUN);
         let s = self.scroll.get();
         self.scroll.set(match down != tail {
             true => s.saturating_add(SCROLL),
@@ -789,6 +819,31 @@ impl App {
         if self.tab == 1 {
             let log = self.state.join(format!("logs/{id}.jsonl"));
             self.activity = activity(&log, &self.slot_dir().unwrap_or_default());
+        }
+        if self.tab == RUN {
+            if self.run.loaded.as_ref() != Some(&id) {
+                let cfg = config::load(&self.repo).ok();
+                let n = self.task().and_then(|(t, _)| t.slot).unwrap_or_default();
+                let ports = cfg.as_ref().and_then(|c| c.ports.as_ref());
+                self.run.ports = ports.map(|p| (p.base + n * p.per_slot, p.per_slot));
+                let s = cfg.as_ref().and_then(|c| c.scripts.as_ref());
+                self.run.scripts = s.map_or(Vec::new(), |s| {
+                    let named = [
+                        ("setup", &s.setup),
+                        ("run", &s.run),
+                        ("teardown", &s.teardown),
+                    ];
+                    named
+                        .into_iter()
+                        .filter(|(_, c)| c.is_some())
+                        .map(|(n, _)| n)
+                        .collect()
+                });
+                self.run.loaded = Some(id.clone());
+            }
+            self.run.pid = slot::running(&self.state, &id);
+            let log = self.state.join(format!("logs/{id}.run.log"));
+            self.run.log = String::from_utf8_lossy(&tail(&log, 64 << 10)).into_owned();
         }
         let key = Some((id.clone(), since));
         if self.tab >= 2 && self.loaded != key {
@@ -835,8 +890,33 @@ impl App {
         Ok(())
     }
 
-    /// Runs `[scripts] teardown` in the task's slot, then saves it with the slot freed.
+    /// `R`: stops the selected task's run script, or starts `[scripts] run` in its slot.
+    fn toggle_run(&mut self) -> Result<()> {
+        let (t, _) = self.task().context("no task selected")?;
+        if slot::running(&self.state, &t.id).is_some() {
+            slot::stop_run(&self.state, &t.id)?;
+            self.info = Some("stopped the run script".into());
+            return Ok(());
+        }
+        ensure!(
+            t.status == Status::Review,
+            "run a task's script once it's in Review"
+        );
+        let n = t.slot.context("this task has no worktree")?;
+        let dir = self.slot_dir().context("this task has no worktree")?;
+        let cfg = config::load(&self.repo)?;
+        let run = cfg.scripts.as_ref().and_then(|s| s.run.as_deref());
+        let cmd = run.context("no [scripts] run in the project file")?;
+        let env = slot::env(&self.repo, &dir, n, t, cfg.ports.as_ref());
+        slot::start_run(&self.state, &t.id, cmd, &dir, &env)?;
+        (self.tab, self.info) = (RUN, Some("started the run script".into()));
+        Ok(())
+    }
+
+    /// Stops the task's run script and runs `[scripts] teardown` in its slot, then saves it with
+    /// the slot freed.
     fn free_slot(&mut self, mut t: Task, done: &str) -> Result<()> {
+        let _ = slot::stop_run(&self.state, &t.id); // it may already have exited
         let mut teardown = Ok(());
         if let (Some(n), Some(dir)) = (t.slot, self.slot_dir()) {
             let cfg = config::load(&self.repo)?;
@@ -1162,19 +1242,8 @@ const HANDOFF: &str = "⇢";
 /// Tool calls, nudges and handoffs from the tail of a Claude stream log, as (tool, target), with `slot/`
 /// paths made relative.
 fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
-    let Ok(mut file) = File::open(log) else {
-        return Vec::new();
-    };
     // ponytail: only the last 256 KiB, so redrawing a long session stays cheap
-    let len = file.metadata().map_or(0, |m| m.len());
-    let mut bytes = Vec::new();
-    if file
-        .seek(SeekFrom::Start(len.saturating_sub(256 << 10)))
-        .is_err()
-        || file.read_to_end(&mut bytes).is_err()
-    {
-        return Vec::new();
-    }
+    let bytes = tail(log, 256 << 10);
     let prefix = format!("{}/", slot.display());
     let text = String::from_utf8_lossy(&bytes);
     let events = text
@@ -1207,6 +1276,19 @@ fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
             _ => Vec::new(),
         })
         .collect()
+}
+
+/// Up to the last `max` bytes of `file`; empty if it can't be read.
+fn tail(file: &Path, max: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if let Ok(mut f) = File::open(file) {
+        let len = f.metadata().map_or(0, |m| m.len());
+        let read = f.seek(SeekFrom::Start(len.saturating_sub(max)));
+        if read.and_then(|_| f.read_to_end(&mut bytes)).is_err() {
+            bytes.clear();
+        }
+    }
+    bytes
 }
 
 /// Draws `p` scrolled down by the detail pane's offset, clamped to its last page.
@@ -1278,7 +1360,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         let mut keys = vec![("j/k", "finding")];
         keys.extend((app.findings.is_disputed(app.finding)).then_some(("r", "uphold")));
         keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive")));
-        keys.extend([("tab", "pane"), ("1-5", "tabs"), ("?", "help")]);
+        keys.extend([("tab", "pane"), ("1-6", "tabs"), ("?", "help")]);
         keys
     } else if app.instruction.is_some() {
         vec![("enter", "redraft"), ("esc", "cancel")]
@@ -1297,7 +1379,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
                 }
                 "w" => selected.is_some_and(|t| t.status == Status::Review),
                 "p" | "y" => answered,
-                "1-5" => selected.is_some(),
+                "1-6" => selected.is_some(),
+                "R" => selected
+                    .is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id)),
                 "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
                 "r" => {
                     answered
@@ -1560,8 +1644,11 @@ fn list(
             let right = match t.status {
                 Status::Running => format!("working · {age}"),
                 Status::Checking => format!("gate · {age}"),
-                _ if app.disputed.contains(&t.id) => format!("disputed · {age}"),
-                _ => age,
+                _ => {
+                    let tags = [("disputed", &app.disputed), ("serving", &app.serving)];
+                    let tags = tags.iter().filter(|(_, ids)| ids.contains(&t.id));
+                    tags.map(|(tag, _)| format!("{tag} · ")).collect::<String>() + &age
+                }
             };
             let depth = lineage(t, &app.tasks).len() - 1;
             items.push(ListItem::new(row(
@@ -1668,8 +1755,59 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
             let cursor = app.on_findings().then_some(app.finding);
             findings_tab(f, body, &app.findings, cursor, theme, &app.scroll)
         }
+        RUN => run_tab(f, body, t, &app.run, theme, &app.scroll),
         _ => diff_tab(f, body, &app.diff, theme, &app.scroll),
     }
+}
+
+/// The slot and its ports, each `[scripts]` entry's status, then the run script's output tail.
+fn run_tab(f: &mut Frame, area: Rect, t: &Task, run: &RunTab, theme: &Theme, scroll: &Cell<u16>) {
+    let mut head = t.slot.map_or(Vec::new(), |n| vec![format!("slot {n}")]);
+    head.extend(run.ports.map(|(p, n)| format!("ports {p}-{}", p + n - 1)));
+    let scripts = run.scripts.iter().flat_map(|&name| {
+        let glyph = match name {
+            "run" if run.pid.is_some() => Span::styled(theme.checking, theme.accent),
+            // setup runs before Claude does, so a failed task with no session failed there
+            "setup" if t.status == Status::Failed && t.sessions.is_empty() => {
+                Span::styled(theme.fail, theme.red)
+            }
+            "setup" => Span::styled(theme.pass, theme.green),
+            _ => Span::raw(theme.queued).dim(),
+        };
+        let state = match (name, run.pid) {
+            ("run", Some(_)) => " running",
+            ("run", None) => " stopped",
+            ("teardown", _) => " when freed",
+            _ => "",
+        };
+        [
+            glyph,
+            Span::raw(format!(" {name}")),
+            Span::raw(format!("{state}  ")).dim(),
+        ]
+    });
+    let [top, list, _, output] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    f.render_widget(Line::raw(head.join(" · ")).dim(), top);
+    f.render_widget(Line::from(scripts.collect::<Vec<_>>()), list);
+    let empty = match run.scripts.contains(&"run") {
+        false => Some("No [scripts] run in the project file."),
+        true if run.log.is_empty() && run.pid.is_none() => Some("R starts the run script."),
+        true => None,
+    };
+    if let Some(text) = empty {
+        f.render_widget(Line::raw(text).dim(), output);
+        return;
+    }
+    let mut lines: Vec<Line> = run.log.lines().map(|l| Line::raw(l.to_string())).collect();
+    lines.truncate(lines.len() - from_tail(lines.len(), output.height, scroll));
+    let skip = lines.len().saturating_sub(output.height as usize);
+    f.render_widget(Paragraph::new(lines.split_off(skip)), output);
 }
 
 /// `parent` is the parent task's title; `sessions` the most a task gets, shown once it hands off.
@@ -2138,6 +2276,8 @@ mod tests {
             finding: 0,
             disputed: Vec::new(),
             sessions: 3,
+            run: RunTab::default(),
+            serving: Vec::new(),
         };
         (app, now)
     }
@@ -2172,7 +2312,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff                  │",
+                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
                 "│                                                          │",
                 "│ Reject negative max_delay                                │",
                 "│ Review · u/reject-negative · slot 1 · session 2/3 ·      │",
@@ -2183,7 +2323,7 @@ mod tests {
                 "│ A negative value panics in the retry loop.               │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR",
+                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
             ]
         );
     }
@@ -2259,7 +2399,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff                  │",
+                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
                 "│                                                          │",
                 "│ read    src/old.rs                                       │",
                 "│ read    src/config.rs                                    │",
@@ -2270,7 +2410,7 @@ mod tests {
                 "│ TodoWrite                                                │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR",
+                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
             ]
         );
     }
@@ -2297,7 +2437,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff                  │",
+                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
                 "│                                                          │",
                 "│ ✓  clean tree                                            │",
                 "│ ✓  fmt                                                   │",
@@ -2308,7 +2448,39 @@ mod tests {
                 "│ thread 'parse' panicked at src/config.rs:40:9:           │",
                 "│ assertion failed: delay >= 0                             │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  d diff  r reply  ",
+                " n new task  j/k move  tab pane  1-6 tabs  d diff  r reply  ",
+            ]
+        );
+    }
+
+    #[test]
+    fn run_tab_shows_ports_scripts_and_output() {
+        let (mut app, _) = app();
+        app.run = RunTab {
+            loaded: Some("t1".into()),
+            ports: Some((1160, 80)),
+            scripts: vec!["setup", "run", "teardown"],
+            pid: Some(4242),
+            log: "> vite\nready on http://localhost:1160\n".into(),
+        };
+        app.serving = vec!["t1".into()];
+        assert_eq!(
+            tab_screen(app, RUN),
+            [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
+                "╭ Task ────────────────────────────────────────────────────╮",
+                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
+                "│                                                          │",
+                "│ slot 1 · ports 1160-1239                                 │",
+                "│ ✓ setup  ◆ run running  ○ teardown when freed            │",
+                "│                                                          │",
+                "│ > vite                                                   │",
+                "│ ready on http://localhost:1160                           │",
+                "│                                                          │",
+                "│                                                          │",
+                "│                                                          │",
+                "╰──────────────────────────────────────────────────────────╯",
+                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
             ]
         );
     }
@@ -2326,7 +2498,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff                  │",
+                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
                 "│                                                          │",
                 "│ src/config.rs             +12    -3 ++++++--             │",
                 "│ crates/ledger/src/limi…   +40    -0 ++++++++++++++++++++ │",
@@ -2337,7 +2509,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR",
+                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR",
             ]
         );
     }
@@ -2500,7 +2672,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ○ 3                                                                          ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff             │",
+                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff  Run        │",
                 "│   ✓ Reject negative max_delay             ││                                                     │",
                 "│                                           ││ Reject negative max_delay in the CLI                │",
                 "│ Proposed                                  ││ Proposed · CC-687 · cli, config · after “Validate   │",
@@ -2513,7 +2685,7 @@ mod tests {
                 "│                                           ││ - the error names the flag                          │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  a approve  A approve all  e edit  r reply  x discard  ? h",
+                " n new task  j/k move  tab pane  1-6 tabs  a approve  A approve all  e edit  r reply  x discard  ? h",
             ]
         );
     }
@@ -2728,7 +2900,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
                 "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary  Activity  Gate  Findings  Diff                  │",
+                "│ Summary  Activity  Gate  Findings  Diff  Run             │",
                 "│                                                          │",
                 "│ Open                                                     │",
                 "│   ✗ src/config.rs:41 -1 still parses                     │",
@@ -2747,7 +2919,7 @@ mod tests {
                 "│     reason: matches the API                              │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " j/k finding  r uphold  x waive  tab pane  1-5 tabs  ? help ",
+                " j/k finding  r uphold  x waive  tab pane  1-6 tabs  ? help ",
             ]
         );
     }
@@ -2963,7 +3135,7 @@ mod tests {
             [
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
                 "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff             │",
+                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff  Run        │",
                 "│ ▌ ✓ Reject negative max_delay          4m ││                                                     │",
                 "│                                           ││ Reject negative max_delay                           │",
                 "│ Failed                                    ││ Review · u/reject-negative · slot 1 · opus/high     │",
@@ -2976,7 +3148,7 @@ mod tests {
                 "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR  r reply  x discard  ? help  q quit  c ",
+                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR  r reply  x discard  ? help  q quit  c ",
             ]
         );
     }
@@ -2998,7 +3170,7 @@ mod tests {
                 "│ Running                                                  │",
                 "│ > / Retry webhook sends                    working · 12m │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  x discard  ? help",
+                " n new task  j/k move  tab pane  1-6 tabs  x discard  ? help",
             ]
         );
     }
