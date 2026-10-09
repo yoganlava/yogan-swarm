@@ -295,11 +295,13 @@ struct App {
     detail: bool,
     help: bool,
     compose: Option<Compose>,
-    /// An error to show in the footer until the next key.
+    /// An error to show as a toast until `esc` or a click on it.
     notice: Option<String>,
-    /// Progress or an outcome to show in the footer until the next key.
+    /// Progress or an outcome to show as a toast for 4 s, or until a click on it.
     info: Option<String>,
-    /// Push and open the previewed PR once the "pushing" footer has been drawn.
+    /// The `info` being shown and when it first was, for `expire`.
+    info_since: Option<(String, Instant)>,
+    /// Push and open the previewed PR once the "pushing" toast has been drawn.
     opening: bool,
     tab: usize,
     /// The selected task's tool calls as (tool, target), newest last.
@@ -380,11 +382,13 @@ struct Hits {
     targets: Vec<(Rect, Target)>,
 }
 
-/// What a click does: press a key, or select a list row, which has no key.
+/// What a click does: press a key, or select a list row or dismiss the info toast, which have
+/// no key.
 #[derive(Clone, Copy)]
 enum Target {
     Key(KeyEvent),
     Row(usize),
+    Info,
 }
 
 /// The key a footer label stands for; pairs like `j/k` stand for none.
@@ -468,6 +472,7 @@ pub fn run(repo: &Path) -> Result<()> {
         compose: None,
         notice: None,
         info: None,
+        info_since: None,
         opening: false,
         tab: 0,
         activity: Vec::new(),
@@ -524,6 +529,7 @@ pub fn run(repo: &Path) -> Result<()> {
                 std::io::stdout().flush()?;
             }
             in_review = Some(review);
+            app.expire(Instant::now());
             let tick = (start.elapsed().as_millis() / 125) as usize; // spinner at 8 Hz
             // ratatui only writes cells that changed, so an idle screen draws nothing
             terminal.draw(|f| draw(f, &app, &theme, tick, SystemTime::now()))?;
@@ -868,14 +874,28 @@ impl App {
         self.tasks.get(i)
     }
 
+    /// Clears `info` 4 s after it first showed.
+    fn expire(&mut self, now: Instant) {
+        match (&self.info, &self.info_since) {
+            (Some(i), Some((shown, at))) if i == shown => {
+                if now.duration_since(*at) >= Duration::from_secs(4) {
+                    (self.info, self.info_since) = (None, None);
+                }
+            }
+            (Some(i), _) => self.info_since = Some((i.clone(), now)),
+            (None, _) => self.info_since = None,
+        }
+    }
+
     /// Returns false to quit.
     fn key(&mut self, key: KeyEvent) -> bool {
         let ctrl =
             |c| key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c);
-        self.notice = None;
-        self.info = None;
         if ctrl('c') {
             return false;
+        }
+        if key.code == KeyCode::Esc && self.notice.take().is_some() {
+            return true;
         }
         if let Some(c) = &mut self.compose {
             let ctrl_enter = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1515,6 +1535,7 @@ impl App {
                 self.last_click = (!double).then_some((at, now));
                 self.selected = i;
             }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Info)) => self.info = None,
             (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, _) if !modal => {
                 let down = m.kind == MouseEventKind::ScrollDown;
                 if in_detail {
@@ -1965,16 +1986,14 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     while more && keys.len() > 2 && width(&keys) > footer.width as usize {
         keys.remove(keys.len() - 2);
     }
-    let mut line = match (&app.notice, &app.info) {
-        (Some(notice), _) => vec![Span::styled(format!(" {notice}"), theme.red)],
-        (None, Some(info)) => vec![Span::styled(format!(" {info}"), theme.accent)],
-        (None, None) if app.editing.is_some() => {
+    let mut line = match app.editing {
+        Some(_) => {
             vec![Span::styled(
                 " editing in VS Code; close its tab to apply",
                 theme.accent,
             )]
         }
-        (None, None) => {
+        None => {
             let mut x = footer.x + Line::from(prefix.clone()).width() as u16;
             for k in &keys {
                 let w = Line::from(chip(k).to_vec()).width() as u16;
@@ -2081,6 +2100,30 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         }
         f.render_widget(input, field);
         f.render_widget(block, area);
+    }
+    // toasts over the bottom right of the body, the info above the error
+    let mut bottom = body.bottom().saturating_sub(1);
+    for (text, err) in [(&app.notice, true), (&app.info, false)] {
+        let Some(text) = text else { continue };
+        let color = if err { theme.red } else { theme.accent };
+        let w = (Line::raw(text).width() as u16 + 4).min(64.min(body.width.saturating_sub(4)));
+        let para = Paragraph::new(text.as_str()).wrap(Wrap { trim: true });
+        let para = if err { para.fg(theme.red) } else { para };
+        let h = para.line_count(w.saturating_sub(4)) as u16 + 2;
+        let x = body.right().saturating_sub(w + 2);
+        let area = Rect::new(x, bottom.saturating_sub(h), w, h).intersection(body);
+        bottom = area.y;
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(color)
+            .padding(Padding::horizontal(1));
+        f.render_widget(Clear, area);
+        f.render_widget(para.block(block), area);
+        let target = match err {
+            true => Target::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            false => Target::Info,
+        };
+        app.hits.borrow_mut().targets.push((area, target));
     }
 }
 
@@ -3031,6 +3074,7 @@ mod tests {
             compose: None,
             notice: None,
             info: None,
+            info_since: None,
             opening: false,
             tab: 0,
             activity: Vec::new(),
@@ -4328,6 +4372,62 @@ mod tests {
         assert!(app.zoom);
         press(&mut app, KeyCode::Esc);
         assert!(!app.zoom);
+    }
+
+    #[test]
+    fn toasts() {
+        let (mut app, now) = app();
+        app.info = Some("copied the answer".into());
+        app.notice = Some("this task has no worktree".into());
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let rows = screen(&term);
+        assert_eq!(
+            rows[16..],
+            [
+                "│                                           ││                               ╭───────────────────╮ │",
+                "│                                           ││                               │ copied the answer │ │",
+                "│                                           ││                               ╰───────────────────╯ │",
+                "│                                           ││                       ╭───────────────────────────╮ │",
+                "│                                           ││                       │ this task has no worktree │ │",
+                "│                                           ││                       ╰───────────────────────────╯ │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more                         ",
+            ]
+        );
+
+        // info fades after 4 s, an error stays until esc
+        let t0 = Instant::now();
+        app.expire(t0);
+        app.expire(t0 + Duration::from_millis(3900));
+        assert!(app.info.is_some());
+        app.expire(t0 + Duration::from_secs(4));
+        assert!(app.info.is_none() && app.notice.is_some());
+        assert!(app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+        assert!(app.notice.is_some());
+        assert!(app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.notice.is_none());
+
+        // a click on a toast dismisses it
+        let click = |app: &mut App, term: &mut Terminal<TestBackend>, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(term);
+            let y = rows.iter().position(|r| r.contains(text)).unwrap();
+            let x = rows[y][..rows[y].find(text).unwrap()].chars().count();
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        app.info = Some("retrying".into());
+        click(&mut app, &mut term, "retrying");
+        assert!(app.info.is_none());
+        app.notice = Some("the worker made no commits".into());
+        click(&mut app, &mut term, "the worker made");
+        assert!(app.notice.is_none());
     }
 
     #[test]

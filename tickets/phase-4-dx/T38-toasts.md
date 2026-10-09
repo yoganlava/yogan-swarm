@@ -1,4 +1,4 @@
-- [ ] **T38 Toasts**
+- [x] **T38 Toasts**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Visual language › Toast.
 
