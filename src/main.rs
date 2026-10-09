@@ -29,6 +29,11 @@ enum TaskCommand {
 }
 
 fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args_os();
+    let argv0 = args.next().unwrap_or_default();
+    if std::path::Path::new(&argv0).file_name() == Some("cargo".as_ref()) {
+        std::process::exit(yogan_swarm::shim::run(args.collect())?);
+    }
     match Cli::parse().command {
         None => anyhow::bail!("TUI not built yet (T14)"),
         Some(Command::Worker { id }) => anyhow::bail!("worker {id}: not built yet (T10)"),

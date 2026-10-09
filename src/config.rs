@@ -16,6 +16,19 @@ pub struct Config {
     pub worker: Role,
     pub ports: Option<Ports>,
     pub scripts: Option<Scripts>,
+    pub build: Build,
+    pub cargo: Option<Cargo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Build {
+    pub max_cargo: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Cargo {
+    /// Runs in place of cargo for builds, e.g. `./scripts/cargo-worktree.sh`.
+    pub wrapper: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +150,7 @@ mod tests {
         assert_eq!(cfg.lead.model, "claude-opus-5-5");
         assert_eq!(cfg.ports.map(|p| p.per_slot), Some(80));
         assert!(cfg.scripts.is_none());
+        assert_eq!(cfg.build.max_cargo, 2);
     }
 
     #[test]

@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 
 pub mod config;
 pub mod redact;
+pub mod shim;
 pub mod slot;
 pub mod stream;
 pub mod task;
