@@ -41,6 +41,9 @@ pub struct Step {
     pub run: String,
     /// Regex; the step runs only when a changed file's path or content matches.
     pub when_files_contain: Option<String>,
+    /// Globs; the step runs only when a changed path matches one.
+    #[serde(default)]
+    pub when_changed: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

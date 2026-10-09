@@ -74,11 +74,13 @@ pub fn run(
     let crates: Vec<String> = crates.iter().map(|c| format!("-p {c}")).collect();
     let paths: BTreeSet<&str> = files.iter().filter_map(|f| f.split('/').next()).collect();
     let paths: Vec<&str> = paths.into_iter().collect();
+    let base_sha = git(slot, &["merge-base", base, "HEAD"])?;
+    let head_sha = git(slot, &["rev-parse", "HEAD"])?;
 
     for step in steps {
         let empty = (step.run.contains("{crates}") && crates.is_empty())
             || (step.run.contains("{paths}") && paths.is_empty());
-        if empty || !wanted(step, slot, &files)? {
+        if empty || !wanted(step, slot, base, &files)? {
             continue;
         }
         let cmd = step
@@ -90,6 +92,8 @@ pub fn run(
             .arg(format!("exec 2>&1\n{cmd}"))
             .current_dir(slot)
             .envs(env.iter().cloned())
+            .env("BASE_SHA", &base_sha)
+            .env("HEAD_SHA", &head_sha)
             .output()?;
         let output = String::from_utf8_lossy(&out.stdout);
         record(
@@ -101,9 +105,22 @@ pub fn run(
     Ok((checks, failures))
 }
 
-/// A step without `when_files_contain` always runs; otherwise a changed file's path or
-/// content must match it.
-fn wanted(step: &Step, slot: &Path, files: &[&str]) -> Result<bool> {
+/// A step runs when a changed path matches one of its `when_changed` globs, if any, and a
+/// changed file's path or content matches its `when_files_contain`, if set.
+fn wanted(step: &Step, slot: &Path, base: &str, files: &[&str]) -> Result<bool> {
+    if !step.when_changed.is_empty() {
+        let range = format!("{base}...HEAD");
+        let globs: Vec<String> = step
+            .when_changed
+            .iter()
+            .map(|g| format!(":(glob){g}"))
+            .collect();
+        let mut args = vec!["diff", "--name-only", &range, "--"];
+        args.extend(globs.iter().map(String::as_str));
+        if git(slot, &args)?.is_empty() {
+            return Ok(false);
+        }
+    }
     let Some(pattern) = &step.when_files_contain else {
         return Ok(true);
     };
@@ -220,12 +237,18 @@ mod tests {
             name: name.into(),
             run: run.into(),
             when_files_contain: when.map(Into::into),
+            when_changed: Vec::new(),
+        };
+        let migration = Step {
+            when_changed: vec!["a/**".into()],
+            ..step("migration", "echo shas $BASE_SHA $HEAD_SHA", None)
         };
         let steps = [
             step("crates", "echo {crates}", None),
             step("paths", "echo {paths}", None),
             step("sqlx", "echo sqlx", Some(r"query(_as)?!")),
             step("fails", "echo broken; exit 1", Some("never matches")),
+            migration,
         ];
         let log = root.with_extension("log");
         let run = || run(&root, "base", &steps, &[], &log).unwrap();
@@ -251,6 +274,7 @@ mod tests {
         assert!(logged.contains("$ echo -p b\n-p b\n"), "{logged}");
         assert!(logged.contains("$ echo b\nb\n"), "{logged}");
         assert!(!logged.contains("sqlx"), "{logged}");
+        assert!(!logged.contains("migration"), "{logged}");
 
         // a query in a's content triggers it; an uncommitted file fails the clean tree
         fs::write(root.join("a/src/lib.rs"), "fn q() { query_as!(x) }\n").unwrap();
@@ -260,6 +284,12 @@ mod tests {
         let logged = fs::read_to_string(&log).unwrap();
         assert!(logged.contains("$ echo -p a -p b\n"), "{logged}");
         assert!(logged.contains("== sqlx: ok"), "{logged}");
+        let shas = format!(
+            "shas {} {}\n",
+            git(&root, &["merge-base", "base", "HEAD"]).unwrap(),
+            git(&root, &["rev-parse", "HEAD"]).unwrap()
+        );
+        assert!(logged.contains(&shas), "{logged}");
         assert_eq!(
             checks[0],
             Check {

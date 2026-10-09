@@ -1,4 +1,4 @@
-- [ ] **T12b Gate `when_changed` and SHAs**
+- [x] **T12b Gate `when_changed` and SHAs**
 
 Plan: Workers › Slot scripts and ports (the `[gate]` example's `migration` step).
 
