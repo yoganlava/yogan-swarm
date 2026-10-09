@@ -268,7 +268,67 @@ fn worker_runs_setup_then_claude() {
         state.join("logs/t1.gate.log").exists(),
         "the moved branch was re-gated"
     );
-    assert_ne!(t1.pr_draft.unwrap().head, draft.head);
+    assert_ne!(t1.pr_draft.as_ref().unwrap().head, draft.head);
+
+    // a two-task chain: once t1's PR is open, its child t9 branches from origin/u/t1
+    git(&slot1, &["push", "-q", "origin", "u/t1"]);
+    let mut t1 = t1;
+    (t1.status, t1.slot) = (Status::PrOpen, None);
+    t1.save(&state).unwrap();
+    let child = Task {
+        id: "t9".into(),
+        title: "Build on t1".into(),
+        branch: "u/t9".into(),
+        parent: Some("t1".into()),
+        status: Status::Approved,
+        ..Default::default()
+    };
+    child.save(&state).unwrap();
+    let (ok, t9) = yogan(&["worker", "t9"], "graft", "");
+    assert!(ok);
+    assert_eq!(t9.status, Status::Review);
+    let slot9 = state.join(format!("slots/{}", t9.slot.unwrap()));
+    let ancestor = |dir: &Path, rev: &str| {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["merge-base", "--is-ancestor", rev, "HEAD"])
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(
+        ancestor(&slot9, "origin/u/t1"),
+        "t9 starts at its parent's head"
+    );
+    let count = Command::new("git")
+        .arg("-C")
+        .arg(&slot9)
+        .args(["rev-list", "--count", "origin/u/t1..HEAD"])
+        .output()
+        .unwrap();
+    // the gate counted commits from the parent, so only the fix round's commit is t9's
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+
+    // m on the child rebases onto the parent's branch, not main
+    git(&repo, &["fetch", "-q", "origin"]);
+    git(
+        &repo,
+        &["checkout", "-q", "-b", "parent-next", "origin/u/t1"],
+    );
+    fs::write(repo.join("c.txt"), "parent follow-up").unwrap();
+    git(&repo, &["add", "c.txt"]);
+    git(&repo, &["commit", "-qm", "parent follow-up"]);
+    git(&repo, &["push", "-q", "origin", "HEAD:u/t1"]);
+    git(&repo, &["checkout", "-q", "main"]);
+    let (ok, t9) = yogan(&["worker", "t9", "--pr"], "graft", "");
+    assert!(ok);
+    assert_eq!(t9.status, Status::Review);
+    assert!(
+        ancestor(&slot9, "origin/u/t1"),
+        "rebased onto the parent's new head"
+    );
+    assert!(t9.pr_draft.is_some());
 
     // queued tasks drain one at a time (concurrency 1), each worker starting the next on exit
     for id in ["t6", "t7"] {

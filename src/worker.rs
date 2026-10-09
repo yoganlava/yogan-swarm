@@ -146,8 +146,8 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
     task.pid = Some(std::process::id());
     task.save(state)?;
 
-    // ponytail: always bases on origin/main; T23 bases on the parent's branch
-    let base = "origin/main";
+    let base = task::base(task, tasks.iter());
+    let base = base.as_str();
     let dir = match pr {
         Some(_) => state.join("slots").join(n.to_string()),
         None => slot::prepare(repo, state, n, &task.branch, base)?,
@@ -322,7 +322,7 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
         }
         Some(instruction) => {
             let passed = match rebase(&dir, base)? {
-                None => work(task, Some((CONFLICT, true)))?,
+                None => work(task, Some((&conflict(base), true)))?,
                 Some(true) => work(task, None)?,
                 Some(false) => task.gate.iter().flatten().all(|c| c.passed),
             };
@@ -339,9 +339,13 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
     task.save(state)
 }
 
-const CONFLICT: &str = "Rebasing this branch onto origin/main conflicted, so yogan aborted it. \
-Rebase onto origin/main and resolve the conflicts, keeping this task's intent, then make sure \
-it still builds and its tests pass.";
+fn conflict(base: &str) -> String {
+    format!(
+        "Rebasing this branch onto {base} conflicted, so yogan aborted it. Rebase onto {base} \
+         and resolve the conflicts, keeping this task's intent, then make sure it still builds \
+         and its tests pass."
+    )
+}
 
 /// Fetches and rebases the slot's branch onto `base`. `None` means it conflicted and was
 /// aborted; otherwise whether the head moved.

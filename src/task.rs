@@ -98,6 +98,13 @@ pub(crate) fn read_toml_dir<T: DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
     Ok(values)
 }
 
+/// What `t` branches from, rebases onto and targets with its PR: its parent's pushed branch,
+/// else `origin/main`.
+pub fn base<'a>(t: &Task, mut tasks: impl Iterator<Item = &'a Task>) -> String {
+    let parent = t.parent.as_ref().and_then(|p| tasks.find(|o| &o.id == p));
+    parent.map_or("origin/main".into(), |p| format!("origin/{}", p.branch))
+}
+
 /// `<prefix><unix seconds>`, so ids sort by creation.
 pub fn now_id(prefix: &str) -> String {
     let secs = SystemTime::now()
@@ -295,6 +302,23 @@ mod tests {
             slug("Split the ledger reconciliation job into per-account batches"),
             "split-the-ledger-reconciliation-job-into"
         );
+    }
+
+    #[test]
+    fn base_is_the_parents_branch() {
+        let parent = Task {
+            id: "t1".into(),
+            branch: "u/parent".into(),
+            ..Default::default()
+        };
+        let child = Task {
+            id: "t2".into(),
+            parent: Some("t1".into()),
+            ..Default::default()
+        };
+        let tasks = [parent.clone(), child.clone()];
+        assert_eq!(base(&child, tasks.iter()), "origin/u/parent");
+        assert_eq!(base(&parent, tasks.iter()), "origin/main");
     }
 
     #[test]

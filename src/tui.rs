@@ -55,9 +55,6 @@ const KEYS: [(&str, &str); 13] = [
     ("q", "quit"),
 ];
 
-// ponytail: Diff and d compare with origin/main, like the worker; T23 adds parent branches
-const BASE: &str = "origin/main";
-
 /// Every color and glyph, so a light-terminal or ASCII variant is one swap. Nothing paints a
 /// background: the terminal's own theme shows through.
 pub struct Theme {
@@ -156,8 +153,8 @@ struct App {
     loaded: Option<(String, Option<SystemTime>)>,
     /// Asking whether to discard the selected task.
     confirm: bool,
-    /// A slot whose full diff to page once the TUI is suspended.
-    pager: Option<PathBuf>,
+    /// A slot and its base, whose full diff to page once the TUI is suspended.
+    pager: Option<(PathBuf, String)>,
     /// Showing the selected task's PR draft.
     preview: bool,
     /// A task being drafted, with the draft it had and the drafting worker's pid, to preview
@@ -257,9 +254,9 @@ pub fn run(repo: &Path) -> Result<()> {
             {
                 return Ok(());
             }
-            if let Some(dir) = app.pager.take() {
+            if let Some((dir, base)) = app.pager.take() {
                 ratatui::restore();
-                let diff = format!("{BASE}...HEAD");
+                let diff = format!("{base}...HEAD");
                 Command::new("git")
                     .arg("-C")
                     .arg(&dir)
@@ -443,6 +440,12 @@ impl App {
         self.requests.get(self.selected)
     }
 
+    /// The selected task's base; see `task::base`.
+    fn base(&self) -> Option<String> {
+        let (t, _) = self.task()?;
+        Some(task::base(t, self.tasks.iter().map(|(t, _)| t)))
+    }
+
     /// The selected row's task, if it's one.
     fn task(&self) -> Option<&(Task, Option<SystemTime>)> {
         let i = self.selected.checked_sub(self.requests.len())?;
@@ -541,7 +544,7 @@ impl App {
             KeyCode::Char('n') => self.compose = Some(Compose::new()),
             KeyCode::Char(c @ '1'..='4') => self.tab = c as usize - '1' as usize,
             KeyCode::Char('d') => match self.slot_dir() {
-                Some(dir) => self.pager = Some(dir),
+                Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default())),
                 None => self.notice = Some("this task has no worktree".into()),
             },
             KeyCode::Char('x') => self.confirm = !self.tasks.is_empty(),
@@ -591,7 +594,11 @@ impl App {
         if self.tab >= 2 && self.loaded != key {
             let log = self.state.join(format!("logs/{id}.gate.log"));
             self.gate_log = fs::read_to_string(log).unwrap_or_default();
-            self.diff = self.slot_dir().map(|d| diffstat(&d)).unwrap_or_default();
+            let base = self.base().unwrap_or_default();
+            self.diff = self
+                .slot_dir()
+                .map(|d| diffstat(&d, &base))
+                .unwrap_or_default();
             self.loaded = key;
         }
     }
@@ -695,7 +702,7 @@ impl App {
         let (title, body) = text.trim().split_once('\n').unwrap_or((text.trim(), ""));
         (draft.title, draft.body) = (pr::clean(title.trim()), pr::clean(body.trim()));
         let cfg = config::load(&self.repo)?;
-        let migration = pr::migration(&dir, BASE)?;
+        let migration = pr::migration(&dir, &self.base().context("no task selected")?)?;
         draft.problem = pr::check_title(&draft.title, &cfg.pr.types, migration).err();
         t.save(&self.state)
     }
@@ -715,7 +722,8 @@ impl App {
             "the branch changed since this draft; press m to redraft"
         );
         let cfg = config::load(&self.repo)?;
-        let url = pr::open(&t, &dir, BASE, cfg.pr.draft)?;
+        let base = self.base().context("no task selected")?;
+        let url = pr::open(&t, &dir, &base, cfg.pr.draft)?;
         t.pr_url = Some(url.clone());
         t.status = Status::PrOpen;
         self.preview = false;
@@ -843,8 +851,8 @@ fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
 }
 
 /// `git diff --numstat` against the base, as (path, added, deleted); binaries count 0.
-fn diffstat(slot: &Path) -> Vec<(String, u64, u64)> {
-    let out = git(slot, &["diff", "--numstat", &format!("{BASE}...HEAD")]).unwrap_or_default();
+fn diffstat(slot: &Path, base: &str) -> Vec<(String, u64, u64)> {
+    let out = git(slot, &["diff", "--numstat", &format!("{base}...HEAD")]).unwrap_or_default();
     out.lines()
         .filter_map(|l| {
             let mut parts = l.splitn(3, '\t');
