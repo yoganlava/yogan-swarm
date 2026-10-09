@@ -1,4 +1,4 @@
-- [ ] **T50 Draggable divider and pane scrollbars**
+- [x] **T50 Draggable divider and pane scrollbars**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › How it's built › Divider; Decided 2.
 

@@ -18,7 +18,8 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use regex::Regex;
@@ -339,7 +340,7 @@ struct App {
     interactive: Option<(PathBuf, String)>,
     /// How far the detail pane is scrolled: down from the top, or up from the tail in Activity
     /// and the Gate output. Drawing clamps it.
-    scroll: Cell<u16>,
+    scroll: Scroll,
     /// The selected task's findings, and the cursor over their actionable ones.
     findings: Findings,
     finding: usize,
@@ -367,6 +368,10 @@ struct App {
     zoom: bool,
     /// The last row click, to spot a double-click.
     last_click: Option<(Position, Instant)>,
+    /// The list pane's width in columns, set by dragging the divider.
+    split: u16,
+    /// The divider is being dragged.
+    dragging: bool,
     /// Where the last frame drew things, for the mouse.
     hits: RefCell<Hits>,
 }
@@ -382,13 +387,33 @@ struct Hits {
     targets: Vec<(Rect, Target)>,
 }
 
-/// What a click does: press a key, or select a list row or dismiss the info toast, which have
-/// no key.
+/// What a click does: press a key, or one of the things with no key: select a list row, dismiss
+/// the info toast, start dragging the divider, or scroll the detail pane to an offset.
 #[derive(Clone, Copy)]
 enum Target {
     Key(KeyEvent),
     Row(usize),
     Info,
+    Divider,
+    Scroll(u16),
+}
+
+/// The detail pane's scroll offset, and the scrollbar its tab asked for this frame as (area,
+/// largest offset, whether the offset counts up from the tail).
+#[derive(Default)]
+struct Scroll {
+    offset: Cell<u16>,
+    bar: Cell<Option<(Rect, u16, bool)>>,
+}
+
+impl Scroll {
+    fn get(&self) -> u16 {
+        self.offset.get()
+    }
+
+    fn set(&self, offset: u16) {
+        self.offset.set(offset);
+    }
 }
 
 /// The key a footer label stands for; pairs like `j/k` stand for none.
@@ -491,7 +516,7 @@ pub fn run(repo: &Path) -> Result<()> {
         commits: Vec::new(),
         commit: 0,
         interactive: None,
-        scroll: Cell::new(0),
+        scroll: Scroll::default(),
         findings: Findings::default(),
         finding: 0,
         disputed: Vec::new(),
@@ -507,6 +532,8 @@ pub fn run(repo: &Path) -> Result<()> {
         diff_file: 0,
         zoom: false,
         last_click: None,
+        split: 45,
+        dragging: false,
         hits: RefCell::default(),
     };
     let theme = Theme::detect();
@@ -1522,8 +1549,18 @@ impl App {
         };
         let before = self.selected;
         match (m.kind, hit) {
+            (MouseEventKind::Drag(MouseButton::Left), _) if self.dragging => {
+                self.split = (m.column + 1).clamp(30, 70);
+            }
+            (MouseEventKind::Up(MouseButton::Left), _) => self.dragging = false,
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Key(key))) => {
                 return self.key(key);
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Divider)) if !modal => {
+                self.dragging = true;
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Scroll(offset))) if !modal => {
+                self.scroll.set(offset);
             }
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Row(i))) if !modal => {
                 // crossterm doesn't report double-clicks: two Downs on one cell within 400 ms
@@ -1818,20 +1855,46 @@ fn tail(file: &Path, max: u64) -> Vec<u8> {
 }
 
 /// Draws `p` scrolled down by the detail pane's offset, clamped to its last page.
-fn scrolled(f: &mut Frame, area: Rect, p: Paragraph, scroll: &Cell<u16>) {
+fn scrolled(f: &mut Frame, area: Rect, p: Paragraph, scroll: &Scroll) {
     let max = p
         .line_count(area.width)
         .saturating_sub(area.height as usize);
     scroll.set(scroll.get().min(max as u16));
+    if max > 0 {
+        scroll.bar.set(Some((area, max as u16, false)));
+    }
     f.render_widget(p.scroll((scroll.get(), 0)), area);
 }
 
 /// For a view that follows its tail: how many of `len` lines to hide below, clamped so a full
-/// page of `height` stays in view.
-fn from_tail(len: usize, height: u16, scroll: &Cell<u16>) -> usize {
-    let max = len.saturating_sub(height as usize);
+/// page of `area` stays in view.
+fn from_tail(len: usize, area: Rect, scroll: &Scroll) -> usize {
+    let max = len.saturating_sub(area.height as usize);
     scroll.set(scroll.get().min(max as u16));
+    if max > 0 {
+        scroll.bar.set(Some((area, max as u16, true)));
+    }
     scroll.get() as usize
+}
+
+/// A thumb over the pane border column `track`, for top offsets `0..=max` at `top`; returns the
+/// top offset each of its rows jumps to.
+fn scrollbar(f: &mut Frame, track: Rect, max: usize, top: usize) -> Vec<(Rect, usize)> {
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(None)
+        .thumb_symbol("┃");
+    let mut state = ScrollbarState::new(max + 1)
+        .position(top)
+        .viewport_content_length(track.height as usize);
+    f.render_stateful_widget(bar, track, &mut state);
+    let last = track.height.saturating_sub(1).max(1) as usize;
+    track
+        .rows()
+        .enumerate()
+        .map(|(i, row)| (row, (i * max + last / 2) / last))
+        .collect()
 }
 
 /// `git diff --numstat` against the base, as (path, added, deleted); binaries count 0.
@@ -1880,7 +1943,18 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         detail(f, body, app, theme, true);
     } else if body.width >= 100 {
         let [left, right] =
-            Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(body);
+            Layout::horizontal([Constraint::Length(app.split), Constraint::Fill(1)]).areas(body);
+        // the two border columns between the panes; row targets drawn later win on the list's
+        let divider = Rect::new(
+            left.right() - 1,
+            body.y + 1,
+            2,
+            body.height.saturating_sub(2),
+        );
+        app.hits
+            .borrow_mut()
+            .targets
+            .push((divider, Target::Divider));
         list(f, left, app, theme, !app.detail, tick, now);
         detail(f, right, app, theme, app.detail);
     } else if app.detail {
@@ -2385,8 +2459,21 @@ fn list(
             i += 1;
         }
     }
+    let len = items.len();
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(List::new(items).block(block), area, &mut state);
+    // a click on the scrollbar selects the first row at that point of the list
+    let max = len.saturating_sub(inner.height as usize);
+    let bar = match max {
+        0 => Vec::new(),
+        _ => {
+            let track = Rect::new(area.right() - 1, inner.y, 1, inner.height);
+            scrollbar(f, track, max, state.offset())
+        }
+    };
+    let bar: Vec<_> = (bar.into_iter())
+        .filter_map(|(r, top)| Some((r, Target::Row(rows[top..].iter().find_map(|i| *i)?))))
+        .collect();
     let mut hits = app.hits.borrow_mut();
     hits.list = area;
     let shown = rows
@@ -2404,6 +2491,7 @@ fn list(
         ))
     });
     hits.targets.extend(rows);
+    hits.targets.extend(bar);
 }
 
 /// `      edit src/retry.rs…  quiet 2m`, dim under a Running row; `quiet` is amber when `late`.
@@ -2501,6 +2589,27 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     let rect = Rect::new(area.right().saturating_sub(w + 1), area.y, w, 1).intersection(area);
     let target = Target::Key(KeyEvent::new(key, KeyModifiers::NONE));
     app.hits.borrow_mut().targets.push((rect, target));
+    app.scroll.bar.set(None);
+    detail_body(f, inner, app, theme, compact);
+    // the tab's scrollbar sits on the pane's right border; a click there jumps to that offset
+    if let Some((rect, max, tail)) = app.scroll.bar.take() {
+        let track = Rect::new(area.right() - 1, rect.y, 1, rect.height);
+        let top = if tail {
+            max - app.scroll.get()
+        } else {
+            app.scroll.get()
+        };
+        let rows = scrollbar(f, track, max as usize, top as usize);
+        let rows = rows.into_iter().map(|(r, top)| {
+            let offset = if tail { max - top as u16 } else { top as u16 };
+            (r, Target::Scroll(offset))
+        });
+        app.hits.borrow_mut().targets.extend(rows);
+    }
+}
+
+/// The detail pane's tabs and the active tab, or the selected request.
+fn detail_body(f: &mut Frame, inner: Rect, app: &App, theme: &Theme, compact: bool) {
     let Some((t, _)) = app.task() else {
         match app.request() {
             Some(r) => request(f, inner, r, app.answer.as_ref(), theme, &app.scroll),
@@ -2575,7 +2684,7 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
 }
 
 /// The slot and its ports, each `[scripts]` entry's status, then the run script's output tail.
-fn run_tab(f: &mut Frame, area: Rect, t: &Task, run: &RunTab, theme: &Theme, scroll: &Cell<u16>) {
+fn run_tab(f: &mut Frame, area: Rect, t: &Task, run: &RunTab, theme: &Theme, scroll: &Scroll) {
     let mut head = t.slot.map_or(Vec::new(), |n| vec![format!("slot {n}")]);
     head.extend(run.ports.map(|(p, n)| format!("ports {p}-{}", p + n - 1)));
     let scripts = run.scripts.iter().flat_map(|&name| {
@@ -2619,7 +2728,7 @@ fn run_tab(f: &mut Frame, area: Rect, t: &Task, run: &RunTab, theme: &Theme, scr
         return;
     }
     let mut lines: Vec<Line> = run.log.lines().map(|l| Line::raw(l.to_string())).collect();
-    lines.truncate(lines.len() - from_tail(lines.len(), output.height, scroll));
+    lines.truncate(lines.len() - from_tail(lines.len(), output, scroll));
     let skip = lines.len().saturating_sub(output.height as usize);
     f.render_widget(Paragraph::new(lines.split_off(skip)), output);
 }
@@ -2631,7 +2740,7 @@ fn summary(
     t: &Task,
     parent: Option<String>,
     sessions: u32,
-    scroll: &Cell<u16>,
+    scroll: &Scroll,
 ) {
     let label = GROUPS
         .iter()
@@ -2681,7 +2790,7 @@ fn request(
     r: &Request,
     answer: Option<&(String, String, Vec<String>)>,
     theme: &Theme,
-    scroll: &Cell<u16>,
+    scroll: &Scroll,
 ) {
     let failed = r.status == Phase::Failed;
     let status = match r.status {
@@ -2803,7 +2912,7 @@ fn findings_tab(
     fs: &Findings,
     cursor: Option<usize>,
     theme: &Theme,
-    scroll: &Cell<u16>,
+    scroll: &Scroll,
 ) {
     let mut lines = Vec::new();
     if let Some(e) = &fs.error {
@@ -2870,14 +2979,14 @@ fn activity_tab(
     area: Rect,
     calls: &[(String, String)],
     theme: &Theme,
-    scroll: &Cell<u16>,
+    scroll: &Scroll,
 ) {
     if calls.is_empty() {
         f.render_widget(Line::raw("No tool calls yet.").dim(), area);
         return;
     }
     let width = area.width as usize;
-    let end = calls.len() - from_tail(calls.len(), area.height, scroll);
+    let end = calls.len() - from_tail(calls.len(), area, scroll);
     let shown = &calls[end.saturating_sub(area.height as usize)..end];
     let lines = shown.iter().map(|(tool, target)| {
         let (verb, style) = verb(tool, theme);
@@ -2910,7 +3019,7 @@ fn verb<'a>(tool: &'a str, theme: &Theme) -> (&'a str, Style) {
 }
 
 /// The checks as a table, then the tail of each failing step's output from the gate log.
-fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scroll: &Cell<u16>) {
+fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scroll: &Scroll) {
     let Some(checks) = &t.gate else {
         f.render_widget(Line::raw("The gate hasn't run yet.").dim(), area);
         return;
@@ -2941,7 +3050,7 @@ fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scrol
             lines.extend(body.lines().map(|l| Line::raw(l.to_string())));
         }
     }
-    lines.truncate(lines.len() - from_tail(lines.len(), output.height, scroll));
+    lines.truncate(lines.len() - from_tail(lines.len(), output, scroll));
     let skip = lines.len().saturating_sub(output.height as usize);
     f.render_widget(Paragraph::new(lines.split_off(skip)), output);
 }
@@ -2954,7 +3063,7 @@ fn diff_tab(
     files: &[(String, u64, u64)],
     cursor: Option<usize>,
     theme: &Theme,
-    scroll: &Cell<u16>,
+    scroll: &Scroll,
 ) {
     if files.is_empty() {
         f.render_widget(Line::raw("No changes yet.").dim(), area);
@@ -3106,7 +3215,7 @@ mod tests {
             commits: Vec::new(),
             commit: 0,
             interactive: None,
-            scroll: Cell::new(0),
+            scroll: Scroll::default(),
             findings: Findings::default(),
             finding: 0,
             disputed: Vec::new(),
@@ -3122,6 +3231,8 @@ mod tests {
             diff_file: 0,
             zoom: false,
             last_click: None,
+            split: 45,
+            dragging: false,
             hits: RefCell::default(),
         };
         (app, now)
@@ -4481,5 +4592,85 @@ mod tests {
                 " yogan · fuse-os  + 1  x 1  | 1  o 1   x  discard  ?  more  ",
             ]
         );
+    }
+
+    #[test]
+    fn dragging_the_divider() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let border = |term: &Terminal<TestBackend>| {
+            let row: Vec<char> = screen(term)[1].chars().collect();
+            row.windows(2).position(|w| w == ['╮', '╭']).unwrap()
+        };
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(border(&term), 44);
+
+        // the detail pane's left border grabs; drags move the list's right border to the cursor
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 45));
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 59));
+        assert_eq!(app.split, 60);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(border(&term), 59);
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+        assert_eq!(app.split, 30);
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 110));
+        assert_eq!(app.split, 70);
+
+        // once released, a drag elsewhere leaves it be
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 110));
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50));
+        assert_eq!(app.split, 70);
+    }
+
+    #[test]
+    fn activity_scrollbar() {
+        let (mut app, _) = app();
+        app.activity = (1..=20)
+            .map(|i| ("Read".into(), format!("f{i}.rs")))
+            .collect();
+        app.detail = true;
+        app.tab = 1;
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ Activity ▾                                               │",
+                "│ read    f11.rs                                           │",
+                "│ read    f12.rs                                           │",
+                "│ read    f13.rs                                           │",
+                "│ read    f14.rs                                           │",
+                "│ read    f15.rs                                           │",
+                "│ read    f16.rs                                           ┃",
+                "│ read    f17.rs                                           ┃",
+                "│ read    f18.rs                                           ┃",
+                "│ read    f19.rs                                           ┃",
+                "│ read    f20.rs                                           ┃",
+                "╰──────────────────────────────────────────────────────────╯",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  ?  more  ",
+            ]
+        );
+
+        // clicking the scrollbar's top jumps to the oldest calls
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 59,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll.get(), 10);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert!(screen(&term)[2].contains("f1.rs"));
     }
 }
