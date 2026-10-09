@@ -1,0 +1,50 @@
+# Built-in defaults: the plan's global config example. ~/.config/yogan/config.toml and the
+# project file are merged over this, key by key.
+
+[lead]
+model  = "claude-opus-5-5"
+effort = "xhigh"
+
+[ask]
+model  = "claude-opus-5-5"
+effort = "high"
+concurrency = 2
+
+[pr]
+model  = "claude-opus-5-5"
+effort = "medium"
+draft  = true
+style  = "Concise what and why in 2-4 sentences, readable at a glance, then bullets. No links to plan pages."
+
+[critic]
+model  = "claude-fable-5-1"
+effort = "max"
+max_rounds = 2
+
+[worker]
+model  = "claude-opus-5-5"
+effort = "high"
+budget_usd = 5.0
+concurrency = 4
+slots = 5
+
+[watch]
+stall_after  = "15m"
+nudges       = 1
+loop_repeats = 4
+autocompact  = 200000
+handoff_at   = 0.8
+max_handoffs = 2
+
+[build]
+max_cargo = 2
+
+[disk]
+max_target_gb = 60
+min_free_gb   = 100
+
+[tui]
+mouse = true
+
+[notify]
+on_review_ready = ""
