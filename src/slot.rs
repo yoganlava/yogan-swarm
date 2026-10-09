@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use crate::config::Ports;
 use crate::git;
 use crate::redact::redact;
-use crate::task::Task;
+use crate::task::{Status, Task};
 use crate::worker;
 
 /// Lowest slot in `1..=count` that no task holds and no process has locked.
@@ -47,7 +47,8 @@ fn try_lock(state: &Path, n: u32) -> Result<Option<File>> {
 /// Checks out a fresh `branch` from `base` (e.g. `origin/main`) in slot `n`, adding the worktree
 /// on first use. Discards whatever the slot's previous task left behind. In a cargo repo, cleans
 /// the target dir after a toolchain change or past `max_target_gb` of divergence, and seeds a
-/// missing one.
+/// missing one. The plan checks divergence as a task leaves; checking as the next one enters
+/// keeps the re-seed in the detached worker rather than the TUI.
 pub fn prepare(
     repo: &Path,
     state: &Path,
@@ -85,29 +86,30 @@ pub fn prepare(
 }
 
 /// Below `min_free_gb` free, cleans slots that no task holds and no worker has locked, most
-/// diverged first, until there's enough. The next `prepare` in each re-seeds it.
+/// diverged first, until there's enough. The next `prepare` in each re-seeds it. Called under
+/// `sched.lock`, so `tasks` shows every worker that has yet to claim its slot.
 // ponytail: runs inline in the scheduler, so a big delete pauses its caller; detach it if that shows
 pub fn free_disk(state: &Path, tasks: &[Task], count: u32, min_free_gb: u64) -> Result<()> {
     let want = min_free_gb << 30;
-    if free(state)? >= want {
+    // a started worker without a slot yet would find the one being cleaned locked
+    let claiming = |t: &Task| matches!(t.status, Status::Running | Status::Checking);
+    if free(state)? >= want || tasks.iter().any(|t| claiming(t) && t.slot.is_none()) {
         return Ok(());
     }
-    let mut idle = Vec::new();
-    for n in 1..=count {
-        let target = state.join(format!("slots/{n}/target"));
-        if tasks.iter().any(|t| t.slot == Some(n)) || !target.exists() {
-            continue;
-        }
-        if let Some(lock) = try_lock(state, n)? {
-            idle.push((divergence(&target), n, lock));
-        }
-    }
+    let mut idle: Vec<_> = (1..=count)
+        .filter(|n| !tasks.iter().any(|t| t.slot == Some(*n)))
+        .map(|n| (n, state.join(format!("slots/{n}/target"))))
+        .filter(|(_, target)| target.exists())
+        .map(|(n, target)| (divergence(&target), n))
+        .collect();
     idle.sort_by_key(|a| std::cmp::Reverse(a.0));
-    for (_, n, _lock) in idle {
+    for (_, n) in idle {
         if free(state)? >= want {
             break;
         }
-        clean(state, n)?;
+        if let Some(_lock) = try_lock(state, n)? {
+            clean(state, n)?;
+        }
     }
     Ok(())
 }
@@ -496,7 +498,14 @@ mod tests {
             slot: Some(2),
             ..Default::default()
         };
-        // a threshold no disk meets, so every idle slot is cleaned
+        // a threshold no disk meets, so every idle slot is cleaned, but not while a started
+        // worker has yet to claim a slot
+        let starting = Task {
+            status: Status::Running,
+            ..Default::default()
+        };
+        free_disk(&state, &[review.clone(), starting], 3, u64::MAX >> 30).unwrap();
+        assert!(state.join("slots/3/target").exists());
         free_disk(&state, &[review], 3, u64::MAX >> 30).unwrap();
         assert!(state.join("slots/1/target").exists());
         assert!(state.join("slots/2/target").exists());
@@ -504,6 +513,39 @@ mod tests {
         // enough free space cleans nothing
         free_disk(&state, &[], 3, 0).unwrap();
         assert!(state.join("slots/2/target").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn prepare_cleans_on_toolchain_change_and_divergence() {
+        let files = [
+            ("Cargo.toml", "[package]\nname = \"x\"\n"),
+            (".gitignore", "/target\n"),
+        ];
+        let (root, repo) = repo_with_origin("prepare-clean", &files);
+        fs::create_dir_all(repo.join("target/debug")).unwrap();
+        fs::write(repo.join("target/debug/lib"), "built").unwrap();
+        let state = root.join("state");
+        let slot = prepare(&repo, &state, 1, "u/a", "origin/main", 60).unwrap();
+        let target = slot.join("target");
+        assert!(target.join("debug/lib").exists() && target.join(SEEDED).exists());
+        let junk = target.join("debug/junk");
+
+        // under the threshold, the slot keeps what it built
+        fs::write(&junk, [1; 8192]).unwrap();
+        prepare(&repo, &state, 1, "u/b", "origin/main", 60).unwrap();
+        assert!(junk.exists());
+
+        // another toolchain: cleaned and seeded again from main
+        fs::write(state.join("slots/1.toolchain"), "rustc 0.0.0").unwrap();
+        prepare(&repo, &state, 1, "u/c", "origin/main", 60).unwrap();
+        assert!(!junk.exists() && target.join("debug/lib").exists());
+
+        // past max_target_gb of divergence: the same
+        fs::write(&junk, [1; 8192]).unwrap();
+        prepare(&repo, &state, 1, "u/d", "origin/main", 0).unwrap();
+        assert!(!junk.exists() && target.join(SEEDED).exists());
 
         fs::remove_dir_all(&root).unwrap();
     }

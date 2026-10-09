@@ -372,8 +372,8 @@ struct Hits {
 /// script's pid and output, read every frame.
 #[derive(Default)]
 struct RunTab {
-    /// The task the ports and scripts were read for.
-    loaded: Option<String>,
+    /// The task and slot the ports and scripts were read for.
+    loaded: Option<(String, Option<u32>)>,
     /// The first port and how many.
     ports: Option<(u32, u32)>,
     /// The configured `[scripts]` by name.
@@ -1129,11 +1129,15 @@ impl App {
             self.activity = activity(&log, &self.slot_dir().unwrap_or_default());
         }
         if self.tab == RUN {
-            if self.run.loaded.as_ref() != Some(&id) {
+            let slot = self.task().and_then(|(t, _)| t.slot);
+            let key = Some((id.clone(), slot));
+            if self.run.loaded != key {
                 let cfg = config::load(&self.repo).ok();
-                let n = self.task().and_then(|(t, _)| t.slot).unwrap_or_default();
                 let ports = cfg.as_ref().and_then(|c| c.ports.as_ref());
-                self.run.ports = ports.map(|p| (p.base + n * p.per_slot, p.per_slot));
+                // a task without a slot has no ports yet
+                self.run.ports = slot
+                    .zip(ports)
+                    .map(|(n, p)| (p.base + n * p.per_slot, p.per_slot));
                 let s = cfg.as_ref().and_then(|c| c.scripts.as_ref());
                 self.run.scripts = s.map_or(Vec::new(), |s| {
                     let named = [
@@ -1147,7 +1151,7 @@ impl App {
                         .map(|(n, _)| n)
                         .collect()
                 });
-                self.run.loaded = Some(id.clone());
+                self.run.loaded = key;
             }
             self.run.pid = slot::running(&self.state, &id);
             let log = self.state.join(format!("logs/{id}.run.log"));
@@ -2000,6 +2004,7 @@ fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
         Line::raw(""),
         Line::raw("Models").dim(),
     ];
+    let mut selected = 0;
     for (i, ((_, key, label, _), v)) in SETTINGS.iter().zip(&s.values).enumerate() {
         if i == WATCH {
             lines.extend([Line::raw(""), Line::raw("Watch").dim()]);
@@ -2024,10 +2029,15 @@ fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
             value,
         ];
         row.extend((*v != s.loaded[i]).then(|| Span::styled(" •", theme.amber)));
+        if sel {
+            selected = lines.len() as u16;
+        }
         lines.push(Line::from(row));
     }
     let block = pane(&format!("Settings · {file} file"), true, theme);
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    // a short panel scrolls just enough to keep the selected row in view
+    let top = (selected + 1).saturating_sub(block.inner(area).height);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((top, 0)), area);
 }
 
 fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
@@ -3022,7 +3032,7 @@ mod tests {
     fn run_tab_shows_ports_scripts_and_output() {
         let (mut app, _) = app();
         app.run = RunTab {
-            loaded: Some("t1".into()),
+            loaded: Some(("t1".into(), Some(1))),
             ports: Some((1160, 80)),
             scripts: vec!["setup", "run", "teardown"],
             pid: Some(4242),
@@ -3104,6 +3114,18 @@ mod tests {
                 "╰──────────────────────────────────────────────────────────╯",
                 " j/k field  ←→ change  g global file  ctrl-s save  esc close",
             ]
+        );
+
+        // a short panel scrolls to keep the selected row in view
+        app.settings.as_mut().unwrap().row = SETTINGS.len() - 1;
+        let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        let rows = screen(&term);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("max handoffs") && r.contains("‹ 2 ›")),
+            "{rows:#?}"
         );
 
         let mut s = app.settings.take().unwrap();
@@ -3640,6 +3662,51 @@ mod tests {
         assert_eq!(app.reply_for, Some('t'));
         let hint = app.reply.as_ref().unwrap().placeholder_text().to_string();
         assert_eq!(hint, "Model to retry on; empty keeps claude-opus-5-5");
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn applying_an_edited_pr_draft() {
+        let (mut app, _) = app();
+        let state = std::env::temp_dir().join(format!("yogan-edit-draft-{}", std::process::id()));
+        let slot = state.join("slots/1");
+        fs::create_dir_all(&slot).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["commit", "-q", "--allow-empty", "-m", "base"],
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        ] {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&slot)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        // a checkout with no origin, so no project file applies
+        (app.state, app.repo, app.preview) = (state.clone(), slot, true);
+        app.tasks[0].0.pr_draft = Some(pr::Draft {
+            title: "old".into(),
+            body: "old body".into(),
+            head: "abc".into(),
+            problem: None,
+        });
+        app.tasks[0].0.save(&state).unwrap();
+
+        let edit = app.edit_file().unwrap();
+        assert!(edit.1, "the PR draft");
+        assert_eq!(fs::read_to_string(&edit.2).unwrap(), "old\n\nold body\n");
+        fs::write(&edit.2, "feat: reject — negative [CC-1]\n\nNew body.\n").unwrap();
+        app.apply_edit(edit).unwrap();
+        let saved = task::load_all(&state).unwrap().remove(0);
+        let draft = saved.pr_draft.unwrap();
+        assert_eq!(draft.title, "feat: reject, negative [CC-1]");
+        assert_eq!(draft.body, "New body.");
+        assert_eq!(draft.head, "abc");
         fs::remove_dir_all(&state).unwrap();
     }
 

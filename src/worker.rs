@@ -778,16 +778,24 @@ fn lifecycle(
     }
     task.status = Status::Review;
     task.save(state)?;
-    let notify = &cfg.notify.on_review_ready;
-    if pr.is_none() && !notify.is_empty() {
-        let mut sh = Command::new("sh");
-        sh.args(["-c", notify])
-            .current_dir(repo)
-            .env("YOGAN_TASK_ID", &task.id)
-            .env("YOGAN_TASK_TITLE", &task.title);
-        let _ = detach(sh); // a broken notifier never fails the task
+    // the --pr path was already in Review
+    if pr.is_none() {
+        review_ready(&cfg.notify.on_review_ready, repo, task);
     }
     Ok(())
+}
+
+/// Runs `[notify] on_review_ready`, if set, detached in `repo` with the task's id and title.
+fn review_ready(cmd: &str, repo: &Path, task: &Task) {
+    if cmd.is_empty() {
+        return;
+    }
+    let mut sh = Command::new("sh");
+    sh.args(["-c", cmd])
+        .current_dir(repo)
+        .env("YOGAN_TASK_ID", &task.id)
+        .env("YOGAN_TASK_TITLE", &task.title);
+    let _ = detach(sh); // a broken notifier never fails the task
 }
 
 fn conflict(base: &str) -> String {
@@ -1052,6 +1060,37 @@ mod tests {
         );
         let _ = fs::remove_file(log.with_extension("pid"));
         fs::remove_file(&log).unwrap();
+    }
+
+    #[test]
+    fn review_ready_runs_the_command_with_the_task() {
+        let dir = std::env::temp_dir().join(format!("yogan-notify-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let task = Task {
+            id: "t1".into(),
+            title: "Fix it".into(),
+            ..Default::default()
+        };
+        review_ready("", &dir, &task); // unset: nothing runs
+        review_ready(
+            "echo \"$YOGAN_TASK_ID $YOGAN_TASK_TITLE\" > tmp && mv tmp out",
+            &dir,
+            &task,
+        );
+        let start = Instant::now();
+        while !dir.join("out").exists() {
+            assert!(start.elapsed() < Duration::from_secs(5), "never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(fs::read_to_string(dir.join("out")).unwrap(), "t1 Fix it\n");
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, ["out"]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
