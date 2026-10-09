@@ -256,6 +256,8 @@ pub struct Theme {
     ellipsis: &'static str,
     /// Before the agent's text in Activity.
     gutter: &'static str,
+    /// Before a markdown list item.
+    bullet: &'static str,
     /// Before a child task, under its parent.
     tree: &'static str,
     /// Pipeline links up to the current stage and after it, the current stage's mark, a passed
@@ -305,6 +307,7 @@ impl Theme {
             bar: glyphs("▌", ">"),
             ellipsis: glyphs("…", "~"),
             gutter: glyphs("│", "|"),
+            bullet: glyphs("•", "-"),
             tree: glyphs("└ ", "- "),
             done: glyphs("━", "="),
             todo: glyphs("┄", "-"),
@@ -3766,22 +3769,171 @@ fn request(
     );
 }
 
-/// Markdown, lightly: headings bold, fenced code in the shell hue, the rest as written.
+/// Markdown, lightly: headings bold, fenced code in the shell hue, lists, quotes, rules, tables
+/// and inline styles; nothing inside a fence is parsed.
 fn markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut code = false;
     let mut lines = Vec::new();
+    let mut table = Vec::new();
     for l in text.lines() {
-        if l.trim_start().starts_with("```") {
+        let t = l.trim();
+        if !code && t.starts_with('|') {
+            table.push(t);
+            continue;
+        }
+        lines.extend(md_table(&std::mem::take(&mut table), theme));
+        let (indent, rest) = l.split_at(l.len() - l.trim_start().len());
+        let item = ["- ", "* ", "+ "].iter().find_map(|b| rest.strip_prefix(b));
+        let quote = rest.strip_prefix("> ").or((t == ">").then_some(""));
+        let prefixed = |prefix: String, rest: &str| {
+            let mut spans = vec![Span::raw(prefix)];
+            spans.extend(inline(rest, Style::new(), theme));
+            Line::from(spans)
+        };
+        if t.starts_with("```") {
             code = !code;
         } else if code {
             lines.push(Line::styled(format!("  {l}"), theme.shell));
         } else if l.starts_with('#') {
             lines.push(Line::raw(l.trim_start_matches('#').trim().to_string()).bold());
+        } else if t.len() >= 3 && ['-', '*', '_'].iter().any(|&c| t.chars().all(|x| x == c)) {
+            lines.push(Line::raw(theme.rule.repeat(8)).dim());
+        } else if let Some(rest) = item {
+            lines.push(prefixed(format!("{indent}{} ", theme.bullet), rest));
+        } else if let Some(rest) = quote {
+            lines.push(prefixed(format!("{indent}{} ", theme.gutter), rest).dim());
         } else {
-            lines.push(Line::raw(l.to_string()));
+            lines.push(Line::from(inline(l, Style::new(), theme)));
         }
     }
+    lines.extend(md_table(&table, theme));
     lines
+}
+
+/// A run of `|` rows with each column padded to its widest cell, the header bold and the
+/// delimiter row a rule.
+fn md_table(rows: &[&str], theme: &Theme) -> Vec<Line<'static>> {
+    let cells = |r: &str| -> Vec<String> {
+        let r = r.strip_prefix('|').unwrap_or(r);
+        let r = r.strip_suffix('|').unwrap_or(r);
+        r.split('|').map(|c| c.trim().to_string()).collect()
+    };
+    let delimiter = |r: &str| {
+        (cells(r).iter()).all(|c| !c.is_empty() && c.chars().all(|x| matches!(x, '-' | ':')))
+    };
+    let header = rows.get(1).is_some_and(|r| delimiter(r));
+    let rows: Vec<Option<Vec<Vec<Span<'static>>>>> = (rows.iter())
+        .map(|r| {
+            let row = || {
+                cells(r)
+                    .iter()
+                    .map(|c| inline(c, Style::new(), theme))
+                    .collect()
+            };
+            (!delimiter(r)).then(row)
+        })
+        .collect();
+    let width = |cell: &[Span]| cell.iter().map(|s| s.content.width()).sum::<usize>();
+    let mut widths: Vec<usize> = Vec::new();
+    for (i, cell) in rows.iter().flatten().flat_map(|r| r.iter().enumerate()) {
+        if widths.len() <= i {
+            widths.push(0);
+        }
+        widths[i] = widths[i].max(width(cell));
+    }
+    let total = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+    (rows.into_iter().enumerate())
+        .map(|(n, row)| {
+            let Some(row) = row else {
+                return Line::raw(theme.rule.repeat(total)).dim();
+            };
+            let mut spans = Vec::new();
+            let mut pad = 0;
+            for (i, cell) in row.into_iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw(" ".repeat(pad + 2)));
+                }
+                pad = widths[i] - width(&cell);
+                spans.extend(cell);
+            }
+            match n == 0 && header {
+                true => Line::from(spans).bold(),
+                false => Line::from(spans),
+            }
+        })
+        .collect()
+}
+
+/// `l` with **bold**, *italic*, `code` and [links](url) styled over `base`; `_` inside a word
+/// stays literal.
+fn inline(l: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
+    fn flush(spans: &mut Vec<Span<'static>>, text: &mut String, style: Style) {
+        if !text.is_empty() {
+            spans.push(Span::styled(std::mem::take(text), style));
+        }
+    }
+    let c: Vec<char> = l.chars().collect();
+    let find = |from: usize, pat: &[char]| (from..c.len()).find(|&j| c[j..].starts_with(pat));
+    let word = |j: usize| c.get(j).is_some_and(|x| x.is_alphanumeric());
+    let (mut spans, mut text) = (Vec::new(), String::new());
+    let (mut bold, mut italic) = (None, None);
+    let mut i = 0;
+    while i < c.len() {
+        let mut style = base;
+        if bold.is_some() {
+            style = style.bold();
+        }
+        if italic.is_some() {
+            style = style.italic();
+        }
+        let ch = c[i];
+        if ch == '`'
+            && let Some(j) = find(i + 1, &['`'])
+        {
+            flush(&mut spans, &mut text, style);
+            let code: String = c[i + 1..j].iter().collect();
+            spans.push(Span::styled(code, style.fg(theme.shell)));
+            i = j + 1;
+        } else if ch == '['
+            && let Some(j) = find(i + 1, &[']', '('])
+            && let Some(k) = find(j + 2, &[')'])
+        {
+            flush(&mut spans, &mut text, style);
+            let label: String = c[i + 1..j].iter().collect();
+            let url: String = c[j + 2..k].iter().collect();
+            spans.push(Span::styled(label, style.underlined()));
+            spans.push(Span::styled(format!(" {url}"), base.dim()));
+            i = k + 1;
+        } else if ch == '*' || ch == '_' {
+            let n = if c.get(i + 1) == Some(&ch) { 2 } else { 1 };
+            let delim = &[ch, ch][..n];
+            let open = if n == 2 { bold } else { italic };
+            // A closer follows text, and a single one isn't half of a double.
+            let closer = |j: usize| {
+                !c[j - 1].is_whitespace()
+                    && (ch == '*' || !word(j + n))
+                    && (n == 2 || (c[j - 1] != ch && c.get(j + 1) != Some(&ch)))
+            };
+            let closes = open == Some(ch) && i > 0 && closer(i);
+            let opens = open.is_none()
+                && c.get(i + n).is_some_and(|x| !x.is_whitespace())
+                && (ch == '*' || i == 0 || !word(i - 1))
+                && (i + n..c.len()).any(|j| c[j..].starts_with(delim) && closer(j));
+            if closes || opens {
+                flush(&mut spans, &mut text, style);
+                let now = opens.then_some(ch);
+                if n == 2 { bold = now } else { italic = now }
+            } else {
+                text.extend(delim);
+            }
+            i += n;
+        } else {
+            text.push(ch);
+            i += 1;
+        }
+    }
+    flush(&mut spans, &mut text, base);
+    spans
 }
 
 /// The repo files `text` cites as `path` or `path:line`, once each, in order.
@@ -5486,6 +5638,59 @@ mod tests {
                 " yogan   ● 2    enter  push and open PR  g  regenerate  e  e",
             ]
         );
+    }
+
+    #[test]
+    fn markdown_lines() {
+        let theme = Theme::new(false, false);
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let md = markdown("use **fast** mode", &theme);
+        assert_eq!(md.len(), 1);
+        assert_eq!(text(&md[0]), "use fast mode");
+        assert_eq!(md[0].spans[1], Span::raw("fast").bold());
+
+        let md = markdown("run `cargo test` now", &theme);
+        assert_eq!(text(&md[0]), "run cargo test now");
+        assert_eq!(md[0].spans[1], Span::styled("cargo test", theme.shell));
+        assert_eq!(
+            markdown("snake_case_name", &theme),
+            [Line::raw("snake_case_name")]
+        );
+        assert_eq!(
+            markdown("```\n**x** `y` _z_\n```", &theme),
+            [Line::styled("  **x** `y` _z_", theme.shell)]
+        );
+
+        let md = markdown("*it* and __b__ [docs](http://x)", &theme);
+        assert_eq!(text(&md[0]), "it and b docs http://x");
+        assert_eq!(md[0].spans[0], Span::raw("it").italic());
+        assert_eq!(md[0].spans[2], Span::raw("b").bold());
+        assert_eq!(md[0].spans[4], Span::raw("docs").underlined());
+        assert_eq!(md[0].spans[5], Span::raw(" http://x").dim());
+
+        let md = markdown("- item\n  - sub\n1. **one**", &theme);
+        let texts: Vec<String> = md.iter().map(text).collect();
+        assert_eq!(texts, ["• item", "  • sub", "1. one"]);
+        let ascii = markdown("- item", &Theme::new(false, true));
+        assert_eq!(text(&ascii[0]), "- item");
+
+        let md = markdown("> quoted\n---", &theme);
+        assert_eq!(text(&md[0]), "│ quoted");
+        assert_eq!(md[0].style, Style::new().dim());
+        assert_eq!(md[1], Line::raw("─".repeat(8)).dim());
+
+        let md = markdown("| a | bb |\n|---|---|\n| ccc | d |", &theme);
+        let texts: Vec<String> = md.iter().map(text).collect();
+        assert_eq!(texts, ["a    bb", "───────", "ccc  d"]);
+        assert_eq!(md[0].style, Style::new().bold());
+        assert_eq!(md[2].style, Style::new());
+
+        assert_eq!(markdown("# Title", &theme), [Line::raw("Title").bold()]);
     }
 
     #[test]
