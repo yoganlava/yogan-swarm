@@ -1,4 +1,4 @@
-- [ ] **T41 Running rows show the step and idle time**
+- [x] **T41 Running rows show the step and idle time**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Try it (Working group).
 
