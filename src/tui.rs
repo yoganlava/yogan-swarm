@@ -347,6 +347,10 @@ struct App {
     run: RunTab,
     /// Tasks whose run script is running.
     serving: Vec<String>,
+    /// Each Running task's latest tool call and when its stream last wrote.
+    steps: Vec<(String, (String, String), SystemTime)>,
+    /// `[watch] stall_after`; a Running row's quiet time turns amber at half of it.
+    stall_after: Duration,
     settings: Option<Settings>,
     /// Running in VS Code's terminal.
     vscode: bool,
@@ -484,6 +488,8 @@ pub fn run(repo: &Path) -> Result<()> {
         sessions: config::load(repo).map_or(0, |c| c.watch.max_handoffs + 1),
         run: RunTab::default(),
         serving: Vec::new(),
+        steps: Vec::new(),
+        stall_after: config::load(repo).map_or(Duration::MAX, |c| c.watch.stall_after),
         settings: None,
         vscode: vscode(),
         editing: None,
@@ -813,6 +819,16 @@ impl App {
         self.serving = (self.tasks.iter())
             .filter(|(t, _)| t.slot.is_some() && slot::running(state, &t.id).is_some())
             .map(|(t, _)| t.id.clone())
+            .collect();
+        self.steps = (self.tasks.iter())
+            .filter(|(t, _)| t.status == Status::Running)
+            .filter_map(|(t, _)| {
+                let log = state.join(format!("logs/{}.jsonl", t.id));
+                let quiet = fs::metadata(&log).and_then(|m| m.modified()).ok()?;
+                let slot = t.slot.map(|n| state.join("slots").join(n.to_string()));
+                let call = activity(&log, &slot.unwrap_or_default()).pop()?;
+                Some((t.id.clone(), call, quiet))
+            })
             .collect();
         Ok(())
     }
@@ -1239,7 +1255,8 @@ impl App {
     fn save_settings(&mut self) -> Result<PathBuf> {
         let s = self.settings.as_mut().context("Settings isn't open")?;
         let path = s.save(&self.repo, &config::home()?)?;
-        self.sessions = config::load(&self.repo)?.watch.max_handoffs + 1;
+        let watch = config::load(&self.repo)?.watch;
+        (self.sessions, self.stall_after) = (watch.max_handoffs + 1, watch.stall_after);
         Ok(path)
     }
 
@@ -2270,7 +2287,6 @@ fn list(
             rows.push(Some(i));
             let age = since.and_then(|s| now.duration_since(s).ok());
             let age = age.map(short).unwrap_or_default();
-            // ponytail: the step is the status; T16's Activity knows the real one (testing, editing)
             let right = match t.status {
                 Status::Running => format!("working · {age}"),
                 Status::Checking => format!("gate · {age}"),
@@ -2284,6 +2300,12 @@ fn list(
             items.push(ListItem::new(row(
                 t, depth, &right, sel, width, theme, tick,
             )));
+            if let Some((_, (tool, target), at)) = app.steps.iter().find(|s| s.0 == t.id) {
+                let quiet = now.duration_since(*at).unwrap_or_default();
+                let late = quiet > app.stall_after / 2;
+                items.push(ListItem::new(step(tool, target, quiet, late, width, theme)));
+                rows.push(Some(i));
+            }
             i += 1;
         }
     }
@@ -2306,6 +2328,33 @@ fn list(
         ))
     });
     hits.targets.extend(rows);
+}
+
+/// `      edit src/retry.rs…  quiet 2m`, dim under a Running row; `quiet` is amber when `late`.
+fn step(
+    tool: &str,
+    target: &str,
+    quiet: Duration,
+    late: bool,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let quiet = format!("quiet {}", short(quiet));
+    let left = format!("{} {target}", verb(tool, theme).0);
+    let left = truncate(
+        &left,
+        width.saturating_sub(7 + quiet.width()),
+        theme.ellipsis,
+    );
+    let pad = width.saturating_sub(6 + left.width() + quiet.width());
+    let quiet = match late {
+        true => Span::styled(quiet, theme.amber),
+        false => Span::raw(quiet).dim(),
+    };
+    Line::from(vec![
+        Span::raw(format!("      {left}{}", " ".repeat(pad))).dim(),
+        quiet,
+    ])
 }
 
 /// `▌ ⠋ title…          working · 4m`: never wraps, the title gives way.
@@ -2747,16 +2796,7 @@ fn activity_tab(
     let end = calls.len() - from_tail(calls.len(), area.height, scroll);
     let shown = &calls[end.saturating_sub(area.height as usize)..end];
     let lines = shown.iter().map(|(tool, target)| {
-        let (verb, style) = match tool.as_str() {
-            "Edit" | "NotebookEdit" => ("edit", Style::new().fg(theme.accent)),
-            "Write" => ("write", Style::new().fg(theme.accent)),
-            "Bash" => ("run", Style::new().fg(theme.shell)),
-            "Read" => ("read", Style::new().dim()),
-            "Grep" | "Glob" => ("search", Style::new().dim()),
-            NUDGE => ("↻ nudged", Style::new().fg(theme.amber)),
-            HANDOFF => ("⇢ handoff", Style::new()),
-            other => (other, Style::new()),
-        };
+        let (verb, style) = verb(tool, theme);
         let target = truncate(
             target,
             width.saturating_sub(verb.width().max(7) + 1),
@@ -2769,6 +2809,20 @@ fn activity_tab(
         Line::from(vec![Span::styled(format!("{verb:<7} "), style), target])
     });
     f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
+}
+
+/// The Activity verb and style for a tool call's tool.
+fn verb<'a>(tool: &'a str, theme: &Theme) -> (&'a str, Style) {
+    match tool {
+        "Edit" | "NotebookEdit" => ("edit", Style::new().fg(theme.accent)),
+        "Write" => ("write", Style::new().fg(theme.accent)),
+        "Bash" => ("run", Style::new().fg(theme.shell)),
+        "Read" => ("read", Style::new().dim()),
+        "Grep" | "Glob" => ("search", Style::new().dim()),
+        NUDGE => ("↻ nudged", Style::new().fg(theme.amber)),
+        HANDOFF => ("⇢ handoff", Style::new()),
+        other => (other, Style::new()),
+    }
 }
 
 /// The checks as a table, then the tail of each failing step's output from the gate log.
@@ -2974,6 +3028,8 @@ mod tests {
             sessions: 3,
             run: RunTab::default(),
             serving: Vec::new(),
+            steps: Vec::new(),
+            stall_after: Duration::from_secs(15 * 60),
             settings: None,
             vscode: false,
             editing: None,
@@ -3514,6 +3570,45 @@ mod tests {
         assert!(app.task().is_none());
         app.selected = 2;
         assert_eq!(app.task().unwrap().0.id, "t1");
+    }
+
+    #[test]
+    fn running_rows_show_the_step() {
+        let (mut app, now) = app();
+        let mut stuck = app.tasks[2].clone();
+        stuck.0.id = "t5".into();
+        stuck.0.title = "Cache the rate table".into();
+        app.tasks.insert(3, stuck);
+        let ago = |m: u64| now - Duration::from_secs(m * 60);
+        let call = |tool: &str, target: &str| (tool.to_string(), target.to_string());
+        app.steps = vec![
+            ("t3".into(), call("Edit", "src/retry.rs"), ago(2)),
+            ("t5".into(), call("Bash", "cargo test -p rates"), ago(9)),
+        ];
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "│ ▌ ✓ Reject negative max_delay          4m ││ Summary ▾                                           │",
+                "│   ✗ Bump sqlx to 0.9                   1h ││ Reject negative max_delay                           │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ Review · u/reject-negative · slot 1 · opus/high     │",
+                "│       edit src/retry.rs          quiet 2m ││                                                     │",
+                "│   ⠋ Cache the rate table    working · 12m ││ max_delay below zero now fails at parse time.       │",
+                "│       run cargo test -p rates    quiet 9m ││                                                     │",
+                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 2  ○ 1   m  open PR  r  reply  d  diff  x  discard  ?  more           ",
+            ]
+        );
+        // past half of the 15m stall_after, the quiet time turns amber
+        let buf = term.backend().buffer();
+        assert_ne!(buf[(36, 4)].fg, theme.amber);
+        assert_eq!(buf[(36, 6)].fg, theme.amber);
     }
 
     #[test]
