@@ -2,6 +2,7 @@
 //! the state directory; workers run detached, so closing it changes nothing.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -376,6 +377,9 @@ struct App {
     gate_log: String,
     /// The selected task's changed files as (path, added, deleted).
     diff: Vec<(String, u64, u64)>,
+    /// Each of `diff`'s files' hunk lines, and which files the Diff tab shows them for.
+    hunks: Vec<Vec<String>>,
+    unfolded: BTreeSet<usize>,
     /// Which task and file version `gate_log` and `diff` were read for.
     loaded: Option<(String, Option<SystemTime>)>,
     /// Asking whether to discard the selected task.
@@ -476,8 +480,8 @@ impl Hits {
 }
 
 /// What a click does: press a key, or one of the things with no key: select a list row, fold
-/// a group, dismiss the info toast, start dragging the divider, or scroll the detail pane to
-/// an offset.
+/// a group, dismiss the info toast, start dragging the divider, scroll the detail pane to
+/// an offset, fold or unfold a Diff file, or open Diff at a finding's file.
 #[derive(Clone, Copy)]
 enum Target {
     Key(KeyEvent),
@@ -486,6 +490,8 @@ enum Target {
     Divider,
     Scroll(u16),
     Fold(usize),
+    File(usize),
+    Location(usize),
 }
 
 /// The detail pane's scroll offset, and the scrollbar its tab asked for this frame as (area,
@@ -599,6 +605,8 @@ pub fn run(repo: &Path) -> Result<()> {
         activity: Vec::new(),
         gate_log: String::new(),
         diff: Vec::new(),
+        hunks: Vec::new(),
+        unfolded: BTreeSet::new(),
         loaded: None,
         confirm: false,
         pager: None,
@@ -989,7 +997,7 @@ impl App {
         self.tab == FINDINGS && self.task().is_some()
     }
 
-    /// Whether `j/k` and `enter` act on the Diff tab's files.
+    /// Whether `j/k`, `enter` and `o` act on the Diff tab's files.
     fn on_diff(&self) -> bool {
         self.detail && self.tab == DIFF && self.task().is_some()
     }
@@ -1220,6 +1228,12 @@ impl App {
                     return true;
                 }
                 KeyCode::Enter => {
+                    if !self.unfolded.remove(&self.diff_file) {
+                        self.unfolded.insert(self.diff_file);
+                    }
+                    return true;
+                }
+                KeyCode::Char('o') => {
                     if let Err(e) = self.open_diff() {
                         self.notice = Some(format!("{e:#}"));
                     }
@@ -1323,6 +1337,9 @@ impl App {
             self.scroll.set(0);
             self.diff_file = 0;
         }
+        if self.selected != before.0 {
+            self.unfolded.clear();
+        }
         true
     }
 }
@@ -1405,9 +1422,9 @@ impl App {
             let log = self.state.join(format!("logs/{id}.gate.log"));
             self.gate_log = fs::read_to_string(log).unwrap_or_default();
             let base = self.base().unwrap_or_default();
-            self.diff = self
+            (self.diff, self.hunks) = self
                 .slot_dir()
-                .map(|d| diffstat(&d, &base))
+                .map(|d| (diffstat(&d, &base), hunks(&d, &base)))
                 .unwrap_or_default();
             self.diff_file = self.diff_file.min(self.diff.len().saturating_sub(1));
             self.findings = Findings::load(&self.state, &id).unwrap_or_default();
@@ -1638,7 +1655,7 @@ impl App {
         Ok(())
     }
 
-    /// `enter` on the Diff tab: the selected file's diff in VS Code's diff editor against its
+    /// `o` on the Diff tab: the selected file's diff in VS Code's diff editor against its
     /// base version, else paged.
     fn open_diff(&mut self) -> Result<()> {
         let (t, _) = self.task().context("no task selected")?;
@@ -1741,11 +1758,24 @@ impl App {
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Fold(g))) if !modal => {
                 self.folded[g] = !self.folded[g];
             }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::File(i))) if !modal => {
+                (self.detail, self.diff_file) = (true, i);
+                if !self.unfolded.remove(&i) {
+                    self.unfolded.insert(i);
+                }
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Location(i))) if !modal => {
+                (self.detail, self.tab, self.diff_file) = (true, DIFF, i);
+                self.unfolded = BTreeSet::from([i]);
+                // with only file `i` unfolded its row is `i`, so this puts it at the top
+                self.scroll.set(i as u16);
+            }
             _ => {}
         }
         if self.selected != before {
             self.scroll.set(0);
             self.diff_file = 0;
+            self.unfolded.clear();
         }
         true
     }
@@ -2125,6 +2155,19 @@ fn diffstat(slot: &Path, base: &str) -> Vec<(String, u64, u64)> {
         .collect()
 }
 
+/// Each file's lines from its first `@@` in `git diff` against the base, in `diffstat`'s order.
+fn hunks(slot: &Path, base: &str) -> Vec<Vec<String>> {
+    let out = git(slot, &["diff", &format!("{base}...HEAD")]).unwrap_or_default();
+    let out = format!("\n{out}");
+    let files = out.split("\ndiff --git ").skip(1);
+    files
+        .map(|f| {
+            let lines = f.lines().skip_while(|l| !l.starts_with("@@"));
+            lines.map(|l| l.replace('\t', "    ")).collect()
+        })
+        .collect()
+}
+
 /// Below this many rows, the header and footer share one line, the list drops its group headings
 /// and the detail pane shows only the active tab's name.
 const COMPACT: u16 = 24;
@@ -2201,7 +2244,12 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         ]);
         keys
     } else if app.on_diff() {
-        let keys = [("j/k", "file"), ("enter", "file diff"), ("d", "full diff")];
+        let keys = [
+            ("j/k", "file"),
+            ("enter", "fold"),
+            ("o", "file diff"),
+            ("d", "full diff"),
+        ];
         [
             &keys[..],
             &[("tab", "pane"), ("1-6", "tabs"), ("?", "more")],
@@ -3110,13 +3158,10 @@ fn detail_body(
         2 => gate_tab(f, body, t, &app.gate_log, theme, &app.scroll),
         FINDINGS => {
             let cursor = app.on_findings().then_some(app.finding);
-            findings_tab(f, body, &app.findings, cursor, theme, &app.scroll)
+            findings_tab(f, body, app, cursor, theme)
         }
         RUN => run_tab(f, body, t, &app.run, theme, &app.scroll),
-        _ => {
-            let cursor = app.on_diff().then_some(app.diff_file);
-            diff_tab(f, body, &app.diff, cursor, theme, &app.scroll)
-        }
+        _ => diff_tab(f, body, app, theme),
     }
 }
 
@@ -3488,15 +3533,12 @@ fn base64(bytes: &[u8]) -> String {
 
 /// The critic's findings by what became of them, each with its evidence and the worker's or the
 /// human's reply; `cursor` marks the selected one of the actionable (open, disputed, optional).
-fn findings_tab(
-    f: &mut Frame,
-    area: Rect,
-    fs: &Findings,
-    cursor: Option<usize>,
-    theme: &Theme,
-    scroll: &Scroll,
-) {
+/// A location in the diff is a click target that opens it there.
+fn findings_tab(f: &mut Frame, area: Rect, app: &App, cursor: Option<usize>, theme: &Theme) {
+    let fs = &app.findings;
     let mut lines = Vec::new();
+    // (line, column, width, diff file) of each location in the diff
+    let mut locs = Vec::new();
     if let Some(e) = &fs.error {
         lines.push(Line::styled(
             format!("The critic didn't finish: {e}"),
@@ -3528,11 +3570,22 @@ fn findings_tab(
                 Severity::Minor => Span::raw(theme.queued).dim(),
             };
             let claim = Span::raw(x.claim.clone());
+            let path = path_line(&x.location).0;
+            let file = app.diff.iter().position(|d| d.0 == path);
+            let at = Span::raw(x.location.clone());
+            if let Some(file) = file {
+                locs.push((lines.len(), 3 + glyph.width(), at.width(), file));
+            }
             lines.push(Line::from(vec![
                 Span::styled(if sel { theme.bar } else { " " }, theme.accent),
                 Span::raw(" "),
                 glyph,
-                Span::raw(format!(" {} ", x.location)).dim(),
+                Span::raw(" "),
+                match file {
+                    Some(_) => at.fg(theme.accent).underlined(),
+                    None => at.dim(),
+                },
+                Span::raw(" "),
                 if sel { claim.bold() } else { claim },
             ]));
             if !x.evidence.is_empty() {
@@ -3546,12 +3599,18 @@ fn findings_tab(
     if lines.is_empty() {
         lines.push(Line::raw("No findings yet.").dim());
     }
-    scrolled(
-        f,
-        area,
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        scroll,
-    );
+    let wrapped =
+        |lines: &[Line<'static>]| Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    scrolled(f, area, wrapped(&lines), &app.scroll);
+    let top = app.scroll.get() as usize;
+    let targets = locs.into_iter().filter_map(|(line, x, w, file)| {
+        let row = wrapped(&lines[..line]).line_count(area.width);
+        let y = row.checked_sub(top).filter(|y| *y < area.height as usize)?;
+        let rect = Rect::new(area.x + x as u16, area.y + y as u16, w as u16, 1);
+        let hint = "click · show it in the diff".into();
+        Some((rect.intersection(area), Target::Location(file), hint))
+    });
+    app.hits.borrow_mut().targets.extend(targets);
 }
 
 /// One line per tool call, following the tail: edits in the accent, shell commands in a
@@ -3676,55 +3735,117 @@ fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scrol
     f.render_widget(Paragraph::new(lines.split_off(skip)), output);
 }
 
-/// git-style `+`/`-` counts with bars scaled to the largest change; `cursor` marks the file
-/// `enter` opens, and stays in view.
-fn diff_tab(
-    f: &mut Frame,
-    area: Rect,
-    files: &[(String, u64, u64)],
-    cursor: Option<usize>,
-    theme: &Theme,
-    scroll: &Scroll,
-) {
+/// git-style `+`/`-` counts with bars scaled to the largest change, and the unfolded files'
+/// hunks with each finding under its line; `cursor` marks the file `enter` folds, and stays in
+/// view.
+fn diff_tab(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let files = &app.diff;
     if files.is_empty() {
         f.render_widget(Line::raw("No changes yet.").dim(), area);
         return;
     }
+    let cursor = app.on_diff().then_some(app.diff_file);
     let (added, deleted) = files.iter().fold((0, 0), |(a, d), f| (a + f.1, d + f.2));
     let max = files.iter().map(|f| f.1 + f.2).max().unwrap_or(1).max(1);
     let bar_width = 20u64.min(max);
     let bar = if cursor.is_some() { 2 } else { 0 };
-    let path_width = (area.width as usize).saturating_sub(13 + bar + bar_width as usize);
+    let path_width = (area.width as usize).saturating_sub(15 + bar + bar_width as usize);
     let scale = |n: u64| ((n * bar_width).div_ceil(max)) as usize;
-    if let Some(c) = cursor.map(|c| c as u16) {
-        let top = scroll.get().max((c + 1).saturating_sub(area.height));
-        scroll.set(top.min(c));
-    }
-    let mut lines: Vec<Line> = files
-        .iter()
-        .enumerate()
-        .map(|(i, (path, a, d))| {
-            let path = truncate(path, path_width, theme.ellipsis);
-            let sel = cursor == Some(i);
-            let mark = match cursor {
-                Some(_) => format!("{} ", if sel { theme.bar } else { " " }),
-                None => String::new(),
-            };
-            let path = Span::raw(format!("{path:<path_width$} "));
-            Line::from(vec![
-                Span::styled(mark, theme.accent),
-                if sel { path.bold() } else { path },
-                Span::styled(format!("{:>5}", format!("+{a}")), theme.green),
-                Span::styled(format!("{:>6} ", format!("-{d}")), theme.red),
-                Span::styled("+".repeat(scale(*a)), theme.green),
-                Span::styled("-".repeat(scale(*d)), theme.red),
-            ])
-        })
+    let fs = &app.findings;
+    let lists = [
+        ("open", &fs.findings),
+        ("disputed", &fs.disputed),
+        ("optional", &fs.optional),
+        ("fixed", &fs.fixed),
+        ("waived", &fs.waived),
+    ];
+    let found: Vec<_> = (lists.into_iter())
+        .flat_map(|(state, list)| list.iter().map(move |x| (state, path_line(&x.location), x)))
         .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    // each file's line, and the cursor file's first and last line
+    let (mut rows, mut section) = (Vec::new(), (0, 0));
+    for (i, (path, a, d)) in files.iter().enumerate() {
+        let open = app.unfolded.contains(&i);
+        rows.push(lines.len());
+        let sel = cursor == Some(i);
+        let mark = match cursor {
+            Some(_) => format!("{} ", if sel { theme.bar } else { " " }),
+            None => String::new(),
+        };
+        let fold = if open { theme.fold.0 } else { theme.fold.1 };
+        let name = truncate(path, path_width, theme.ellipsis);
+        let name = Span::raw(format!("{name:<path_width$} "));
+        lines.push(Line::from(vec![
+            Span::styled(mark, theme.accent),
+            Span::raw(format!("{fold} ")).dim(),
+            if sel { name.bold() } else { name },
+            Span::styled(format!("{:>5}", format!("+{a}")), theme.green),
+            Span::styled(format!("{:>6} ", format!("-{d}")), theme.red),
+            Span::styled("+".repeat(scale(*a)), theme.green),
+            Span::styled("-".repeat(scale(*d)), theme.red),
+        ]));
+        let mut new = 0;
+        for l in app.hunks.get(i).filter(|_| open).into_iter().flatten() {
+            if l.starts_with("@@") {
+                // `@@ -a,b +c,d @@`: the new file's lines count from c
+                let c = l
+                    .split(" +")
+                    .nth(1)
+                    .and_then(|r| r.split([',', ' ']).next());
+                new = c.and_then(|c| c.parse().ok()).unwrap_or(0);
+                lines.push(Line::styled(format!("    {l}"), theme.shell));
+                continue;
+            }
+            let (n, style) = match l.chars().next() {
+                Some('+') => (Some(new), Style::new().fg(theme.green)),
+                Some('-') => (None, Style::new().fg(theme.red)),
+                Some(' ') => (Some(new), Style::new()),
+                _ => (None, Style::new().dim()),
+            };
+            let num = n.map_or(String::new(), |n| n.to_string());
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {num:>4} ")).dim(),
+                Span::styled(l.clone(), style),
+            ]));
+            let Some(n) = n else { continue };
+            new += 1;
+            let here = found
+                .iter()
+                .filter(|(_, at, _)| at.0 == *path && at.1 == Some(n));
+            for (state, _, x) in here {
+                let head = format!("       {} critic, {state}  ", theme.checking);
+                lines.push(Line::from(vec![
+                    Span::styled(head, theme.amber),
+                    Span::raw(format!("{}  {}", x.location, x.claim)).dim(),
+                ]));
+            }
+        }
+        if sel {
+            section = (rows[i], lines.len() - 1);
+        }
+    }
     lines.push(Line::raw(""));
     let total = format!("{} files changed, +{added} -{deleted}", files.len());
     lines.push(Line::raw(total).dim());
-    scrolled(f, area, Paragraph::new(lines), scroll);
+    if cursor.is_some() {
+        let (first, last) = section;
+        let lo = (first + 1).saturating_sub(area.height as usize);
+        let top = (app.scroll.get() as usize).max(lo).min(last);
+        app.scroll.set(top as u16);
+    }
+    scrolled(f, area, Paragraph::new(lines), &app.scroll);
+    let top = app.scroll.get() as usize;
+    let targets = rows.into_iter().enumerate().filter_map(|(i, row)| {
+        let y = row.checked_sub(top).filter(|y| *y < area.height as usize)?;
+        let rect = Rect::new(area.x, area.y + y as u16, area.width, 1);
+        Some((
+            rect,
+            Target::File(i),
+            "click · show or hide its hunks".into(),
+        ))
+    });
+    app.hits.borrow_mut().targets.extend(targets);
 }
 
 fn help(f: &mut Frame, theme: &Theme) {
@@ -3831,6 +3952,8 @@ mod tests {
             activity: Vec::new(),
             gate_log: String::new(),
             diff: Vec::new(),
+            hunks: Vec::new(),
+            unfolded: BTreeSet::new(),
             loaded: None,
             confirm: false,
             pager: None,
@@ -4182,9 +4305,9 @@ mod tests {
                 "│ gate ● 1/1  ·  change +52 -3 · 3 files  ·  slot 1 · opus │",
                 "│ NEXT   m  open the PR    r  ask for changes              │",
                 "│  Diff ▾                                                  │",
-                "│ ▌ src/config.rs           +12    -3 ++++++--             │",
-                "│   crates/ledger/src/li…   +40    -0 ++++++++++++++++++++ │",
-                "│   assets/logo.png          +0    -0                      │",
+                "│ ▌ ▸ src/config.rs         +12    -3 ++++++--             │",
+                "│   ▸ crates/ledger/src/…   +40    -0 ++++++++++++++++++++ │",
+                "│   ▸ assets/logo.png        +0    -0                      │",
                 "│                                                          │",
                 "│ 3 files changed, +52 -3                                  │",
                 "│                                                          │",
@@ -4193,9 +4316,81 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan   ● 2    j/k  file  enter  file diff  ?  more        ",
+                " yogan   ● 2    j/k  file  enter  fold  ?  more             ",
             ]
         );
+    }
+
+    #[test]
+    fn diff_tab_unfolded_file_with_a_finding() {
+        let (mut app, _) = app();
+        app.diff = vec![("src/config.rs".into(), 2, 1), ("README.md".into(), 1, 0)];
+        app.hunks = vec![
+            [
+                "@@ -40,3 +40,4 @@ impl Retry",
+                " fn parse(raw: &Raw) {",
+                "-    let d = raw.max as u64;",
+                "+    ensure!(raw.max >= 0);",
+                "+    let d = u64::try_from(raw.max)?;",
+                " }",
+            ]
+            .map(String::from)
+            .into(),
+            vec!["@@ -1 +1,2 @@".into()],
+        ];
+        app.unfolded.insert(0);
+        app.findings.fixed = vec![crate::critic::Finding {
+            severity: Severity::Minor,
+            location: "src/config.rs:42".into(),
+            claim: "as u64 wraps".into(),
+            evidence: String::new(),
+            reply: None,
+        }];
+        assert_eq!(
+            tab_screen(app, 4)[5..15],
+            [
+                "│ ▌ ▾ src/config.rs                           +2    -1 ++- ┃",
+                "│     @@ -40,3 +40,4 @@ impl Retry                         ┃",
+                "│     40  fn parse(raw: &Raw) {                            ┃",
+                "│        -    let d = raw.max as u64;                      ┃",
+                "│     41 +    ensure!(raw.max >= 0);                       ┃",
+                "│     42 +    let d = u64::try_from(raw.max)?;             ┃",
+                "│        ◆ critic, fixed  src/config.rs:42  as u64 wraps   ┃",
+                "│     43  }                                                ┃",
+                "│   ▸ README.md                               +1    -0 +   ┃",
+                "│                                                          │",
+            ]
+        );
+    }
+
+    #[test]
+    fn clicking_a_finding_location_opens_it_in_diff() {
+        let (mut app, _) = app();
+        app.findings = sample_findings();
+        app.diff = vec![("src/lib.rs".into(), 1, 0), ("src/retry.rs".into(), 3, 1)];
+        (app.detail, app.tab) = (false, FINDINGS);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        let rows = screen(&term);
+        let row = rows
+            .iter()
+            .position(|r| r.contains("src/retry.rs:9"))
+            .unwrap();
+        let column = rows[row][..rows[row].find("src/retry.rs:9").unwrap()]
+            .chars()
+            .count();
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column as u16 + 2,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.tab, DIFF);
+        assert!(app.on_diff());
+        assert_eq!(app.diff_file, 1);
+        assert_eq!(app.unfolded, BTreeSet::from([1]));
     }
 
     #[test]
