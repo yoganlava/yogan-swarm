@@ -1,4 +1,4 @@
-- [ ] **T39 Keys don't depend on pane focus**
+- [x] **T39 Keys don't depend on pane focus**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Mouse map; T36 footer labels.
 

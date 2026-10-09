@@ -846,9 +846,9 @@ impl App {
         Ok(())
     }
 
-    /// Whether `j/k`, `r` and `x` act on the Findings tab's findings.
+    /// Whether `j/k`, `r` and `x` act on the Findings tab's findings, whichever pane has focus.
     fn on_findings(&self) -> bool {
-        self.detail && self.tab == FINDINGS && self.task().is_some()
+        self.tab == FINDINGS && self.task().is_some()
     }
 
     /// Whether `j/k` and `enter` act on the Diff tab's files.
@@ -1902,8 +1902,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         vec![("ctrl-s", "send"), ("esc", "cancel")]
     } else if app.on_findings() {
         let mut keys = vec![("j/k", "finding")];
-        keys.extend((app.findings.is_disputed(app.finding)).then_some(("r", "uphold")));
-        keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive")));
+        let disputed = app.findings.is_disputed(app.finding);
+        keys.extend(disputed.then_some(("r", "reply to worker")));
+        keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive finding")));
         keys.extend([
             ("o", "open"),
             ("tab", "pane"),
@@ -1958,6 +1959,12 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             .into_iter()
             .filter(|k| valid(k))
             .filter_map(|k| KEYS.into_iter().find(|(key, _)| *key == k))
+            .map(|(k, label)| match (k, selected.map(|t| t.status)) {
+                ("x", Some(_)) => (k, "discard task"),
+                ("r", Some(Status::Review)) => (k, "reply to worker"),
+                ("r", _) => (k, "reply to lead"),
+                _ => (k, label),
+            })
             .take(6)
             .collect();
         keys.push(("?", "more"));
@@ -1985,6 +1992,12 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     let more = keys.last() == Some(&("?", "more"));
     while more && keys.len() > 2 && width(&keys) > footer.width as usize {
         keys.remove(keys.len() - 2);
+    }
+    // still too wide: drop the target from labels like `reply to worker`
+    if more && width(&keys) > footer.width as usize {
+        for (_, label) in &mut keys {
+            *label = label.split(' ').next().unwrap_or_default();
+        }
     }
     let mut line = match app.editing {
         Some(_) => {
@@ -3597,7 +3610,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ○ 3   a  approve  A  approve all  e  edit  r  reply  x  discard  ?  more     ",
+                " yogan · fuse-os  ✓ 1  ○ 3   a  approve  A  approve all  e  edit  r  reply to lead  ?  more         ",
             ]
         );
     }
@@ -3676,7 +3689,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 2  ○ 1   m  open PR  r  reply  d  diff  x  discard  ?  more           ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 2  ○ 1   m  open PR  r  reply to worker  d  diff  ?  more             ",
             ]
         );
         // past half of the 15m stall_after, the quiet time turns amber
@@ -3740,7 +3753,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   p  plan it  r  reply  y  copy  x  discard  ?  more           ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   p  plan it  r  reply to lead  y  copy  x  discard  ?  more   ",
             ]
         );
 
@@ -3880,6 +3893,24 @@ mod tests {
                 " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k  finding  ?  more",
             ]
         );
+    }
+
+    #[test]
+    fn findings_keys_ignore_focus() {
+        let (mut app, _) = app();
+        app.findings = sample_findings();
+        (app.finding, app.detail, app.tab) = (1, false, FINDINGS);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term)[29],
+            " j/k  finding  r  reply to worker  x  waive finding  o  open  tab  pane  1-6  tabs  ?  more         "
+        );
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.reply_for, Some('x'));
+        assert!(!app.confirm);
     }
 
     #[test]
@@ -4159,7 +4190,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more                         ",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
             ]
         );
     }
@@ -4194,23 +4225,23 @@ mod tests {
             [
                 (
                     "review",
-                    " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more     ".into(),
-                    " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more                         ".into(),
+                    " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more ".into(),
+                    " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ".into(),
                 ),
                 (
                     "failed",
-                    " t  retry  c  continue  x  discard  n  new task  1-6  tabs  j/k  move  ?  more  ".into(),
-                    " t  retry  c  continue  x  discard  n  new task  1-6  tabs  j/k  move  ?  more                      ".into(),
+                    " t  retry  c  continue  x  discard task  n  new task  1-6  tabs  ?  more        ".into(),
+                    " t  retry  c  continue  x  discard task  n  new task  1-6  tabs  j/k  move  ?  more                 ".into(),
                 ),
                 (
                     "proposed",
-                    " a  approve  A  approve all  e  edit  r  reply  x  discard  ?  more             ".into(),
-                    " a  approve  A  approve all  e  edit  r  reply  x  discard  n  new task  ?  more                    ".into(),
+                    " a  approve  A  approve all  e  edit  r  reply to lead  ?  more                 ".into(),
+                    " a  approve  A  approve all  e  edit  r  reply to lead  x  discard task  n  new task  ?  more       ".into(),
                 ),
                 (
                     "question",
-                    " p  plan it  r  reply  y  copy  x  discard  n  new task  j/k  move  ?  more     ".into(),
-                    " p  plan it  r  reply  y  copy  x  discard  n  new task  j/k  move  ?  more                         ".into(),
+                    " p  plan it  r  reply to lead  y  copy  x  discard  n  new task  ?  more        ".into(),
+                    " p  plan it  r  reply to lead  y  copy  x  discard  n  new task  j/k  move  ?  more                 ".into(),
                 ),
             ]
         );
@@ -4241,7 +4272,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  r  reply  d  diff  x  discard  ?  more           ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  r  reply to worker  d  diff  ?  more             ",
             ]
         );
 
@@ -4361,7 +4392,7 @@ mod tests {
                 "│                                                                                                  │",
                 "│                                                                                                  │",
                 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
-                " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more                         ",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
             ]
         );
         // the border label unzooms; z zooms again and esc goes back
@@ -4393,7 +4424,7 @@ mod tests {
                 "│                                           ││                       │ this task has no worktree │ │",
                 "│                                           ││                       ╰───────────────────────────╯ │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more                         ",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
             ]
         );
 
