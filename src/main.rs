@@ -32,8 +32,20 @@ enum Command {
 
 #[derive(Subcommand)]
 enum TaskCommand {
-    /// File a proposed task
-    Propose,
+    /// File a proposed task and print its id
+    Propose {
+        #[arg(long)]
+        title: String,
+        /// Id of the task this one builds on
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        crates: Vec<String>,
+        /// A testable criterion, 1 to 5 times
+        #[arg(long, required = true)]
+        accept: Vec<String>,
+        body: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,7 +65,22 @@ fn main() -> anyhow::Result<()> {
             yogan_swarm::worker::run(&std::env::current_dir()?, &id, pr.as_deref())
         }
         Some(Command::Task {
-            command: TaskCommand::Propose,
-        }) => anyhow::bail!("task propose: not built yet (T20)"),
+            command:
+                TaskCommand::Propose {
+                    title,
+                    parent,
+                    crates,
+                    accept,
+                    body,
+                },
+        }) => {
+            let checkout = std::env::current_dir()?;
+            let prefix = yogan_swarm::config::load(&checkout)?.branch_prefix;
+            let dir = yogan_swarm::task::state_dir(&checkout)?;
+            let id =
+                yogan_swarm::task::propose(&dir, &prefix, &title, &body, parent, crates, accept)?;
+            println!("{id}");
+            Ok(())
+        }
     }
 }

@@ -1,4 +1,4 @@
-- [ ] **T20 `yogan task propose`**
+- [x] **T20 `yogan task propose`**
 
 Plan: Lead agent (propose command, Acceptance criteria).
 

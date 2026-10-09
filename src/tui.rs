@@ -548,68 +548,22 @@ impl App {
     fn submit(&mut self) -> Result<()> {
         let c = self.compose.as_ref().context("not composing")?;
         let request = c.request.lines().join("\n");
+        let request = request.trim();
+        let (title, body) = request.split_once('\n').unwrap_or((request, ""));
         let ticket = c.ticket.lines().join("").trim().to_string();
         let cfg = config::load(&self.repo)?;
         let tasks = task::load_all(&self.state)?;
-        let task = new_task(&request, &ticket, &cfg.branch_prefix, &tasks, now_id())?;
+        let task = task::new_task(
+            title,
+            body,
+            &ticket,
+            &cfg.branch_prefix,
+            &tasks,
+            task::now_id(),
+        )?;
         task.save(&self.state)?;
         self.compose = None;
         sched::run(&self.repo)
-    }
-}
-
-/// `t<unix seconds>`, so ids sort by creation.
-fn now_id() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("t{secs}")
-}
-
-/// An approved task from a typed request: the first line is the title, the rest the body.
-fn new_task(request: &str, ticket: &str, prefix: &str, tasks: &[Task], id: String) -> Result<Task> {
-    let request = request.trim();
-    let (title, body) = request.split_once('\n').unwrap_or((request, ""));
-    ensure!(!title.trim().is_empty(), "write a request first");
-    let taken = |s: &str| tasks.iter().any(|t| t.id == s);
-    let mut id = id;
-    while taken(&id) {
-        id.push('a'); // two submits in one second
-    }
-    let slug = slug(title);
-    let branch_taken = |b: &str| tasks.iter().any(|t| t.branch == b);
-    let mut branch = format!("{prefix}{slug}");
-    for n in 2.. {
-        if !branch_taken(&branch) {
-            break;
-        }
-        branch = format!("{prefix}{slug}-{n}");
-    }
-    Ok(Task {
-        id,
-        title: title.trim().into(),
-        body: body.trim().into(),
-        ticket: (!ticket.is_empty()).then(|| ticket.into()),
-        status: Status::Approved,
-        branch,
-        ..Default::default()
-    })
-}
-
-/// `Reject negative max_delay!` → `reject-negative-max-delay`, at most 40 chars.
-fn slug(title: &str) -> String {
-    let lower = title.to_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let slug = words.join("-"); // ASCII only, so any byte cut is a char boundary
-    let slug = slug[..slug.len().min(40)].trim_end_matches('-');
-    if slug.is_empty() {
-        "task".into()
-    } else {
-        slug.into()
     }
 }
 
@@ -1365,35 +1319,6 @@ mod tests {
                 ("Read".into(), "note.txt".into()),
                 ("Write".into(), "out.txt".into())
             ]
-        );
-    }
-
-    #[test]
-    fn composed_task() {
-        let other = Task {
-            id: "t5".into(),
-            branch: "u/reject-negative-max-delay".into(),
-            ..Default::default()
-        };
-        let request = "\n  Reject negative max_delay!\nIt panics later.\n\n";
-        let t = new_task(request, "CC-687", "u/", &[other], "t5".into()).unwrap();
-        assert_eq!(
-            (t.id.as_str(), t.title.as_str()),
-            ("t5a", "Reject negative max_delay!")
-        );
-        assert_eq!(
-            (t.body.as_str(), t.ticket.as_deref()),
-            ("It panics later.", Some("CC-687"))
-        );
-        assert_eq!(
-            (t.status, t.branch.as_str()),
-            (Status::Approved, "u/reject-negative-max-delay-2")
-        );
-        assert!(new_task(" \n", "", "", &[], "t6".into()).is_err());
-        assert_eq!(slug("Ünïcode & ...!"), "n-code");
-        assert_eq!(
-            slug("Split the ledger reconciliation job into per-account batches"),
-            "split-the-ledger-reconciliation-job-into"
         );
     }
 
