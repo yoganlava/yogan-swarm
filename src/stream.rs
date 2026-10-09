@@ -25,9 +25,16 @@ pub enum System {
         session_id: String,
         model: String,
         tools: Vec<String>,
+        #[serde(default)]
+        mcp_servers: Vec<McpServer>,
     },
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpServer {
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +99,7 @@ mod tests {
             session_id,
             model,
             tools,
+            mcp_servers,
         }) = &events[0]
         else {
             panic!("first event is init: {:?}", events[0]);
@@ -99,6 +107,7 @@ mod tests {
         assert_eq!(session_id, "b98a1af4-0d10-40db-a505-3f1141bfa52d");
         assert_eq!(model, "claude-haiku-5-5");
         assert!(tools.contains(&"Read".to_string()));
+        assert!(mcp_servers.is_empty());
 
         let tool_calls: Vec<&str> = events
             .iter()

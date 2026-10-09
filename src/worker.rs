@@ -6,13 +6,43 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rustix::process::{Pid, Signal, kill_process_group, setsid};
 
 use crate::redact::redact;
 use crate::stream::{Event, System};
 use crate::task::{self, Status, Task};
-use crate::{config, slot};
+use crate::{config, shim, slot};
+
+/// Built-in worker denies; a project's `[worker] deny` adds to them.
+const DENY: &[&str] = &[
+    "Bash(git push *)",
+    "Bash(git tag *)",
+    "Bash(git checkout *)",
+    "Bash(git reset *)",
+    "Bash(git stash drop *)",
+    "Bash(git clean *)",
+    "Bash(git worktree *)",
+    "Bash(gh *)",
+    "Bash(psql *)",
+    "WebFetch",
+];
+
+const RULES: &str = "\
+You are a yogan worker running unattended in your own git worktree.
+- Stay within the task's crates and acceptance criteria.
+- Use the least plumbing possible: extend existing endpoints, enums and structs, and add no new \
+events, traits, endpoints or sub-enums unless a criterion requires them. If the change needs more \
+plumbing than the task implies, stop and report instead of building it.
+- Run the project's checks scoped to the touched crates or packages only (`cargo test -p`, never \
+the workspace suite); CI covers the rest.
+- Commit in semantic commits of roughly 300 lines or fewer, with conventional messages such as \
+`fix(ledger): ...`. Never push or open a PR.
+- Never run destructive git: `checkout --`, `reset --hard`, `stash drop`, `clean`, `push --force`.
+- If YOGAN_PORT_BASE is set, your ports are YOGAN_PORT_BASE up to YOGAN_PORT_BASE + \
+YOGAN_PORT_COUNT - 1; never bind any other.
+- End with a plain summary that someone without context can follow, flagging anything you were \
+unsure of.";
 
 /// Starts `yogan worker <id>` for the checkout `repo` in a new session, so neither Ctrl-C
 /// nor a closing terminal reaches it. Returns its pid, which is also its process group.
@@ -61,6 +91,10 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
     let cfg = config::load(repo)?;
     let tasks = task::load_all(state)?;
     let (n, _lock) = slot::claim(state, &tasks, cfg.worker.slots)?.context("no free slot")?;
+    let model = task.model.clone().unwrap_or(cfg.worker.model.clone());
+    let effort = task.effort.clone().unwrap_or(cfg.worker.effort.clone());
+    task.model = Some(model.clone());
+    task.effort = Some(effort.clone());
     task.status = Status::Running;
     task.slot = Some(n);
     task.pid = Some(std::process::id());
@@ -68,22 +102,65 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
 
     // ponytail: always bases on origin/main; T23 bases on the parent's branch
     let dir = slot::prepare(repo, state, n, &task.branch, "origin/main")?;
-    let env = slot::env(repo, &dir, n, task, cfg.ports.as_ref());
+    let mut env = slot::env(repo, &dir, n, task, cfg.ports.as_ref());
+    if repo.join("Cargo.toml").exists() {
+        let home = std::env::home_dir().context("no home directory")?;
+        let wrapper = cfg.cargo.as_ref().and_then(|c| c.wrapper.as_ref());
+        env.extend(shim::env(
+            state,
+            n,
+            &std::env::current_exe()?,
+            &home.join(".local/share/yogan/permits"),
+            cfg.build.max_cargo,
+            wrapper.map(|w| dir.join(w)).as_deref(),
+        )?);
+        env.push(("CARGO_TARGET_DIR", dir.join("target").display().to_string()));
+    }
     let logs = state.join("logs");
     let script = cfg.scripts.as_ref().and_then(|s| s.setup.as_deref());
     let setup_log = logs.join(format!("{}.setup.log", task.id));
     slot::setup(repo, &dir, &env, script, &setup_log)?;
 
-    // the lead always files 1-5 acceptance criteria
-    let prompt = format!(
-        "{}\n\n{}\n\nAcceptance criteria:\n- {}\n",
-        task.title,
-        task.body,
-        task.acceptance.join("\n- ")
-    );
-    let mut claude = Command::new("claude")
-        .args(["-p", &prompt, "--output-format", "stream-json", "--verbose"])
+    let w = &cfg.worker;
+    let allowed = [&w.allowed_tools[..], &w.read_tools[..]].concat();
+    ensure!(!allowed.is_empty(), "[worker] allowed_tools is empty");
+    let mut cmd = Command::new("claude");
+    cmd.args([
+        "-p",
+        &prompt(task),
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ])
+    .args([
+        "--permission-mode",
+        "acceptEdits",
+        "--setting-sources",
+        "project",
+    ])
+    .args([
+        "--model",
+        &model,
+        "--effort",
+        &effort,
+        "--strict-mcp-config",
+    ]);
+    let servers = match &w.mcp_config {
+        Some(file) => {
+            cmd.args(["--mcp-config", file]);
+            mcp_servers(&dir.join(file))?
+        }
+        None => Vec::new(),
+    };
+    let mut claude = cmd
+        .arg("--allowedTools")
+        .args(&allowed)
+        .arg("--disallowedTools")
+        .args(DENY)
+        .args(&w.deny)
+        .args(["--append-system-prompt", RULES])
         .current_dir(&dir)
+        .env_remove("CLAUDE_CODE_EFFORT_LEVEL") // it would override --effort
         .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -92,19 +169,70 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
     fs::create_dir_all(&logs)?;
     let mut log = File::create(logs.join(format!("{}.jsonl", task.id)))?;
     let stdout = claude.stdout.take().context("claude stdout")?;
+    let mut denied = Vec::new();
     for line in BufReader::new(stdout).lines() {
         let line = line?;
         writeln!(log, "{}", redact(&line))?;
-        if let Ok(Event::System(System::Init { session_id, .. })) = serde_json::from_str(&line) {
-            task.sessions.push(session_id);
-            task.save(state)?;
+        match serde_json::from_str(&line) {
+            Ok(Event::System(System::Init {
+                session_id,
+                mcp_servers,
+                ..
+            })) => {
+                task.sessions.push(session_id);
+                task.save(state)?;
+                let extra: Vec<_> = mcp_servers
+                    .into_iter()
+                    .filter(|s| !servers.contains(&s.name))
+                    .map(|s| s.name)
+                    .collect();
+                if !extra.is_empty() {
+                    claude.kill()?;
+                    bail!("unexpected MCP servers: {}", extra.join(", "));
+                }
+            }
+            Ok(Event::Result(r)) => {
+                denied = r
+                    .permission_denials
+                    .into_iter()
+                    .map(|d| d.tool_name)
+                    .collect();
+            }
+            _ => {}
         }
     }
     let status = claude.wait()?;
     ensure!(status.success(), "claude exited with {status}");
+    ensure!(
+        denied.is_empty(),
+        "incomplete: permission denied for {}",
+        denied.join(", ")
+    );
     // ponytail: straight to Review until the gate (T12) adds Checking
     task.status = Status::Review;
     task.save(state)
+}
+
+/// Server names in an `.mcp.json`-style file.
+fn mcp_servers(file: &Path) -> Result<Vec<String>> {
+    let text = fs::read_to_string(file).with_context(|| file.display().to_string())?;
+    let json: serde_json::Value = serde_json::from_str(&text)?;
+    let servers = json["mcpServers"].as_object().into_iter().flatten();
+    Ok(servers.map(|(name, _)| name.clone()).collect())
+}
+
+// the lead always files 1-5 acceptance criteria
+fn prompt(task: &Task) -> String {
+    let mut p = format!(
+        "{}\n\n{}\n\nAcceptance criteria:\n- {}\n",
+        task.title,
+        task.body,
+        task.acceptance.join("\n- ")
+    );
+    if !task.crates.is_empty() {
+        p.push_str(&format!("\nCrates: {}\n", task.crates.join(", ")));
+    }
+    p
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-- [ ] **T11 Worker Claude flags**
+- [x] **T11 Worker Claude flags**
 
 Plan: Workers (launch command, deny list, MCP/settings/permissions bullets, worker rules, "What is enforced"); Configuration (`CLAUDE_CODE_EFFORT_LEVEL`); Open questions and assumptions (`--resume` from the slot).
 

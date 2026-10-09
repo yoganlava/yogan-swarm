@@ -25,6 +25,15 @@ pub struct Worker {
     pub model: String,
     pub effort: String,
     pub slots: u32,
+    /// Relative to the slot, e.g. `.mcp.json`.
+    pub mcp_config: Option<String>,
+    #[serde(default)]
+    pub read_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Added to the built-in deny list.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
