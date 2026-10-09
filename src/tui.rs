@@ -204,10 +204,12 @@ impl Settings {
     }
 }
 
-/// Every color and glyph, so a light-terminal or ASCII variant is one swap. Nothing paints a
-/// background: the terminal's own theme shows through.
+/// Every color and glyph, so a light-terminal or ASCII variant is one swap. Only key chips paint
+/// a background: elsewhere the terminal's own theme shows through.
 pub struct Theme {
     accent: Color,
+    /// Behind a footer key.
+    key: Color,
     /// Shell commands in Activity.
     shell: Color,
     green: Color,
@@ -240,6 +242,7 @@ impl Theme {
         let glyphs = |fancy, plain| if ascii { plain } else { fancy };
         Theme {
             accent: rgb(122, 162, 247, Color::Blue),
+            key: rgb(42, 47, 69, Color::Black),
             shell: rgb(125, 207, 255, Color::Cyan),
             green: rgb(158, 206, 106, Color::Green),
             amber: rgb(224, 175, 104, Color::Yellow),
@@ -1819,14 +1822,14 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             ("o", "open"),
             ("tab", "pane"),
             ("1-6", "tabs"),
-            ("?", "help"),
+            ("?", "more"),
         ]);
         keys
     } else if app.on_diff() {
         let keys = [("j/k", "file"), ("enter", "file diff"), ("d", "full diff")];
         [
             &keys[..],
-            &[("tab", "pane"), ("1-6", "tabs"), ("?", "help")],
+            &[("tab", "pane"), ("1-6", "tabs"), ("?", "more")],
         ]
         .concat()
     } else if app.instruction.is_some() {
@@ -1835,38 +1838,68 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         let push = ("enter", "push and open PR");
         vec![push, ("g", "regenerate"), ("e", "edit"), ("esc", "back")]
     } else {
-        // only the keys that do something for the selected task
-        KEYS.into_iter()
-            .filter(|(k, _)| match *k {
-                "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
-                "x" => selected.is_some() || failed || answered,
-                "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
-                "c" => {
-                    selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed))
-                }
-                "w" => selected.is_some_and(|t| t.status == Status::Review),
-                "p" | "y" => answered,
-                "1-6" => selected.is_some(),
-                "R" => selected
-                    .is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id)),
-                "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
-                "r" => {
-                    answered
-                        || selected
-                            .is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
-                }
-                "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
-                "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
-                _ => true,
-            })
-            .collect()
+        // up to six keys that do something for the selection, the one that moves it on first
+        let valid = |k: &str| match k {
+            "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
+            "x" => selected.is_some() || failed || answered,
+            "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
+            "c" => selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed)),
+            "w" => selected.is_some_and(|t| t.status == Status::Review),
+            "p" | "y" => answered,
+            "1-6" => selected.is_some(),
+            "R" => {
+                selected.is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id))
+            }
+            "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
+            "r" => {
+                answered
+                    || selected
+                        .is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
+            }
+            "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
+            "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
+            _ => true,
+        };
+        let first: &[&str] = match selected.map(|t| t.status) {
+            Some(Status::Review) => &["m", "r", "d", "x", "c", "w", "R", "o"],
+            Some(Status::Failed) => &["t", "c", "x", "d", "o"],
+            Some(Status::Proposed) => &["a", "A", "e", "r", "x"],
+            _ if answered => &["p", "r", "y", "x"],
+            _ => &["t", "d", "o", "R", "x"],
+        };
+        let mut keys: Vec<_> = [first, &["n", "1-6", "j/k", "tab", "q"]]
+            .concat()
+            .into_iter()
+            .filter(|k| valid(k))
+            .filter_map(|k| KEYS.into_iter().find(|(key, _)| *key == k))
+            .take(6)
+            .collect();
+        keys.push(("?", "more"));
+        keys
     };
-    let keys = keys.iter().flat_map(|(key, label)| {
+    let chip = |(key, label): &(&str, &str)| {
         [
-            Span::styled(format!(" {key} "), theme.accent),
-            Span::raw(format!("{label} ")).dim(),
+            Span::styled(format!(" {key} "), theme.accent)
+                .bold()
+                .bg(theme.key),
+            Span::raw(format!(" {label} ")).dim(),
         ]
-    });
+    };
+    let prefix = if compact {
+        header_line(app, theme).spans
+    } else {
+        Vec::new()
+    };
+    let width = |keys: &[(&str, &str)]| {
+        let spans = prefix.iter().cloned().chain(keys.iter().flat_map(chip));
+        Line::from(spans.collect::<Vec<_>>()).width()
+    };
+    // a `? more` footer drops keys from before it until the line fits, keeping the first
+    let mut keys = keys;
+    let more = keys.last() == Some(&("?", "more"));
+    while more && keys.len() > 2 && width(&keys) > footer.width as usize {
+        keys.remove(keys.len() - 2);
+    }
     let mut line = match (&app.notice, &app.info) {
         (Some(notice), _) => vec![Span::styled(format!(" {notice}"), theme.red)],
         (None, Some(info)) => vec![Span::styled(format!(" {info}"), theme.accent)],
@@ -1876,11 +1909,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
                 theme.accent,
             )]
         }
-        (None, None) => keys.collect(),
+        (None, None) => keys.iter().flat_map(chip).collect(),
     };
-    if compact {
-        line.splice(0..0, header_line(app, theme).spans);
-    }
+    line.splice(0..0, prefix);
     f.render_widget(Line::from(line), footer);
     if app.help {
         help(f, theme);
@@ -2898,7 +2929,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  ?  more  ",
             ]
         );
     }
@@ -2985,7 +3016,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  ?  more  ",
             ]
         );
     }
@@ -3023,7 +3054,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   r  reply  ?  more    ",
             ]
         );
     }
@@ -3055,7 +3086,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  ?  more  ",
             ]
         );
     }
@@ -3112,7 +3143,7 @@ mod tests {
                 "│   max handoffs       2                                   │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " j/k field  ←→ change  g global file  ctrl-s save  esc close",
+                " j/k  field  ←→  change  g  global file  ctrl-s  save  esc  ",
             ]
         );
 
@@ -3164,7 +3195,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k file  enter file ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k  file  ?  more   ",
             ]
         );
     }
@@ -3340,7 +3371,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ○ 3   n new task  j/k move  tab pane  1-6 tabs  a approve  A approve all  e e",
+                " yogan · fuse-os  ✓ 1  ○ 3   a  approve  A  approve all  e  edit  r  reply  x  discard  ?  more     ",
             ]
         );
     }
@@ -3381,7 +3412,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  t retry  x discard  ? help  q",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   t  retry  x  discard  n  new task  j/k  move  ?  more        ",
             ]
         );
         assert!(app.task().is_none());
@@ -3444,7 +3475,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  r reply  p plan it  y copy  x",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   p  plan it  r  reply  y  copy  x  discard  ?  more           ",
             ]
         );
 
@@ -3581,7 +3612,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k finding  r uphold",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k  finding  ?  more",
             ]
         );
     }
@@ -3797,7 +3828,7 @@ mod tests {
                 "│ - adds a check                                           │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   enter push and open P",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   enter  push and open ",
             ]
         );
     }
@@ -3863,7 +3894,59 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR  r reply  x discard  ? help  q quit  c ",
+                " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more                         ",
+            ]
+        );
+    }
+
+    #[test]
+    fn footer_fits_at_80_and_100_columns() {
+        let footer = |app: &App, now, w| {
+            let mut term = Terminal::new(TestBackend::new(w, 24)).unwrap();
+            let theme = Theme::new(false, false);
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            screen(&term).pop().unwrap()
+        };
+        let (mut app, now) = app();
+        let mut states = Vec::new();
+        states.push(("review", footer(&app, now, 80), footer(&app, now, 100)));
+        app.selected = 1;
+        states.push(("failed", footer(&app, now, 80), footer(&app, now, 100)));
+        app.tasks[1].0.status = Status::Proposed;
+        states.push(("proposed", footer(&app, now, 80), footer(&app, now, 100)));
+        app.requests = vec![Request {
+            id: "r5".into(),
+            text: "How are tasks saved?".into(),
+            mode: Mode::Ask,
+            status: Phase::Done,
+            ..Default::default()
+        }];
+        app.selected = 0;
+        states.push(("question", footer(&app, now, 80), footer(&app, now, 100)));
+        // six keys at most, then ? more; at 80 columns the lowest-priority key gives way
+        assert_eq!(
+            states,
+            [
+                (
+                    "review",
+                    " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more     ".into(),
+                    " m  open PR  r  reply  d  diff  x  discard  c  continue  w  rewind  ?  more                         ".into(),
+                ),
+                (
+                    "failed",
+                    " t  retry  c  continue  x  discard  n  new task  1-6  tabs  j/k  move  ?  more  ".into(),
+                    " t  retry  c  continue  x  discard  n  new task  1-6  tabs  j/k  move  ?  more                      ".into(),
+                ),
+                (
+                    "proposed",
+                    " a  approve  A  approve all  e  edit  r  reply  x  discard  ?  more             ".into(),
+                    " a  approve  A  approve all  e  edit  r  reply  x  discard  n  new task  ?  more                    ".into(),
+                ),
+                (
+                    "question",
+                    " p  plan it  r  reply  y  copy  x  discard  n  new task  j/k  move  ?  more     ".into(),
+                    " p  plan it  r  reply  y  copy  x  discard  n  new task  j/k  move  ?  more                         ".into(),
+                ),
             ]
         );
     }
@@ -3893,7 +3976,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR  ",
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   m  open PR  r  reply  d  diff  x  discard  ?  more           ",
             ]
         );
 
@@ -3931,7 +4014,7 @@ mod tests {
                 "│   o Split the ledger reconciliation job into per-acc~ 2m │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  + 1  x 1  | 1  o 1   n new task  j/k move ",
+                " yogan · fuse-os  + 1  x 1  | 1  o 1   x  discard  ?  more  ",
             ]
         );
     }
