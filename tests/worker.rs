@@ -77,7 +77,7 @@ fn worker_runs_setup_then_claude() {
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
-    let worker = |id: &str, setup: &str, mcp: &str, denied: &str| {
+    let worker = |id: &str, setup: &str, mcp: &str, denied: &str, effort: Option<&str>| {
         let worker_cfg = "[worker]\nmcp_config = \".mcp.json\"\nallowed_tools = [\"Read\"]\n\
                           read_tools = [\"mcp__graft__find\"]\ndeny = [\"Bash(curl *)\"]\n";
         let scripts = format!("[scripts]\nsetup = \"{setup}\"\n[cargo]\nnofile = 777\n");
@@ -88,6 +88,7 @@ fn worker_runs_setup_then_claude() {
             branch: format!("u/{id}"),
             status: Status::Approved,
             model: Some("opus-x".into()),
+            effort: effort.map(Into::into),
             ..Default::default()
         };
         task.save(&state).unwrap();
@@ -107,7 +108,7 @@ fn worker_runs_setup_then_claude() {
         (ok, tasks.into_iter().find(|t| t.id == id).unwrap())
     };
 
-    let (ok, t1) = worker("t1", "echo ready", "graft", "");
+    let (ok, t1) = worker("t1", "echo ready", "graft", "", None);
     assert!(ok);
     assert_eq!(t1.status, Status::Review);
     // the task's model beats config; effort falls back to the [worker] default
@@ -147,7 +148,7 @@ fn worker_runs_setup_then_claude() {
     assert!(log.contains("[REDACTED]") && !log.contains("ghp_"), "{log}");
 
     // a failing setup fails the task with its log path, before Claude starts
-    let (ok, t2) = worker("t2", "echo db down; exit 3", "graft", "");
+    let (ok, t2) = worker("t2", "echo db down; exit 3", "graft", "", None);
     assert!(!ok);
     assert_eq!((t2.status, t2.slot), (Status::Failed, Some(2)));
     let summary = t2.summary.unwrap();
@@ -155,7 +156,7 @@ fn worker_runs_setup_then_claude() {
     assert!(!state.join("logs/t2.jsonl").exists());
 
     // an MCP server the project didn't configure stops the worker
-    let (ok, t3) = worker("t3", "true", "notion", "");
+    let (ok, t3) = worker("t3", "true", "notion", "", None);
     assert!(!ok);
     assert_eq!(t3.status, Status::Failed);
     assert_eq!(
@@ -165,11 +166,18 @@ fn worker_runs_setup_then_claude() {
 
     // a denied tool means the work is incomplete
     let denial = r#"{"tool_name":"Write","tool_input":{}}"#;
-    let (ok, t4) = worker("t4", "true", "graft", denial);
+    let (ok, t4) = worker("t4", "true", "graft", denial, None);
     assert!(!ok);
     assert_eq!(t4.status, Status::Failed);
     let summary = t4.summary.unwrap();
     assert_eq!(summary, "incomplete: permission denied for Write");
+
+    // an unknown effort fails before Claude starts
+    let (ok, t5) = worker("t5", "true", "graft", "", Some("bogus"));
+    assert!(!ok);
+    assert_eq!(t5.status, Status::Failed);
+    assert!(t5.summary.unwrap().contains("\"bogus\""));
+    assert!(!state.join("logs/t5.jsonl").exists());
 
     fs::remove_dir_all(&root).unwrap();
 }

@@ -16,6 +16,8 @@ use crate::stream::{Event, System};
 use crate::task::{self, Status, Task};
 use crate::{config, shim, slot};
 
+const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// Built-in worker denies; a project's `[worker] deny` adds to them.
 const DENY: &[&str] = &[
     "Bash(git push *)",
@@ -103,6 +105,12 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task) -> Result<()> {
     let (n, _lock) = slot::claim(state, &tasks, cfg.worker.slots)?.context("no free slot")?;
     let model = task.model.clone().unwrap_or(cfg.worker.model.clone());
     let effort = task.effort.clone().unwrap_or(cfg.worker.effort.clone());
+    // claude only warns on an unknown effort and runs on its default
+    ensure!(
+        EFFORTS.contains(&effort.as_str()),
+        "unknown effort {effort:?}, expected one of {}",
+        EFFORTS.join(", ")
+    );
     task.model = Some(model.clone());
     task.effort = Some(effort.clone());
     task.status = Status::Running;
