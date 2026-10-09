@@ -74,7 +74,7 @@ const RUN: usize = 5;
 /// Lines a scroll key moves the detail pane.
 const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 23] = [
+const KEYS: [(&str, &str); 24] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -98,6 +98,7 @@ const KEYS: [(&str, &str); 23] = [
     (",", "settings"),
     ("pgup/pgdn", "scroll"),
     ("z", "zoom"),
+    ("]", "next for you"),
 ];
 
 /// How a Settings field changes: cycling through choices, or stepping a number within bounds.
@@ -1023,6 +1024,15 @@ impl App {
         }
     }
 
+    /// `]`: selects the next Needs you row, wrapping round, and unfolds the group.
+    fn next_need(&mut self) {
+        let need = &self.groups()[0];
+        let at = need.iter().position(|&r| r == self.selected);
+        if let Some(&r) = need.get(at.map_or(0, |i| (i + 1) % need.len())) {
+            (self.selected, self.folded[0]) = (r, false);
+        }
+    }
+
     /// The selected row's request, if it's one.
     fn request(&self) -> Option<&Request> {
         self.requests.get(self.selected)
@@ -1315,6 +1325,7 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_by(true),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(false),
+            KeyCode::Char(']') => self.next_need(),
             KeyCode::Tab => self.detail = !self.detail,
             KeyCode::PageDown | KeyCode::PageUp => self.scroll_by(key.code == KeyCode::PageDown),
             _ => {}
@@ -5081,6 +5092,20 @@ mod tests {
         assert_eq!(app.task().unwrap().0.id, "t3");
         click(&mut app, "slots ▰▰▱", 6);
         assert_eq!(app.task().unwrap().0.id, "t1");
+    }
+
+    #[test]
+    fn next_for_you_wraps_within_needs_you() {
+        let (mut app, _) = app();
+        let next = |app: &mut App| {
+            app.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+            app.selected
+        };
+        // t1 and t2 need you; t3 is working and t4 is queued
+        app.selected = 2;
+        assert_eq!(next(&mut app), 0);
+        assert_eq!(next(&mut app), 1);
+        assert_eq!(next(&mut app), 0);
     }
 
     #[test]
