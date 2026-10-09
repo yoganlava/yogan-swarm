@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -86,16 +85,8 @@ fn find_project<'a>(
 }
 
 pub(crate) fn origin_name(checkout: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(checkout)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    let url = String::from_utf8(out.stdout).ok()?;
-    out.status
-        .success()
-        .then(|| repo_name(url.trim()).to_string())
+    let url = crate::git(checkout, &["remote", "get-url", "origin"]).ok()?;
+    Some(repo_name(&url).to_string())
 }
 
 fn repo_name(url: &str) -> &str {
