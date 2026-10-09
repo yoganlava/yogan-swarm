@@ -96,14 +96,16 @@ impl Findings {
         Ok(())
     }
 
+    /// Whether the `i`th of `actionable` is a disputed one.
+    pub fn is_disputed(&self, i: usize) -> bool {
+        let first = self.findings.len();
+        (first..first + self.disputed.len()).contains(&i)
+    }
+
     /// `r` on a disputed finding: the human sides with the critic. It moves to `fixed`, for the
     /// next critic to check once the worker has fixed it; returns it for the worker's prompt.
     pub fn uphold(&mut self, i: usize) -> Result<Finding> {
-        let first = self.findings.len();
-        anyhow::ensure!(
-            (first..first + self.disputed.len()).contains(&i),
-            "only a disputed finding can be upheld"
-        );
+        anyhow::ensure!(self.is_disputed(i), "only a disputed finding can be upheld");
         let f = self.take(i)?;
         self.fixed.push(f.clone());
         Ok(f)

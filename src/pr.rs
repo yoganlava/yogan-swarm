@@ -55,17 +55,14 @@ pub fn draft(
             task.acceptance.join("\n- ")
         ));
     }
-    let open: Vec<_> = (findings.findings.iter())
-        .chain(&findings.optional)
+    let open: Vec<_> = (findings.findings.iter().chain(&findings.optional))
+        .map(|f| format!("- {}: {}", f.location, f.claim))
         .collect();
     if !open.is_empty() {
-        let open = open
-            .iter()
-            .map(|f| format!("- {}: {}", f.location, f.claim));
         prompt.push_str(&format!(
             "\nReview findings still open, which may mean a criterion isn't met:\n{}\n\
              yogan appends its own review summary, so don't write one.\n",
-            open.collect::<Vec<_>>().join("\n")
+            open.join("\n")
         ));
     }
     if let Some(summary) = &task.summary {

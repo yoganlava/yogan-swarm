@@ -608,11 +608,8 @@ impl App {
         let failed = self.request().is_some_and(|r| r.status == Phase::Failed);
         let answered = self.request().is_some_and(|r| r.status == Phase::Done);
         if self.on_findings() {
-            let (n, first) = (
-                self.findings.actionable().count(),
-                self.findings.findings.len(),
-            );
-            let disputed = (first..first + self.findings.disputed.len()).contains(&self.finding);
+            let n = self.findings.actionable().count();
+            let disputed = self.findings.is_disputed(self.finding);
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.finding = (self.finding + 1).min(n.saturating_sub(1));
@@ -888,6 +885,8 @@ impl App {
         );
         let id = t.id.clone();
         let mut findings = Findings::load(&self.state, &id)?;
+        // the tab reloads on task file changes, which this isn't, so force it
+        self.loaded = None;
         if act == 'x' {
             findings.waive(self.finding, text)?;
             findings.save(&self.state, &id)?;
@@ -1092,10 +1091,8 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     } else if app.reply.is_some() {
         vec![("ctrl-s", "send"), ("esc", "cancel")]
     } else if app.on_findings() {
-        let first = app.findings.findings.len();
-        let disputed = (first..first + app.findings.disputed.len()).contains(&app.finding);
         let mut keys = vec![("j/k", "finding")];
-        keys.extend(disputed.then_some(("r", "uphold")));
+        keys.extend((app.findings.is_disputed(app.finding)).then_some(("r", "uphold")));
         keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive")));
         keys.extend([("tab", "pane"), ("1-5", "tabs"), ("?", "help")]);
         keys
@@ -2446,6 +2443,9 @@ mod tests {
         assert!(saved.disputed.is_empty());
         assert_eq!(saved.waived[1].claim, "no test for zero");
         assert_eq!(saved.waived[1].reply.as_deref(), Some("0 is fine here"));
+        // the tab shows it too, so the cursor can't act on a stale row
+        app.load_tab();
+        assert_eq!(app.findings, saved);
         fs::remove_dir_all(&state).unwrap();
     }
 

@@ -186,10 +186,7 @@ fn worker_runs_setup_then_claude() {
     assert!(log.contains("[REDACTED]") && !log.contains("ghp_"), "{log}");
 
     // the critic reviewed the passing change; an unproven major is only optional
-    let findings = |id: &str| -> Findings {
-        let text = fs::read_to_string(state.join(format!("findings/{id}.toml"))).unwrap();
-        toml::from_str(&text).unwrap()
-    };
+    let findings = |id: &str| Findings::load(&state, id).unwrap();
     let review = findings("t1");
     let severity = |f: &[Finding]| f.iter().map(|f| f.severity).collect::<Vec<_>>();
     assert_eq!(
