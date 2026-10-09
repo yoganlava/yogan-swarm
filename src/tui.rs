@@ -873,6 +873,7 @@ fn help(f: &mut Frame, theme: &Theme) {
     f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()).block(block), area);
 }
 
+/// Formats a duration as `45s`, `4m`, `2h` or `3d`, using the largest whole unit.
 fn short(d: Duration) -> String {
     match d.as_secs() {
         s if s < 60 => format!("{s}s"),
