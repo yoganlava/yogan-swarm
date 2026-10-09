@@ -3895,7 +3895,8 @@ fn inline(l: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
             spans.push(Span::styled(code, style.fg(theme.shell)));
             i = j + 1;
         } else if ch == '['
-            && let Some(j) = find(i + 1, &[']', '('])
+            && let Some(j) = find(i + 1, &[']'])
+            && c.get(j + 1) == Some(&'(')
             && let Some(k) = find(j + 2, &[')'])
         {
             flush(&mut spans, &mut text, style);
@@ -5672,6 +5673,9 @@ mod tests {
         assert_eq!(md[0].spans[2], Span::raw("b").bold());
         assert_eq!(md[0].spans[4], Span::raw("docs").underlined());
         assert_eq!(md[0].spans[5], Span::raw(" http://x").dim());
+        let md = markdown("see [1] or [docs](u)", &theme);
+        assert_eq!(text(&md[0]), "see [1] or docs u");
+        assert_eq!(md[0].spans[1], Span::raw("docs").underlined());
 
         let md = markdown("- item\n  - sub\n1. **one**", &theme);
         let texts: Vec<String> = md.iter().map(text).collect();
