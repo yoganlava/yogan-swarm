@@ -734,6 +734,9 @@ impl App {
                 self.reply = Some(field("What should the lead change?"));
             }
             KeyCode::Char('r') if answered => self.reply = Some(field("Ask a follow-up")),
+            KeyCode::Char('r') if status == Some(Status::Review) => {
+                self.reply = Some(field("What should the worker change?"));
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 let rows = self.requests.len() + self.tasks.len();
                 self.selected = (self.selected + 1).min(rows.saturating_sub(1));
@@ -1114,6 +1117,15 @@ impl App {
             return Ok(());
         }
         let (t, _) = self.task().context("no task selected")?;
+        if t.status == Status::Review {
+            let prompt = format!(
+                "Feedback from the human reviewing this change:\n\n{}",
+                text.trim()
+            );
+            worker::spawn(&self.repo, &t.id, &["--reply", &prompt])?;
+            self.info = Some("sent to the worker".into());
+            return Ok(());
+        }
         ensure!(
             t.status == Status::Proposed && !t.plan.is_empty(),
             "this task has no lead to reply to"
@@ -1287,7 +1299,11 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
                 "p" | "y" => answered,
                 "1-5" => selected.is_some(),
                 "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
-                "r" => answered || selected.is_some_and(|t| t.status == Status::Proposed),
+                "r" => {
+                    answered
+                        || selected
+                            .is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
+                }
                 "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
                 "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
                 _ => true,
@@ -1351,6 +1367,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             Some('t') => "Retry the task",
             Some('w') => "Rewind to a commit (↑↓)",
             Some(_) => "Uphold the finding",
+            None if app.task().is_some_and(|(t, _)| t.status == Status::Review) => {
+                "Reply to the worker"
+            }
             None => "Reply to the lead",
         };
         let block = pane(title, true, theme);
@@ -2289,7 +2308,7 @@ mod tests {
                 "│ thread 'parse' panicked at src/config.rs:40:9:           │",
                 "│ assertion failed: delay >= 0                             │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  d diff  x discard",
+                " n new task  j/k move  tab pane  1-5 tabs  d diff  r reply  ",
             ]
         );
     }
@@ -2787,6 +2806,13 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.reply_for, None);
 
+        // r on a task in Review replies to its worker
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.reply_for, None);
+        let hint = app.reply.as_ref().unwrap().placeholder_text().to_string();
+        assert_eq!(hint, "What should the worker change?");
+        press(&mut app, KeyCode::Esc);
+
         // c needs a session to continue
         press(&mut app, KeyCode::Char('c'));
         assert!(app.interactive.is_none());
@@ -2950,7 +2976,7 @@ mod tests {
                 "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR  x discard  ? help  q quit  c continue ",
+                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR  r reply  x discard  ? help  q quit  c ",
             ]
         );
     }

@@ -53,6 +53,9 @@ the workspace suite); CI covers the rest.
 - Commit in semantic commits of roughly 300 lines or fewer, with conventional messages such as \
 `fix(ledger): ...`. Never push or open a PR.
 - Never run destructive git: `checkout --`, `reset --hard`, `stash drop`, `clean`, `push --force`.
+- Change files with the Edit and Write tools, never with shell scripts (`python3 -`, `sed -i`, \
+heredocs), and keep `${...}` out of commands: both are denied here. To check an exit status, run \
+`cmd > /tmp/out.log 2>&1; echo exit=$?`.
 - If YOGAN_PORT_BASE is set, your ports are YOGAN_PORT_BASE up to YOGAN_PORT_BASE + \
 YOGAN_PORT_COUNT - 1; never bind any other.
 - End with a plain summary that someone without context can follow, flagging anything you were \
