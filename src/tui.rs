@@ -3621,7 +3621,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
                 "│ ▌ ✓ Reject negative max_delay          4m ││ Summary ▾                                           │",
                 "│   ✗ Bump sqlx to 0.9                   1h ││ Reject negative max_delay                           │",
                 "│   ⠋ Retry webhook sends     working · 12m ││ Review · u/reject-negative · slot 1 · opus/high     │",
