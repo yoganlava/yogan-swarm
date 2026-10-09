@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use yogan_swarm::critic::{self, Severity};
+use yogan_swarm::critic::{self, Findings, Severity};
 use yogan_swarm::{config, task::Task};
 
 fn git(dir: &Path, args: &[&str]) {
@@ -64,7 +64,9 @@ fn flags_an_unmet_criterion_as_a_blocker() {
         ..Default::default()
     };
     let cfg = config::load(&repo).unwrap();
-    let review = critic::run(&task, &repo, "origin/main", &cfg, &[], &repo.join("logs")).unwrap();
+    let logs = repo.join("logs");
+    let fresh = Findings::default();
+    let review = critic::run(&task, &repo, "origin/main", &cfg, &[], &logs, &fresh).unwrap();
     println!("{review:#?}");
     assert!(
         review

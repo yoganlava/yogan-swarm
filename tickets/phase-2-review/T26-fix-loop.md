@@ -1,4 +1,4 @@
-- [ ] **T26 Fix loop**
+- [x] **T26 Fix loop**
 
 Plan: Adversarial review › The fix loop; Task lifecycle.
 

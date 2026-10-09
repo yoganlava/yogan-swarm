@@ -11,6 +11,8 @@ use rustix::process::{
     Pid, Resource, Rlimit, Signal, getrlimit, kill_process_group, setrlimit, setsid,
 };
 
+use serde_json::Value;
+
 use crate::critic::{self, Findings};
 use crate::redact::redact;
 use crate::stream::{Event, System};
@@ -238,8 +240,13 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
     };
     let (mut log, err_log) = (append("jsonl")?, append("stderr.log")?);
 
-    // one Claude run in the slot; `resume` continues the task's last session
-    let mut session = |task: &mut Task, prompt: &str, resume: bool| -> Result<()> {
+    // one Claude run in the slot; `resume` continues the task's last session, and a `schema`
+    // asks for a structured reply, which it returns
+    let mut session = |task: &mut Task,
+                       prompt: &str,
+                       resume: bool,
+                       schema: Option<&str>|
+     -> Result<Option<Value>> {
         // the branch is about to change, so any PR draft is stale
         task.status = Status::Running;
         task.pr_draft = None;
@@ -256,6 +263,9 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
                 task.sessions.last().context("no session to resume")?,
             ]);
         }
+        if let Some(schema) = schema {
+            cmd.args(["--json-schema", schema]);
+        }
         cmd.arg("--allowedTools")
             .args(&allowed)
             .arg("--disallowedTools")
@@ -265,7 +275,7 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
             .current_dir(&dir)
             .env("GIT_EDITOR", "true") // `rebase --continue` must not wait on an editor
             .envs(env.iter().cloned());
-        let mut denied = Vec::new();
+        let (mut denied, mut reply) = (Vec::new(), None);
         claude(&mut cmd, prompt, &mut log, &err_log, |event| {
             match event {
                 Event::System(System::Init {
@@ -289,7 +299,11 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
                     );
                 }
                 Event::Result(r) => {
-                    task.summary = Some(r.result).filter(|s| !s.is_empty());
+                    // a structured reply isn't a summary, so the last one stands
+                    if schema.is_none() {
+                        task.summary = Some(r.result).filter(|s| !s.is_empty());
+                    }
+                    reply = r.structured_output;
                     denied = r
                         .permission_denials
                         .into_iter()
@@ -305,27 +319,54 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
             "incomplete: permission denied for {}",
             denied.join(", ")
         );
-        Ok(())
+        Ok(reply)
     };
 
-    // an optional Claude run, then the gate with up to max_rounds fix rounds; true if it passed
+    // an optional Claude run, then the gate and, with `review`, the critic. A failing gate or an
+    // open blocker or major goes back to the worker, for up to max_rounds fix rounds between
+    // them; true if the gate passed
     let gate_log = logs.join(format!("{}.gate.log", task.id));
-    let mut work = |task: &mut Task, first: Option<(&str, bool)>| -> Result<bool> {
+    let mut work = |task: &mut Task, first: Option<(&str, bool)>, review: bool| -> Result<bool> {
         if let Some((prompt, resume)) = first {
-            session(task, prompt, resume)?;
+            session(task, prompt, resume, None)?;
         }
+        let mut findings = Findings::default();
         let mut round = 0;
         loop {
             task.status = Status::Checking;
             task.save(state)?;
             let (checks, failures) = gate::run(&dir, base, &cfg.gate.steps, &env, &gate_log)?;
             task.gate = Some(checks);
-            if failures.is_empty() || round == cfg.critic.max_rounds {
-                return Ok(failures.is_empty());
+            let last = round == cfg.critic.max_rounds;
+            if !failures.is_empty() {
+                if last {
+                    return Ok(false);
+                }
+                let fix =
+                    format!("The gate failed. Fix the failures below, then commit.\n\n{failures}");
+                session(task, &fix, true, None)?;
+                round += 1;
+                continue;
             }
-            let fix =
-                format!("The gate failed. Fix the failures below, then commit.\n\n{failures}");
-            session(task, &fix, true)?;
+            if !review {
+                return Ok(true);
+            }
+            // a critic that can't finish leaves a note, not a failed task
+            findings =
+                critic::run(task, &dir, base, &cfg, &env, &logs, &findings).unwrap_or_else(|e| {
+                    Findings {
+                        error: Some(format!("{e:#}")),
+                        ..findings
+                    }
+                });
+            findings.save(state, &task.id)?;
+            let open = findings.open();
+            if open.is_empty() || last || findings.error.is_some() {
+                return Ok(true);
+            }
+            let reply = session(task, &critic::fix_prompt(&open), true, Some(critic::REPLY))?;
+            findings.resolve(open, reply);
+            findings.save(state, &task.id)?;
             round += 1;
         }
     };
@@ -333,20 +374,12 @@ fn lifecycle(repo: &Path, state: &Path, task: &mut Task, pr: Option<&str>) -> Re
     match pr {
         None => {
             let prompt = prompt(task);
-            if work(task, Some((&prompt, false)))? {
-                // a critic that can't finish leaves a note, not a failed task
-                let review =
-                    critic::run(task, &dir, base, &cfg, &env, &logs).unwrap_or_else(|e| Findings {
-                        error: Some(format!("{e:#}")),
-                        ..Default::default()
-                    });
-                review.save(state, &task.id)?;
-            }
+            work(task, Some((&prompt, false)), true)?;
         }
         Some(instruction) => {
             let passed = match rebase(&dir, base)? {
-                None => work(task, Some((&conflict(base), true)))?,
-                Some(true) => work(task, None)?,
+                None => work(task, Some((&conflict(base), true)), false)?,
+                Some(true) => work(task, None, false)?,
                 Some(false) => task.gate.iter().flatten().all(|c| c.passed),
             };
             if passed {

@@ -11,11 +11,13 @@ use yogan_swarm::task::{self, Status, Task};
 
 /// Stand-in for Claude: records its args, cwd, effort env and the task's status, then emits an
 /// init with `$MCP` as its server, a leaked token, and a result denying `$DENIED`. Resumed, it
-/// commits. Asked for JSON, it's the PR drafter, which fails while `$HOME/draft.fail` exists;
-/// given `--json-schema`, the critic, which fails while `$HOME/critic.fail` exists.
+/// commits. Asked for JSON, it's the PR drafter, which fails while `$HOME/draft.fail` exists.
+/// As the critic it always finds a proven blocker, and fails while `$HOME/critic.fail` exists;
+/// a fix round's structured reply calls finding 1 fixed, or disputed while `$HOME/dispute` exists.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
-case "$*" in *--json-schema*)
+case "$*" in *"yogan's critic"*)
   printf '%s\n' "$@" > "$YOGAN_ROOT/../critic.args"
+  echo run >> "$YOGAN_ROOT/../critic.count"
   [ -e "$HOME/critic.fail" ] && exit 1
   echo '{"type":"system","subtype":"init","session_id":"s-critic","model":"m","tools":[],"mcp_servers":[]}'
   echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1,"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1},"permission_denials":[],"structured_output":{"findings":[{"severity":"blocker","location":"a.txt:1","claim":"criterion unmet","evidence":"cargo test fails"},{"severity":"major","location":"b.rs:2","claim":"maybe a bug","evidence":""},{"severity":"minor","location":"c.rs:3","claim":"naming","evidence":""}]}}'
@@ -32,7 +34,11 @@ ulimit -n > "$out/claude.nofile"
 echo 'warning: token ghp_aB3aB3aB3aB3aB3aB3aB3aB3 expired' >&2
 echo '{"type":"system","subtype":"init","session_id":"s-1","model":"m","tools":[],"mcp_servers":[{"name":"'"$MCP"'"}]}'
 echo '{"type":"assistant","text":"ghp_aB3aB3aB3aB3aB3aB3aB3aB3"}'
-echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1,"usage":{},"permission_denials":['"$DENIED"']}'
+so=''
+case "$*" in *--json-schema*)
+  fix=fixed; [ -e "$HOME/dispute" ] && fix=disputed
+  so=',"structured_output":{"findings":[{"number":1,"status":"'"$fix"'","reason":"done"}]}' ;; esac
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1,"usage":{},"permission_denials":['"$DENIED"']'"$so"'}'
 # only a gate fix round commits, so the first gate fails on "new commits"
 case "$*" in *--resume*) git -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
   commit -q --allow-empty -m fix ;; esac
@@ -162,7 +168,8 @@ fn worker_runs_setup_then_claude() {
     assert_eq!(nofile, "777\n");
     assert_eq!(
         fs::read_to_string(state.join("logs/t1.stderr.log")).unwrap(),
-        "warning: token [REDACTED] expired\n".repeat(2) // first run and the fix round
+        // the first run, a gate fix round and a critic fix round
+        "warning: token [REDACTED] expired\n".repeat(3)
     );
     assert_eq!((t1.slot, t1.sessions), (Some(1), vec!["s-1".to_string()]));
     assert!(t1.pid.is_some());
@@ -202,6 +209,30 @@ fn worker_runs_setup_then_claude() {
         assert!(critic.contains(want), "{want:?} not in {critic}");
     }
     assert!(!critic.contains("--resume"), "the critic starts fresh");
+
+    // the gate fix and the critic fix shared max_rounds = 2, so the loop stopped with the
+    // re-found blocker open and the earlier one marked fixed by the worker
+    let runs = fs::read_to_string(root.join("critic.count")).unwrap();
+    assert_eq!(
+        runs.lines().count(),
+        2,
+        "a fresh critic after the fix round"
+    );
+    assert!(
+        critic.contains("The worker says it fixed these"),
+        "{critic}"
+    );
+    assert_eq!(review.fixed.len(), 1);
+    assert_eq!(review.fixed[0].reply.as_deref(), Some("done"));
+    assert!(review.disputed.is_empty());
+    assert!(
+        args.contains("--json-schema\n"),
+        "the fix round asks for a reply"
+    );
+    assert!(
+        args.contains("1. [Blocker] a.txt:1 - criterion unmet"),
+        "{args}"
+    );
 
     // a failing setup fails the task with its log path, before Claude starts
     let (ok, t2) = worker("t2", "echo db down; exit 3", "graft", "", None);

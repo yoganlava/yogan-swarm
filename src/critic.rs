@@ -6,6 +6,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::Config;
 use crate::stream::Event;
@@ -31,6 +32,8 @@ pub struct Finding {
     pub claim: String,
     /// A failing test or command, or a call path from a real caller; empty when unproven.
     pub evidence: String,
+    /// The worker's reason when it fixed or disputed it.
+    pub reply: Option<String>,
 }
 
 /// `findings/<id>.toml`.
@@ -40,6 +43,12 @@ pub struct Findings {
     pub findings: Vec<Finding>,
     /// Blockers and majors without evidence: shown in Review, never sent back.
     pub optional: Vec<Finding>,
+    /// Sent back and reported fixed by the worker; the next critic checks them.
+    #[serde(default)]
+    pub fixed: Vec<Finding>,
+    /// Sent back and disputed by the worker: for the human, never argued with the critic.
+    #[serde(default)]
+    pub disputed: Vec<Finding>,
     /// Why the critic didn't finish, if it didn't.
     pub error: Option<String>,
 }
@@ -48,6 +57,60 @@ impl Findings {
     pub fn save(&self, state: &Path, id: &str) -> Result<()> {
         task::write_toml(&state.join("findings"), id, self)
     }
+
+    /// The blockers and majors to send back; unproven ones are in `optional` already.
+    pub fn open(&self) -> Vec<Finding> {
+        let blocking = |f: &&Finding| f.severity != Severity::Minor;
+        self.findings.iter().filter(blocking).cloned().collect()
+    }
+
+    /// Files each of `open` as fixed or disputed by the worker's `reply` to `fix_prompt`; one it
+    /// didn't answer counts as fixed, for the next critic to check.
+    pub fn resolve(&mut self, open: Vec<Finding>, reply: Option<Value>) {
+        #[derive(Deserialize)]
+        struct Reply {
+            findings: Vec<Resolution>,
+        }
+        #[derive(Deserialize)]
+        struct Resolution {
+            number: usize,
+            status: String,
+            reason: String,
+        }
+        let reply = reply.and_then(|r| serde_json::from_value::<Reply>(r).ok());
+        let answers = reply.map(|r| r.findings).unwrap_or_default();
+        self.findings.retain(|f| !open.contains(f));
+        for (i, mut f) in open.into_iter().enumerate() {
+            let answer = answers.iter().find(|a| a.number == i + 1);
+            f.reply = answer.map(|a| a.reason.clone());
+            match answer {
+                Some(a) if a.status == "disputed" => self.disputed.push(f),
+                _ => self.fixed.push(f),
+            }
+        }
+    }
+}
+
+/// The structured reply a fix round ends with.
+pub const REPLY: &str = r#"{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"number":{"type":"integer"},"status":{"enum":["fixed","disputed"]},"reason":{"type":"string"}},"required":["number","status","reason"]}}},"required":["findings"]}"#;
+
+/// Sends `open` back to the worker, numbered for its structured reply.
+pub fn fix_prompt(open: &[Finding]) -> String {
+    let mut p = "The critic found these problems. Fix each one and commit, or dispute it with a \
+                 reason if you're sure it's wrong. End with structured output that lists every \
+                 finding by number as fixed or disputed, with a short reason.\n"
+        .to_string();
+    for (i, f) in open.iter().enumerate() {
+        p.push_str(&format!(
+            "\n{}. [{:?}] {} - {}\n   Evidence: {}\n",
+            i + 1,
+            f.severity,
+            f.location,
+            f.claim,
+            f.evidence
+        ));
+    }
+    p
 }
 
 const SCHEMA: &str = r#"{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"enum":["blocker","major","minor"]},"location":{"type":"string","description":"path:line"},"claim":{"type":"string"},"evidence":{"type":"string"}},"required":["severity","location","claim","evidence"]}}},"required":["findings"]}"#;
@@ -68,7 +131,8 @@ as optional.
 - Report every finding in the structured output, or an empty list if you find none.";
 
 /// Reviews the task's branch in `slot` against `base`, in a fresh session with read access,
-/// `cargo check`/`cargo test` and `git diff`/`git log`. `env` is the slot's environment.
+/// `cargo check`/`cargo test` and `git diff`/`git log`. `env` is the slot's environment. After
+/// a fix round, `previous` holds what was fixed, to re-check, and disputed, to leave alone.
 pub fn run(
     task: &Task,
     slot: &Path,
@@ -76,6 +140,7 @@ pub fn run(
     cfg: &Config,
     env: &[(&str, String)],
     logs: &Path,
+    previous: &Findings,
 ) -> Result<Findings> {
     let c = &cfg.critic;
     worker::check_effort(&c.effort)?;
@@ -102,7 +167,8 @@ pub fn run(
         .current_dir(slot)
         .envs(env.iter().cloned());
     let mut report = None;
-    worker::claude(&mut cmd, &prompt(task, base), &mut log, &err_log, |event| {
+    let prompt = prompt(task, base, previous);
+    worker::claude(&mut cmd, &prompt, &mut log, &err_log, |event| {
         if let Event::Result(r) = event {
             report = r.structured_output;
         }
@@ -121,11 +187,13 @@ pub fn run(
     Ok(Findings {
         findings,
         optional,
+        fixed: previous.fixed.clone(),
+        disputed: previous.disputed.clone(),
         error: None,
     })
 }
 
-fn prompt(task: &Task, base: &str) -> String {
+fn prompt(task: &Task, base: &str, previous: &Findings) -> String {
     let mut p = format!(
         "Review this change.\n\nTask: {}\n\n{}\n",
         task.title, task.body
@@ -142,5 +210,61 @@ fn prompt(task: &Task, base: &str) -> String {
     p.push_str(&format!(
         "\nThe change is `git diff {base}...HEAD`, its commits `git log {base}..HEAD`.\n"
     ));
+    let list = |fs: &[Finding]| {
+        let lines = fs.iter().map(|f| format!("- {} - {}", f.location, f.claim));
+        lines.collect::<Vec<_>>().join("\n")
+    };
+    if !previous.fixed.is_empty() {
+        p.push_str(&format!(
+            "\nThe worker says it fixed these earlier findings. Check each one and report any \
+             that isn't resolved. Then do a simplicity pass: code that can be removed, merged or \
+             kept smaller, not a hunt for new bugs.\n{}\n",
+            list(&previous.fixed)
+        ));
+    }
+    if !previous.disputed.is_empty() {
+        p.push_str(&format!(
+            "\nThe worker disputes these; they're for the human, so don't report them again:\n{}\n",
+            list(&previous.disputed)
+        ));
+    }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fix_round_files_findings_as_fixed_or_disputed() {
+        let finding = |severity, claim: &str| Finding {
+            severity,
+            location: "src/lib.rs:1".into(),
+            claim: claim.into(),
+            evidence: "cargo test fails".into(),
+            reply: None,
+        };
+        let mut findings = Findings {
+            findings: vec![
+                finding(Severity::Blocker, "a"),
+                finding(Severity::Minor, "b"),
+                finding(Severity::Major, "c"),
+            ],
+            ..Default::default()
+        };
+        let open = findings.open();
+        assert_eq!(open.len(), 2, "minors stay in Review");
+        let prompt = fix_prompt(&open);
+        assert!(prompt.contains("1. [Blocker] src/lib.rs:1 - a") && prompt.contains("2. [Major]"));
+
+        let reply = serde_json::json!({"findings": [
+            {"number": 2, "status": "disputed", "reason": "c is intended"},
+        ]});
+        findings.resolve(open, Some(reply));
+        assert_eq!(findings.findings, [finding(Severity::Minor, "b")]);
+        // unanswered counts as fixed, for the next critic to check
+        assert_eq!(findings.fixed[0].claim, "a");
+        assert_eq!(findings.fixed[0].reply, None);
+        assert_eq!(findings.disputed[0].reply.as_deref(), Some("c is intended"));
+    }
 }
