@@ -56,6 +56,9 @@ YOGAN_PORT_COUNT - 1; never bind any other.
 - End with a plain summary that someone without context can follow, flagging anything you were \
 unsure of.";
 
+const WHOLE: &str = "End with a plain summary of the whole change on this branch so far, not \
+only this step.";
+
 /// Starts `yogan worker <id>` for the checkout `repo` in a new session, so neither Ctrl-C
 /// nor a closing terminal reaches it. Returns its pid, which is also its process group.
 pub fn spawn(repo: &Path, id: &str, extra: &[&str]) -> Result<u32> {
@@ -400,7 +403,12 @@ pub fn run(repo: &Path, id: &str, pr: Option<&str>, reply: Option<&str>) -> Resu
         fs::write(state.join(format!("logs/{id}.pr.log")), format!("{e:#}\n"))?;
     } else if let Err(e) = &res {
         task.status = Status::Failed;
-        task.summary = Some(format!("{e:#}"));
+        // keep what the worker said it did under the error
+        let said = task
+            .summary
+            .take()
+            .map_or(String::new(), |s| format!("\n\n{s}"));
+        task.summary = Some(format!("{e:#}{said}"));
         task.save(&state)?;
     }
     // this worker's slot lock is released by now, so the next task can take it
@@ -545,7 +553,12 @@ fn lifecycle(
             let (mut fresh, mut said) = (None, None);
             let (mut rejected, mut step, mut outcome) = (None, None, None);
             let watch = Some((&cfg.watch, queue.as_path()));
-            let res = claude(&mut cmd, &prompt, &mut log, &err_log, watch, |event| {
+            // a resumed run's summary replaces the last one, so it has to cover everything
+            let sent = match resume && schema.is_none() {
+                true => format!("{prompt}\n\n{WHOLE}"),
+                false => prompt.clone(),
+            };
+            let res = claude(&mut cmd, &sent, &mut log, &err_log, watch, |event| {
                 match event {
                     Event::System(stream::System::Init {
                         session_id,

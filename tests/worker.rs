@@ -276,8 +276,22 @@ fn worker_runs_setup_then_claude() {
     let (ok, t5) = worker("t5", "true", "graft", "", Some("bogus"));
     assert!(!ok);
     assert_eq!(t5.status, Status::Failed);
-    assert!(t5.summary.unwrap().contains("\"bogus\""));
+    assert!(t5.summary.as_ref().unwrap().contains("\"bogus\""));
     assert!(!state.join("logs/t5.jsonl").exists());
+    // failing again keeps what the worker had said under the new error
+    let t5 = Task {
+        status: Status::Approved,
+        summary: Some("did the thing".into()),
+        ..t5
+    };
+    t5.save(&state).unwrap();
+    let (_, t5) = yogan(&["worker", "t5"], "graft", "");
+    let summary = t5.summary.unwrap();
+    assert!(
+        summary
+            .ends_with("\"bogus\", expected one of low, medium, high, xhigh, max\n\ndid the thing"),
+        "{summary}"
+    );
 
     // m: a rebase that conflicts is aborted and the worker resumed to resolve it, then the
     // gate runs again and the PR is drafted
@@ -292,7 +306,9 @@ fn worker_runs_setup_then_claude() {
     assert!(ok);
     let args = fs::read_to_string(root.join("claude.args")).unwrap();
     assert!(
-        args.contains("--resume\ns-1\n") && args.contains("conflicted"),
+        args.contains("--resume\ns-1\n")
+            && args.contains("conflicted")
+            && args.contains("summary of the whole change"),
         "{args}"
     );
     let seen = fs::read_to_string(root.join("claude.status")).unwrap();
