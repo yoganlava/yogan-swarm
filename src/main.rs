@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(yogan_swarm::shim::run(args.collect())?);
     }
     match Cli::parse().command {
-        None => anyhow::bail!("TUI not built yet (T14)"),
+        None => yogan_swarm::tui::run(&std::env::current_dir()?),
         Some(Command::Worker { id }) => yogan_swarm::worker::run(&std::env::current_dir()?, &id),
         Some(Command::Task {
             command: TaskCommand::Propose,

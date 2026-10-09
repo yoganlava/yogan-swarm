@@ -1,4 +1,4 @@
-- [ ] **T14 TUI shell**
+- [x] **T14 TUI shell**
 
 Plan: TUI (Visual principles, Widgets, Keys, Rendering and layout, Screens › 12. Help overlay); Architecture (restart PID check).
 

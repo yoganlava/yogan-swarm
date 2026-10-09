@@ -11,6 +11,7 @@ pub mod shim;
 pub mod slot;
 pub mod stream;
 pub mod task;
+pub mod tui;
 pub mod worker;
 
 /// Runs `git -C dir args…` and returns trimmed stdout; a failure carries git's stderr.
