@@ -1,4 +1,4 @@
-- [ ] **T45 Right-click actions menu**
+- [x] **T45 Right-click actions menu**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Screens › D.
 
