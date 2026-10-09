@@ -173,6 +173,8 @@ struct App {
     edit: bool,
     /// The reply to the selected proposal's lead, while it's being typed.
     reply: Option<TextArea<'static>>,
+    /// Sessions a task gets: its first plus `[watch] max_handoffs`.
+    sessions: u32,
     /// What the reply modal is for when it isn't the lead: `r` upholds the selected finding,
     /// `x` waives it.
     on_finding: Option<char>,
@@ -255,6 +257,7 @@ pub fn run(repo: &Path) -> Result<()> {
         findings: Findings::default(),
         finding: 0,
         disputed: Vec::new(),
+        sessions: config::load(repo).map_or(0, |c| c.watch.max_handoffs + 1),
     };
     let theme = Theme::detect();
     let mut terminal = ratatui::init();
@@ -998,8 +1001,10 @@ impl App {
 
 /// The Activity tab's tool name for a worker's nudge.
 const NUDGE: &str = "↻";
+/// The Activity tab's tool name for a worker's handoff to a fresh session.
+const HANDOFF: &str = "⇢";
 
-/// Tool calls and nudges from the tail of a Claude stream log, as (tool, target), with `slot/`
+/// Tool calls, nudges and handoffs from the tail of a Claude stream log, as (tool, target), with `slot/`
 /// paths made relative.
 fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
     let Ok(mut file) = File::open(log) else {
@@ -1043,6 +1048,7 @@ fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
                 message.content.into_iter().filter_map(line).collect()
             }
             stream::Event::Nudge { reason } => vec![(NUDGE.into(), reason)],
+            stream::Event::Handoff { reason } => vec![(HANDOFF.into(), reason)],
             _ => Vec::new(),
         })
         .collect()
@@ -1449,7 +1455,7 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
                 let shown = app.tasks.iter().find(|(o, _)| &o.id == p);
                 shown.map_or(p.clone(), |(o, _)| o.title.clone())
             });
-            summary(f, body, t, parent)
+            summary(f, body, t, parent, app.sessions)
         }
         1 => activity_tab(f, body, &app.activity, theme),
         2 => gate_tab(f, body, t, &app.gate_log, theme),
@@ -1461,8 +1467,8 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
     }
 }
 
-/// `parent` is the parent task's title.
-fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>) {
+/// `parent` is the parent task's title; `sessions` the most a task gets, shown once it hands off.
+fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>, sessions: u32) {
     let label = GROUPS
         .iter()
         .find(|(s, _)| *s == t.status)
@@ -1470,6 +1476,8 @@ fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>) {
     let mut meta = vec![label.to_string()];
     meta.extend((!t.branch.is_empty()).then(|| t.branch.clone()));
     meta.extend(t.slot.map(|n| format!("slot {n}")));
+    let n = t.sessions.len();
+    meta.extend((n > 1).then(|| format!("session {n}/{sessions}")));
     meta.extend(t.model.as_ref().map(|m| match &t.effort {
         Some(e) => format!("{m}/{e}"),
         None => m.clone(),
@@ -1684,6 +1692,7 @@ fn activity_tab(f: &mut Frame, area: Rect, calls: &[(String, String)], theme: &T
             "Read" => ("read", Style::new().dim()),
             "Grep" | "Glob" => ("search", Style::new().dim()),
             NUDGE => ("↻ nudged", Style::new().fg(theme.amber)),
+            HANDOFF => ("⇢ handoff", Style::new()),
             other => (other, Style::new()),
         };
         let target = truncate(
@@ -1874,6 +1883,7 @@ mod tests {
             findings: Findings::default(),
             finding: 0,
             disputed: Vec::new(),
+            sessions: 3,
         };
         (app, now)
     }
@@ -1902,6 +1912,7 @@ mod tests {
         let (mut app, _) = app();
         app.tasks[0].0.ticket = Some("CC-687".into());
         app.tasks[0].0.body = "A negative value panics in the retry loop.".into();
+        app.tasks[0].0.sessions = vec!["s-1".into(), "s-2".into()];
         assert_eq!(
             tab_screen(app, 0),
             [
@@ -1910,12 +1921,12 @@ mod tests {
                 "│ Summary  Activity  Gate  Findings  Diff                  │",
                 "│                                                          │",
                 "│ Reject negative max_delay                                │",
-                "│ Review · u/reject-negative · slot 1 · opus/high · CC-687 │",
+                "│ Review · u/reject-negative · slot 1 · session 2/3 ·      │",
+                "│ opus/high · CC-687                                       │",
                 "│                                                          │",
                 "│ max_delay below zero now fails at parse time.            │",
                 "│                                                          │",
                 "│ A negative value panics in the retry loop.               │",
-                "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
                 " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR",
@@ -2543,11 +2554,18 @@ mod tests {
         let log = std::env::temp_dir().join(format!("yogan-nudge-{}.jsonl", std::process::id()));
         fs::write(
             &log,
-            "{\"type\":\"nudge\",\"reason\":\"stalled for 15m\"}\n",
+            "{\"type\":\"nudge\",\"reason\":\"stalled for 15m\"}\n\
+             {\"type\":\"handoff\",\"reason\":\"context at 160000 of 200000 tokens\"}\n",
         )
         .unwrap();
         let calls = activity(&log, Path::new("/tmp"));
-        assert_eq!(calls, [(NUDGE.into(), "stalled for 15m".into())]);
+        assert_eq!(
+            calls,
+            [
+                (NUDGE.into(), "stalled for 15m".into()),
+                (HANDOFF.into(), "context at 160000 of 200000 tokens".into())
+            ]
+        );
         fs::remove_file(&log).unwrap();
     }
 

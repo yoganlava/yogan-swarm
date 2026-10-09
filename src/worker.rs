@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rustix::process::{
     Pid, Resource, Rlimit, Signal, getrlimit, kill_process, kill_process_group, setrlimit, setsid,
 };
@@ -496,7 +496,8 @@ fn lifecycle(
 
     // one Claude run in the slot; `resume` continues the task's last session, and a `schema`
     // asks for a structured reply, which it returns. A stall or loop resumes it with a nudge,
-    // up to [watch] nudges per task
+    // up to [watch] nudges per task; a full context, or a transcript Claude Code has deleted,
+    // hands off to a fresh session
     let queue = shim::queue(state, n);
     let mut session = |task: &mut Task,
                        prompt: &str,
@@ -507,11 +508,13 @@ fn lifecycle(
         task.status = Status::Running;
         task.pr_draft = None;
         task.save(state)?;
-        let (mut prompt, mut resume) = (prompt.to_string(), resume);
+        let (instruction, mut resume) = (prompt, resume);
+        let mut prompt = prompt.to_string();
         loop {
             let mut cmd = Command::new("claude");
             cmd.args(["--permission-mode", "acceptEdits"])
-                .args(["--model", &model, "--effort", &effort]);
+                .args(["--model", &model, "--effort", &effort])
+                .args(["--autocompact", &cfg.watch.autocompact.to_string()]);
             if let Some(file) = &w.mcp_config {
                 cmd.args(["--mcp-config", file]);
             }
@@ -534,6 +537,7 @@ fn lifecycle(
                 .env("GIT_EDITOR", "true") // `rebase --continue` must not wait on an editor
                 .envs(env.iter().cloned());
             let (mut denied, mut reply) = (Vec::new(), None);
+            let (mut fresh, mut said) = (None, None);
             let watch = Some((&cfg.watch, queue.as_path()));
             let res = claude(&mut cmd, &prompt, &mut log, &err_log, watch, |event| {
                 match event {
@@ -557,7 +561,27 @@ fn lifecycle(
                             extra.join(", ")
                         );
                     }
+                    Event::Assistant { message } => {
+                        let text = message.content.iter().rev().find_map(|c| match c {
+                            Content::Text { text } => Some(text.clone()),
+                            _ => None,
+                        });
+                        said = text.or(said.take());
+                        let (used, window) = (message.usage.context(), cfg.watch.autocompact);
+                        if used as f64 >= cfg.watch.handoff_at * window as f64
+                            && task.sessions.len() <= cfg.watch.max_handoffs as usize
+                        {
+                            fresh = Some(format!("context at {used} of {window} tokens"));
+                            bail!("handing off");
+                        }
+                    }
                     Event::Result(r) => {
+                        if r.errors
+                            .iter()
+                            .any(|e| e.starts_with("No conversation found"))
+                        {
+                            fresh = Some("the transcript is gone".to_string());
+                        }
                         // a structured reply isn't a summary, so the last one stands
                         if schema.is_none() {
                             task.summary = Some(r.result).filter(|s| !s.is_empty());
@@ -573,6 +597,14 @@ fn lifecycle(
                 }
                 Ok(())
             });
+            if let Some(reason) = fresh {
+                let line = serde_json::json!({"type": "handoff", "reason": reason});
+                writeln!(log, "{}", redact(&line.to_string()))?;
+                let said = said.or(task.summary.clone());
+                prompt = handoff(task, &dir, base, said.as_deref(), instruction)?;
+                resume = false;
+                continue;
+            }
             if let Err(e) = &res
                 && let Some(nudge) = e.downcast_ref::<Nudge>()
             {
@@ -703,6 +735,43 @@ fn mcp_servers(file: &Path) -> Result<Vec<String>> {
     Ok(servers.map(|(name, _)| name.clone()).collect())
 }
 
+/// A fresh session's prompt: the task, where the last session left off (`said`), the diff so
+/// far, and the instruction it was on if that wasn't the task itself.
+fn handoff(
+    task: &Task,
+    dir: &Path,
+    base: &str,
+    said: Option<&str>,
+    instruction: &str,
+) -> Result<String> {
+    let mut p = prompt(task);
+    p.push_str(
+        "\nAn earlier session worked on this task in this worktree and can't go on; its commits \
+         are on the branch and its uncommitted changes are in the worktree. Carry on from where \
+         it left off.\n",
+    );
+    if let Some(said) = said {
+        p.push_str(&format!("\nIts last words:\n{said}\n"));
+    }
+    let fork = git(dir, &["merge-base", base, "HEAD"])?;
+    let diff = git(dir, &["diff", &fork])?;
+    // ponytail: a cap so a runaway diff can't fill the new context; it can read the rest
+    let cut: String = diff.chars().take(100_000).collect();
+    let more = match cut.len() < diff.len() {
+        true => "\n(cut short; run the git diff for the rest)",
+        false => "",
+    };
+    p.push_str(&format!(
+        "\nThe change so far, `git diff {fork}`:\n{cut}{more}\n"
+    ));
+    if instruction != prompt(task) {
+        p.push_str(&format!(
+            "\nIt was working on this instruction:\n{instruction}\n"
+        ));
+    }
+    Ok(p)
+}
+
 fn prompt(task: &Task) -> String {
     let mut p = format!("{}\n\n{}\n", task.title, task.body);
     // the lead files 1-5; a task typed in compose has none
@@ -786,6 +855,9 @@ mod tests {
             stall_after: Duration::from_secs(3600),
             nudges: 1,
             loop_repeats: 3,
+            autocompact: 200_000,
+            handoff_at: 0.8,
+            max_handoffs: 2,
         };
         let (mut out, err) = (
             File::create(&log).unwrap(),

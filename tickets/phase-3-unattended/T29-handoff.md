@@ -1,4 +1,4 @@
-- [ ] **T29 Handoff**
+- [x] **T29 Handoff**
 
 Plan: Unattended safety › Nudges and handoffs (Handoff, "Why not just compaction"); Open questions and assumptions › Assumptions (30-day transcripts).
 

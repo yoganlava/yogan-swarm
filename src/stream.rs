@@ -22,6 +22,10 @@ pub enum Event {
     Nudge {
         reason: String,
     },
+    /// Not Claude's: the line the worker logs when it starts a fresh session.
+    Handoff {
+        reason: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -76,6 +80,14 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+impl Usage {
+    /// Tokens in context, for an assistant message's usage. A message's events repeat it, so
+    /// the latest message's is the context; a result's sums every call and isn't.
+    pub fn context(&self) -> u64 {
+        self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RunResult {
     pub subtype: String,
@@ -89,6 +101,9 @@ pub struct RunResult {
     /// The `--json-schema` answer.
     #[serde(default)]
     pub structured_output: Option<Value>,
+    /// e.g. `No conversation found with session ID: …` for a `--resume` whose transcript is gone.
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +167,28 @@ mod tests {
         assert!(r.usage.cache_read_input_tokens > 0);
         assert_eq!(r.permission_denials[0].tool_name, "Write");
         assert_eq!(r.permission_denials[0].tool_input["content"], "x");
+
+        // context is the latest assistant message's input, not the result's sum of calls
+        let context: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Assistant { message } => Some(message.usage.context()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(context.first(), Some(&(2 + 4012 + 13801)));
+        assert_eq!(context.last(), Some(&(2 + 318 + 18009)));
+        assert_eq!(r.usage.context(), 6 + 4526 + 49623);
+    }
+
+    #[test]
+    fn a_missing_transcript_is_reported_in_errors() {
+        // claude 2.1.295: -p --output-format stream-json --verbose --resume <unknown id>
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"total_cost_usd":0,"usage":{"input_tokens":0},"permission_denials":[],"errors":["No conversation found with session ID: 7d1b1d6a-0000-4000-8000-000000000000"]}"#;
+        let Event::Result(r) = serde_json::from_str(line).unwrap() else {
+            panic!("a result");
+        };
+        assert!(r.errors[0].starts_with("No conversation found"));
     }
 
     #[test]

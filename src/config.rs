@@ -92,6 +92,12 @@ pub struct Watch {
     pub nudges: u8,
     /// The same tool call this many times in a row is a loop.
     pub loop_repeats: u32,
+    /// Context window in tokens, passed as `--autocompact`.
+    pub autocompact: u64,
+    /// Share of the window at which a worker hands off to a fresh session.
+    pub handoff_at: f64,
+    /// Fresh sessions a task gets after its first.
+    pub max_handoffs: u32,
 }
 
 /// `90s`, `15m` or `1h`.
