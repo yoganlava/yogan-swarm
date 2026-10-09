@@ -20,9 +20,9 @@ use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
 use crate::critic::{self, Findings};
 use crate::redact::redact;
-use crate::stream::{self, Content, Event};
+use crate::stream::{self, Content, Event, RunResult};
 use crate::task::{self, Status, Task};
-use crate::{config, gate, git, pr, shim, slot};
+use crate::{config, gate, git, pr, sched, shim, slot};
 
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
@@ -510,6 +510,7 @@ fn lifecycle(
         task.save(state)?;
         let (instruction, mut resume) = (prompt, resume);
         let mut prompt = prompt.to_string();
+        let mut retried = false;
         loop {
             let mut cmd = Command::new("claude");
             cmd.args(["--permission-mode", "acceptEdits"])
@@ -527,6 +528,10 @@ fn lifecycle(
             if let Some(schema) = schema {
                 cmd.args(["--json-schema", schema]);
             }
+            let ceiling = task.budget_usd.unwrap_or(w.budget_usd);
+            if let Some(left) = budget_left(ceiling, task.spent())? {
+                cmd.args(["--max-budget-usd", &left.to_string()]);
+            }
             cmd.arg("--allowedTools")
                 .args(&allowed)
                 .arg("--disallowedTools")
@@ -538,6 +543,7 @@ fn lifecycle(
                 .envs(env.iter().cloned());
             let (mut denied, mut reply) = (Vec::new(), None);
             let (mut fresh, mut said) = (None, None);
+            let (mut rejected, mut step, mut outcome) = (None, None, None);
             let watch = Some((&cfg.watch, queue.as_path()));
             let res = claude(&mut cmd, &prompt, &mut log, &err_log, watch, |event| {
                 match event {
@@ -567,6 +573,11 @@ fn lifecycle(
                             _ => None,
                         });
                         said = text.or(said.take());
+                        let mut calls = message.content.iter().filter_map(|c| match c {
+                            Content::ToolUse { name, input, .. } => Some(call(name, input)),
+                            _ => None,
+                        });
+                        step = calls.next_back().or(step.take());
                         let (used, window) = (message.usage.context(), cfg.watch.autocompact);
                         if used as f64 >= cfg.watch.handoff_at * window as f64
                             && task.sessions.len() <= cfg.watch.max_handoffs as usize
@@ -575,7 +586,18 @@ fn lifecycle(
                             bail!("handing off");
                         }
                     }
+                    Event::RateLimitEvent { rate_limit_info: l } => {
+                        if !matches!(l.status.as_str(), "allowed" | "allowed_warning") {
+                            // ponytail: no reset time means a 5-minute guess
+                            rejected = Some(l.resets_at.unwrap_or(sched::now() + 300));
+                        }
+                    }
                     Event::Result(r) => {
+                        // never lower it: a crashed run can report zero
+                        let spent = task.usage.entry(r.session_id.clone()).or_default();
+                        *spent = spent.max(r.total_cost_usd);
+                        task.save(state)?;
+                        outcome = Some(next(&r, rejected, retried));
                         if r.errors
                             .iter()
                             .any(|e| e.starts_with("No conversation found"))
@@ -604,6 +626,29 @@ fn lifecycle(
                 prompt = handoff(task, &dir, base, said.as_deref(), instruction)?;
                 resume = false;
                 continue;
+            }
+            match outcome.unwrap_or(Next::Go) {
+                Next::Go => {}
+                Next::Fail(why) => bail!("{why}"),
+                Next::Park(until) => {
+                    sched::park(state, until)?;
+                    std::thread::sleep(Duration::from_secs(until.saturating_sub(sched::now())));
+                    prompt = "A rate limit paused you and has now reset. Carry on where you \
+                              left off."
+                        .into();
+                    resume = true;
+                    continue;
+                }
+                Next::Retry(status) => {
+                    retried = true;
+                    let step =
+                        step.map_or(String::new(), |s| format!(" Your last step was `{s}`."));
+                    prompt = format!(
+                        "Your last turn ended on an API error ({status}).{step} Pick up from there."
+                    );
+                    resume = true;
+                    continue;
+                }
             }
             if let Err(e) = &res
                 && let Some(nudge) = e.downcast_ref::<Nudge>()
@@ -735,6 +780,48 @@ fn mcp_servers(file: &Path) -> Result<Vec<String>> {
     Ok(servers.map(|(name, _)| name.clone()).collect())
 }
 
+/// A run's `--max-budget-usd`: what's left of the task's `ceiling`, since the flag counts only
+/// the run's own spend; none when the ceiling is 0, which turns it off.
+fn budget_left(ceiling: f64, spent: f64) -> Result<Option<f64>> {
+    if ceiling <= 0.0 {
+        return Ok(None);
+    }
+    let left = ceiling - spent;
+    ensure!(left > 0.0, "hit its spend ceiling of ${ceiling}");
+    Ok(Some(left))
+}
+
+/// What a run's result calls for.
+#[derive(Debug, PartialEq)]
+enum Next {
+    /// Carry on as usual.
+    Go,
+    /// A rate limit stopped it: wait until this Unix time, then resume.
+    Park(u64),
+    /// An API error ended it: resume once.
+    Retry(u16),
+    Fail(String),
+}
+
+/// `rejected` is the reset time of a rate limit the run reported as not allowed; `retried`
+/// whether this session already resumed after an API error.
+fn next(r: &RunResult, rejected: Option<u64>, retried: bool) -> Next {
+    if r.subtype == "error_max_budget_usd" {
+        return Next::Fail("hit its spend ceiling".into());
+    }
+    if !r.is_error {
+        return Next::Go;
+    }
+    if let Some(until) = rejected {
+        return Next::Park(until);
+    }
+    match r.api_error_status {
+        Some(status) if retried => Next::Fail(format!("API error {status} again after a retry")),
+        Some(status) => Next::Retry(status),
+        None => Next::Go,
+    }
+}
+
 /// A fresh session's prompt: the task, where the last session left off (`said`), the diff so
 /// far, and the instruction it was on if that wasn't the task itself.
 fn handoff(
@@ -790,6 +877,50 @@ mod tests {
     use super::*;
     use rustix::process::{getsid, test_kill_process};
     use std::time::{Duration, Instant};
+
+    fn result(json: &str) -> RunResult {
+        let base = serde_json::json!({
+            "subtype": "success", "is_error": false, "total_cost_usd": 0.5, "usage": {},
+            "permission_denials": []
+        });
+        let mut v = base.as_object().unwrap().clone();
+        v.extend(serde_json::from_str::<serde_json::Map<_, _>>(json).unwrap());
+        serde_json::from_value(v.into()).unwrap()
+    }
+
+    #[test]
+    fn budget_is_what_the_ceiling_leaves_or_off() {
+        assert_eq!(budget_left(5.0, 1.5).unwrap(), Some(3.5));
+        assert!(budget_left(5.0, 5.0).is_err());
+        assert_eq!(budget_left(0.0, 99.0).unwrap(), None);
+    }
+
+    #[test]
+    fn results_lead_to_go_park_retry_or_fail() {
+        let ok = result("{}");
+        assert_eq!(next(&ok, None, false), Next::Go);
+        // a rate limit that let the run finish isn't a reason to park
+        assert_eq!(next(&ok, Some(9), false), Next::Go);
+
+        let budget = result(r#"{"subtype": "error_max_budget_usd", "is_error": true}"#);
+        assert!(matches!(next(&budget, None, false), Next::Fail(_)));
+
+        let api = result(r#"{"is_error": true, "api_error_status": 529}"#);
+        assert_eq!(next(&api, None, false), Next::Retry(529));
+        assert!(matches!(next(&api, None, true), Next::Fail(w) if w.contains("529")));
+        // a rejected rate limit parks until its reset, retried or not
+        let limited = result(r#"{"is_error": true, "api_error_status": 429}"#);
+        assert_eq!(
+            next(&limited, Some(1791519000), true),
+            Next::Park(1791519000)
+        );
+
+        // any other error is left to the exit status
+        assert_eq!(
+            next(&result(r#"{"is_error": true}"#), None, false),
+            Next::Go
+        );
+    }
 
     #[test]
     fn loop_detector_counts_identical_calls_in_a_row() {

@@ -1478,6 +1478,7 @@ fn summary(f: &mut Frame, area: Rect, t: &Task, parent: Option<String>, sessions
     meta.extend(t.slot.map(|n| format!("slot {n}")));
     let n = t.sessions.len();
     meta.extend((n > 1).then(|| format!("session {n}/{sessions}")));
+    meta.extend((t.spent() > 0.0).then(|| format!("${:.2}", t.spent())));
     meta.extend(t.model.as_ref().map(|m| match &t.effort {
         Some(e) => format!("{m}/{e}"),
         None => m.clone(),

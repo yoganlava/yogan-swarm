@@ -3,6 +3,7 @@
 
 use std::fs::{self, File};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
@@ -16,6 +17,9 @@ pub fn run(repo: &Path) -> Result<()> {
     fs::create_dir_all(&state)?;
     let lock = File::create(state.join("sched.lock"))?;
     lock.lock()?;
+    if parked(&state, now()) {
+        return Ok(());
+    }
     let tasks = task::load_all(&state)?;
     for mut task in ready(&tasks, cfg.worker.concurrency, cfg.worker.slots) {
         task.status = Status::Running;
@@ -24,6 +28,21 @@ pub fn run(repo: &Path) -> Result<()> {
         task.save(&state)?;
     }
     Ok(())
+}
+
+/// Holds new workers back until `until` (Unix seconds), for a rate limit.
+pub(crate) fn park(state: &Path, until: u64) -> Result<()> {
+    Ok(fs::write(state.join("rate_limit"), until.to_string())?)
+}
+
+fn parked(state: &Path, now: u64) -> bool {
+    let until = fs::read_to_string(state.join("rate_limit")).unwrap_or_default();
+    until.trim().parse().is_ok_and(|until: u64| now < until)
+}
+
+pub(crate) fn now() -> u64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH);
+    since.map_or(0, |d| d.as_secs())
 }
 
 /// `Approved` tasks whose parent, if any, has its PR open, as many as the limits leave room for.
@@ -97,5 +116,16 @@ mod tests {
         // a task in Review still holds its slot: 5 slots - p, r, k = 2
         assert_eq!(ids(ready(&tasks, 9, 5)), ["a", "b"]);
         assert!(ready(&tasks, 2, 5).is_empty());
+    }
+
+    #[test]
+    fn a_rate_limit_holds_new_workers_until_its_reset() {
+        let state = std::env::temp_dir().join(format!("yogan-sched-{}", std::process::id()));
+        fs::create_dir_all(&state).unwrap();
+        assert!(!parked(&state, 100));
+        park(&state, 200).unwrap();
+        assert!(parked(&state, 100));
+        assert!(!parked(&state, 200));
+        fs::remove_dir_all(&state).unwrap();
     }
 }

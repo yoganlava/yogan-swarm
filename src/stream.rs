@@ -16,7 +16,9 @@ pub enum Event {
         #[serde(default)]
         message: Value,
     },
-    RateLimitEvent,
+    RateLimitEvent {
+        rate_limit_info: RateLimit,
+    },
     Result(RunResult),
     /// Not Claude's: the line the worker logs when it nudges a stalled or looping run.
     Nudge {
@@ -89,7 +91,17 @@ impl Usage {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RateLimit {
+    /// `allowed`, `allowed_warning` (near the limit, still running) or `rejected`.
+    pub status: String,
+    /// Unix seconds.
+    #[serde(rename = "resetsAt")]
+    pub resets_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RunResult {
+    /// `success`, or e.g. `error_max_budget_usd`.
     pub subtype: String,
     pub is_error: bool,
     pub total_cost_usd: f64,
@@ -104,6 +116,11 @@ pub struct RunResult {
     /// e.g. `No conversation found with session ID: …` for a `--resume` whose transcript is gone.
     #[serde(default)]
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub session_id: String,
+    /// Set when the turn ended on an API error.
+    #[serde(default)]
+    pub api_error_status: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,7 +173,13 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::System(System::Other)))
         );
-        assert!(events.iter().any(|e| matches!(e, Event::RateLimitEvent)));
+        let limit = events.iter().find_map(|e| match e {
+            Event::RateLimitEvent { rate_limit_info } => Some(rate_limit_info),
+            _ => None,
+        });
+        let limit = limit.expect("a rate limit event");
+        assert_eq!(limit.status, "allowed_warning");
+        assert_eq!(limit.resets_at, Some(1791519000));
         assert!(events.iter().any(|e| matches!(e, Event::User { .. })));
 
         let Some(Event::Result(r)) = events.last() else {

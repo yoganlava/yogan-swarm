@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,10 @@ pub struct Task {
     pub sessions: Vec<String>,
     pub branch: String,
     pub nudges: u8,
+    /// The latest `total_cost_usd` of each session, which is cumulative within a session.
+    #[serde(default)]
+    pub usage: BTreeMap<String, f64>,
+    /// The spend ceiling in USD; 0 turns it off.
     pub budget_usd: Option<f64>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -60,6 +65,11 @@ pub fn state_dir(checkout: &Path) -> Result<PathBuf> {
 }
 
 impl Task {
+    /// USD spent across the task's sessions.
+    pub fn spent(&self) -> f64 {
+        self.usage.values().sum()
+    }
+
     /// Writes `tasks/<id>.toml` atomically.
     pub fn save(&self, dir: &Path) -> Result<()> {
         write_toml(&dir.join("tasks"), &self.id, self)
@@ -210,6 +220,7 @@ mod tests {
             sessions: vec![],
             branch: "u/reject-negative".into(),
             nudges: 0,
+            usage: BTreeMap::from([("s-1".into(), 1.25)]),
             budget_usd: Some(5.0),
             model: None,
             effort: Some("high".into()),

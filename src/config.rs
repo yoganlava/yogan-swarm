@@ -69,6 +69,8 @@ pub struct Step {
 pub struct Worker {
     pub model: String,
     pub effort: String,
+    /// The spend ceiling per task in USD, unless the task sets its own; 0 turns it off.
+    pub budget_usd: f64,
     pub slots: u32,
     /// Workers running at once.
     pub concurrency: u32,
