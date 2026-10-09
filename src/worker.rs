@@ -280,14 +280,13 @@ fn mcp_servers(file: &Path) -> Result<Vec<String>> {
     Ok(servers.map(|(name, _)| name.clone()).collect())
 }
 
-// the lead always files 1-5 acceptance criteria
 fn prompt(task: &Task) -> String {
-    let mut p = format!(
-        "{}\n\n{}\n\nAcceptance criteria:\n- {}\n",
-        task.title,
-        task.body,
-        task.acceptance.join("\n- ")
-    );
+    let mut p = format!("{}\n\n{}\n", task.title, task.body);
+    // the lead files 1-5; a task typed in compose has none
+    if !task.acceptance.is_empty() {
+        let criteria = task.acceptance.join("\n- ");
+        p.push_str(&format!("\nAcceptance criteria:\n- {criteria}\n"));
+    }
     if !task.crates.is_empty() {
         p.push_str(&format!("\nCrates: {}\n", task.crates.join(", ")));
     }

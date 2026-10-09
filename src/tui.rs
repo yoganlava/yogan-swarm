@@ -2,10 +2,10 @@
 //! the state directory; workers run detached, so closing it changes nothing.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -16,9 +16,11 @@ use ratatui::widgets::{
 };
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
+use tui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::task::{self, Status, Task};
+use crate::{config, sched};
 
 /// List order, what needs you first; `Discarded` isn't shown.
 const GROUPS: [(Status, &str); 7] = [
@@ -31,7 +33,8 @@ const GROUPS: [(Status, &str); 7] = [
     (Status::PrOpen, "PR open"),
 ];
 
-const KEYS: [(&str, &str); 4] = [
+const KEYS: [(&str, &str); 5] = [
+    ("n", "new task"),
     ("j/k", "move"),
     ("tab", "switch pane"),
     ("?", "help"),
@@ -101,6 +104,8 @@ impl Theme {
 }
 
 struct App {
+    repo: PathBuf,
+    state: PathBuf,
     name: String,
     /// Shown tasks in list order, each with when its file last changed.
     tasks: Vec<(Task, Option<SystemTime>)>,
@@ -108,6 +113,32 @@ struct App {
     /// Narrow layout shows the detail pane instead of the list.
     detail: bool,
     help: bool,
+    compose: Option<Compose>,
+    /// An error to show in the footer until the next key.
+    notice: Option<String>,
+}
+
+/// The `n` screen: a request whose first line is the title, and an optional ticket.
+struct Compose {
+    request: TextArea<'static>,
+    ticket: TextArea<'static>,
+    on_ticket: bool,
+}
+
+impl Compose {
+    fn new() -> Compose {
+        let field = |placeholder: &str| {
+            let mut t = TextArea::default();
+            t.set_cursor_line_style(Style::new());
+            t.set_placeholder_text(placeholder);
+            t
+        };
+        Compose {
+            request: field("What should a worker do? The first line is the title."),
+            ticket: field("e.g. CC-687"),
+            on_ticket: false,
+        }
+    }
 }
 
 pub fn run(repo: &Path) -> Result<()> {
@@ -115,11 +146,15 @@ pub fn run(repo: &Path) -> Result<()> {
     reap(&state)?;
     let name = state.file_name().unwrap_or_default().to_string_lossy();
     let mut app = App {
+        repo: repo.to_path_buf(),
+        state: state.clone(),
         name: name.into_owned(),
         tasks: Vec::new(),
         selected: 0,
         detail: false,
         help: false,
+        compose: None,
+        notice: None,
     };
     let theme = Theme::detect();
     let mut terminal = ratatui::init();
@@ -187,9 +222,28 @@ impl App {
 
     /// Returns false to quit.
     fn key(&mut self, key: KeyEvent) -> bool {
-        let ctrl_c =
-            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
-        if key.code == KeyCode::Char('q') || ctrl_c {
+        let ctrl =
+            |c| key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c);
+        self.notice = None;
+        if ctrl('c') {
+            return false;
+        }
+        if let Some(c) = &mut self.compose {
+            match key.code {
+                KeyCode::Esc => self.compose = None,
+                KeyCode::Tab => c.on_ticket = !c.on_ticket,
+                _ if ctrl('s') => {
+                    if let Err(e) = self.submit() {
+                        self.notice = Some(format!("{e:#}"));
+                    }
+                }
+                KeyCode::Enter if c.on_ticket => {}
+                _ if c.on_ticket => _ = c.ticket.input(key),
+                _ => _ = c.request.input(key),
+            }
+            return true;
+        }
+        if key.code == KeyCode::Char('q') {
             return false;
         }
         if self.help {
@@ -198,6 +252,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('n') => self.compose = Some(Compose::new()),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.tasks.len().saturating_sub(1));
             }
@@ -209,6 +264,76 @@ impl App {
     }
 }
 
+impl App {
+    /// Files the composed request as an approved task and starts whatever is ready.
+    fn submit(&mut self) -> Result<()> {
+        let c = self.compose.as_ref().context("not composing")?;
+        let request = c.request.lines().join("\n");
+        let ticket = c.ticket.lines().join("").trim().to_string();
+        let cfg = config::load(&self.repo)?;
+        let tasks = task::load_all(&self.state)?;
+        let task = new_task(&request, &ticket, &cfg.branch_prefix, &tasks, now_id())?;
+        task.save(&self.state)?;
+        self.compose = None;
+        sched::run(&self.repo)
+    }
+}
+
+/// `t<unix seconds>`, so ids sort by creation.
+fn now_id() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("t{secs}")
+}
+
+/// An approved task from a typed request: the first line is the title, the rest the body.
+fn new_task(request: &str, ticket: &str, prefix: &str, tasks: &[Task], id: String) -> Result<Task> {
+    let request = request.trim();
+    let (title, body) = request.split_once('\n').unwrap_or((request, ""));
+    ensure!(!title.trim().is_empty(), "write a request first");
+    let taken = |s: &str| tasks.iter().any(|t| t.id == s);
+    let mut id = id;
+    while taken(&id) {
+        id.push('a'); // two submits in one second
+    }
+    let slug = slug(title);
+    let branch_taken = |b: &str| tasks.iter().any(|t| t.branch == b);
+    let mut branch = format!("{prefix}{slug}");
+    for n in 2.. {
+        if !branch_taken(&branch) {
+            break;
+        }
+        branch = format!("{prefix}{slug}-{n}");
+    }
+    Ok(Task {
+        id,
+        title: title.trim().into(),
+        body: body.trim().into(),
+        ticket: (!ticket.is_empty()).then(|| ticket.into()),
+        status: Status::Approved,
+        branch,
+        ..Default::default()
+    })
+}
+
+/// `Reject negative max_delay!` → `reject-negative-max-delay`, at most 40 chars.
+fn slug(title: &str) -> String {
+    let lower = title.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let slug = words.join("-"); // ASCII only, so any byte cut is a char boundary
+    let slug = slug[..slug.len().min(40)].trim_end_matches('-');
+    if slug.is_empty() {
+        "task".into()
+    } else {
+        slug.into()
+    }
+}
+
 fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -217,7 +342,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     ])
     .areas(f.area());
     f.render_widget(header_line(app, theme), header);
-    if body.width >= 100 {
+    if let Some(c) = &app.compose {
+        compose(f, body, c, theme);
+    } else if body.width >= 100 {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(body);
         list(f, left, app, theme, !app.detail, tick, now);
@@ -227,15 +354,37 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     } else {
         list(f, body, app, theme, true, tick, now);
     }
-    let keys = KEYS.iter().flat_map(|(key, label)| {
+    let keys: &[(&str, &str)] = if app.compose.is_some() {
+        &[("tab", "field"), ("ctrl-s", "submit"), ("esc", "cancel")]
+    } else {
+        &KEYS
+    };
+    let keys = keys.iter().flat_map(|(key, label)| {
         [
             Span::styled(format!(" {key} "), theme.accent),
             Span::raw(format!("{label} ")).dim(),
         ]
     });
-    f.render_widget(Line::from(keys.collect::<Vec<_>>()), footer);
+    let line = match &app.notice {
+        Some(notice) => Line::styled(format!(" {notice}"), theme.red),
+        None => Line::from(keys.collect::<Vec<_>>()),
+    };
+    f.render_widget(line, footer);
     if app.help {
         help(f, theme);
+    }
+}
+
+fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
+    let [request, ticket] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(area);
+    for (field, area, title, focused) in [
+        (&c.request, request, "New task", !c.on_ticket),
+        (&c.ticket, ticket, "Ticket", c.on_ticket),
+    ] {
+        let block = pane(title, focused, theme);
+        f.render_widget(field, block.inner(area));
+        f.render_widget(block, area);
     }
 }
 
@@ -468,11 +617,15 @@ mod tests {
             ),
         ];
         let app = App {
+            repo: PathBuf::new(),
+            state: PathBuf::new(),
             name: "fuse-os".into(),
             tasks,
             selected: 0,
             detail: false,
             help: false,
+            compose: None,
+            notice: None,
         };
         (app, now)
     }
@@ -483,6 +636,35 @@ mod tests {
         let rows = buf.content.chunks(buf.area.width as usize);
         rows.map(|row| row.iter().map(|c| c.symbol()).collect())
             .collect()
+    }
+
+    #[test]
+    fn composed_task() {
+        let other = Task {
+            id: "t5".into(),
+            branch: "u/reject-negative-max-delay".into(),
+            ..Default::default()
+        };
+        let request = "\n  Reject negative max_delay!\nIt panics later.\n\n";
+        let t = new_task(request, "CC-687", "u/", &[other], "t5".into()).unwrap();
+        assert_eq!(
+            (t.id.as_str(), t.title.as_str()),
+            ("t5a", "Reject negative max_delay!")
+        );
+        assert_eq!(
+            (t.body.as_str(), t.ticket.as_deref()),
+            ("It panics later.", Some("CC-687"))
+        );
+        assert_eq!(
+            (t.status, t.branch.as_str()),
+            (Status::Approved, "u/reject-negative-max-delay-2")
+        );
+        assert!(new_task(" \n", "", "", &[], "t6".into()).is_err());
+        assert_eq!(slug("Ünïcode & ...!"), "n-code");
+        assert_eq!(
+            slug("Split the ledger reconciliation job into per-account batches"),
+            "split-the-ledger-reconciliation-job-into"
+        );
     }
 
     #[test]
@@ -509,7 +691,7 @@ mod tests {
                 "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " j/k move  tab switch pane  ? help  q quit                                                          ",
+                " n new task  j/k move  tab switch pane  ? help  q quit                                              ",
             ]
         );
     }
@@ -531,7 +713,7 @@ mod tests {
                 "│ Running                                                  │",
                 "│ > / Retry webhook sends                    working · 12m │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " j/k move  tab switch pane  ? help  q quit                  ",
+                " n new task  j/k move  tab switch pane  ? help  q quit      ",
             ]
         );
     }

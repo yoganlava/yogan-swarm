@@ -9,6 +9,9 @@ const DEFAULTS: &str = include_str!("defaults.toml");
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// Prefixed to every task branch, e.g. `udeshya/`.
+    #[serde(default)]
+    pub branch_prefix: String,
     pub lead: Role,
     pub ask: Role,
     pub pr: Role,

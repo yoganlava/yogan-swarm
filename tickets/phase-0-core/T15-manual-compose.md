@@ -1,4 +1,4 @@
-- [ ] **T15 Manual compose**
+- [x] **T15 Manual compose**
 
 Plan: TUI › Screens › 1. Compose; Gate, review and PRs › PR drafts (Tickets).
 
