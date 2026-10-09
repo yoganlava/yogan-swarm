@@ -13,11 +13,18 @@ pub struct Config {
     pub ask: Role,
     pub pr: Role,
     pub critic: Role,
-    pub worker: Role,
+    pub worker: Worker,
     pub ports: Option<Ports>,
     pub scripts: Option<Scripts>,
     pub build: Build,
     pub cargo: Option<Cargo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Worker {
+    pub model: String,
+    pub effort: String,
+    pub slots: u32,
 }
 
 #[derive(Debug, Deserialize)]

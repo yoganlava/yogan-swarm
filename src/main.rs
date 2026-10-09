@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
     }
     match Cli::parse().command {
         None => anyhow::bail!("TUI not built yet (T14)"),
-        Some(Command::Worker { id }) => anyhow::bail!("worker {id}: not built yet (T10)"),
+        Some(Command::Worker { id }) => yogan_swarm::worker::run(&std::env::current_dir()?, &id),
         Some(Command::Task {
             command: TaskCommand::Propose,
         }) => anyhow::bail!("task propose: not built yet (T20)"),

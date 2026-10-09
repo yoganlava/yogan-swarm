@@ -9,6 +9,7 @@ pub mod shim;
 pub mod slot;
 pub mod stream;
 pub mod task;
+pub mod worker;
 
 /// Runs `git -C dir args…` and returns trimmed stdout; a failure carries git's stderr.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
