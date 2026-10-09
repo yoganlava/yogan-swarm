@@ -469,7 +469,7 @@ fn lifecycle(
     let base = base.as_str();
     let dir = match existing {
         true => state.join("slots").join(n.to_string()),
-        false => slot::prepare(repo, state, n, &task.branch, base)?,
+        false => slot::prepare(repo, state, n, &task.branch, base, cfg.disk.max_target_gb)?,
     };
     let mut env = slot::env(repo, &dir, n, task, cfg.ports.as_ref());
     if repo.join("Cargo.toml").exists() {

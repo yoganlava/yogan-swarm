@@ -24,6 +24,15 @@ pub struct Config {
     pub cargo: Option<Cargo>,
     pub gate: Gate,
     pub watch: Watch,
+    pub disk: Disk,
+}
+
+/// Slot cleanup thresholds.
+#[derive(Debug, Deserialize)]
+pub struct Disk {
+    /// Per slot, measured as divergence from the seed.
+    pub max_target_gb: u64,
+    pub min_free_gb: u64,
 }
 
 #[derive(Debug, Deserialize)]

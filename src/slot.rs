@@ -1,8 +1,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, TryLockError};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, ensure};
 
@@ -20,11 +22,8 @@ pub fn claim(state: &Path, tasks: &[Task], count: u32) -> Result<Option<(u32, Fi
         if tasks.iter().any(|t| t.slot == Some(n)) {
             continue;
         }
-        let file = File::create(state.join(format!("slots/{n}.lock")))?;
-        match file.try_lock() {
-            Ok(()) => return Ok(Some((n, file))),
-            Err(TryLockError::WouldBlock) => continue,
-            Err(TryLockError::Error(e)) => return Err(e.into()),
+        if let Some(file) = try_lock(state, n)? {
+            return Ok(Some((n, file)));
         }
     }
     Ok(None)
@@ -32,17 +31,31 @@ pub fn claim(state: &Path, tasks: &[Task], count: u32) -> Result<Option<(u32, Fi
 
 /// Locks slot `n`, which a task already holds, for as long as the file is kept.
 pub fn lock(state: &Path, n: u32) -> Result<File> {
+    try_lock(state, n)?.with_context(|| format!("slot {n} is busy"))
+}
+
+/// Slot `n`'s lock, or `None` while a worker holds it.
+fn try_lock(state: &Path, n: u32) -> Result<Option<File>> {
     let file = File::create(state.join(format!("slots/{n}.lock")))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => anyhow::bail!("slot {n} is busy"),
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
-/// Checks out a fresh `branch` from `base` (e.g. `origin/main`) in slot `n`, adding and
-/// seeding the worktree on first use. Discards whatever the slot's previous task left behind.
-pub fn prepare(repo: &Path, state: &Path, n: u32, branch: &str, base: &str) -> Result<PathBuf> {
+/// Checks out a fresh `branch` from `base` (e.g. `origin/main`) in slot `n`, adding the worktree
+/// on first use. Discards whatever the slot's previous task left behind. In a cargo repo, cleans
+/// the target dir after a toolchain change or past `max_target_gb` of divergence, and seeds a
+/// missing one.
+pub fn prepare(
+    repo: &Path,
+    state: &Path,
+    n: u32,
+    branch: &str,
+    base: &str,
+    max_target_gb: u64,
+) -> Result<PathBuf> {
     let dir = state.join("slots").join(n.to_string());
     git(repo, &["worktree", "prune"])?;
     git(repo, &["fetch", "--quiet", "origin"])?;
@@ -59,10 +72,97 @@ pub fn prepare(repo: &Path, state: &Path, n: u32, branch: &str, base: &str) -> R
         &["checkout", "--quiet", "--force", "-B", branch, base],
     )?;
     git(&dir, &["clean", "-fdq"])?;
-    if fresh {
-        seed(repo, &dir)?;
+    if repo.join("Cargo.toml").exists() {
+        let target = dir.join("target");
+        if toolchain_changed(state, n, &dir)? || divergence(&target) > max_target_gb << 30 {
+            clean(state, n)?;
+        }
+        if !target.exists() {
+            seed(repo, &dir)?;
+        }
     }
     Ok(dir)
+}
+
+/// Below `min_free_gb` free, cleans slots that no task holds and no worker has locked, most
+/// diverged first, until there's enough. The next `prepare` in each re-seeds it.
+// ponytail: runs inline in the scheduler, so a big delete pauses its caller; detach it if that shows
+pub fn free_disk(state: &Path, tasks: &[Task], count: u32, min_free_gb: u64) -> Result<()> {
+    let want = min_free_gb << 30;
+    if free(state)? >= want {
+        return Ok(());
+    }
+    let mut idle = Vec::new();
+    for n in 1..=count {
+        let target = state.join(format!("slots/{n}/target"));
+        if tasks.iter().any(|t| t.slot == Some(n)) || !target.exists() {
+            continue;
+        }
+        if let Some(lock) = try_lock(state, n)? {
+            idle.push((divergence(&target), n, lock));
+        }
+    }
+    idle.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (_, n, _lock) in idle {
+        if free(state)? >= want {
+            break;
+        }
+        clean(state, n)?;
+    }
+    Ok(())
+}
+
+fn free(dir: &Path) -> Result<u64> {
+    let vfs = rustix::fs::statvfs(dir)?;
+    Ok(vfs.f_bavail * vfs.f_frsize)
+}
+
+/// Removes slot `n`'s target dir, as `cargo clean` would. The caller holds the slot's lock; this
+/// takes its build permit exclusively, so any build there finishes first.
+fn clean(state: &Path, n: u32) -> Result<()> {
+    let permit = File::create(state.join(format!("slots/{n}.build")))?;
+    permit.lock()?;
+    match fs::remove_dir_all(state.join(format!("slots/{n}/target"))) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `rustc -vV` in `dir` differs from what slot `n` last recorded; records the new one.
+fn toolchain_changed(state: &Path, n: u32, dir: &Path) -> Result<bool> {
+    let out = Command::new("rustc")
+        .arg("-vV")
+        .current_dir(dir)
+        .output()
+        .context("running rustc -vV")?;
+    let now = String::from_utf8_lossy(&out.stdout);
+    let file = state.join(format!("slots/{n}.toolchain"));
+    let before = fs::read_to_string(&file).ok();
+    fs::write(&file, now.as_bytes())?;
+    Ok(before.is_some_and(|b| b != now))
+}
+
+/// Marks when a target dir was seeded.
+const SEEDED: &str = ".yogan-seeded";
+
+/// Bytes in `target` written since it was seeded: the slot's own share of the disk, since a
+/// clone shares its blocks with the seed until they're rewritten.
+// ponytail: files newer than the seed stand in for unshared blocks; an unseeded target counts in full
+fn divergence(target: &Path) -> u64 {
+    let since = fs::metadata(target.join(SEEDED)).and_then(|m| m.modified());
+    newer(target, since.unwrap_or(SystemTime::UNIX_EPOCH))
+}
+
+fn newer(dir: &Path, since: SystemTime) -> u64 {
+    let entries = fs::read_dir(dir).into_iter().flatten().flatten();
+    entries
+        .filter_map(|e| Some((e.path(), e.metadata().ok()?)))
+        .map(|(path, meta)| match meta.is_dir() {
+            true => newer(&path, since),
+            false if meta.modified().is_ok_and(|m| m > since) => meta.blocks() * 512,
+            false => 0,
+        })
+        .sum()
 }
 
 /// Variables that slot scripts, Claude, the gate and the critic all run with.
@@ -171,17 +271,15 @@ pub fn running(state: &Path, id: &str) -> Option<u32> {
     pid.trim().parse().ok().filter(|p| worker::alive(*p))
 }
 
-/// Cargo repos only: clones the main checkout's target dir into `<slot>/target` without
-/// incremental caches (rustc never reuses them after a move), then copies mtimes so Cargo's
-/// fingerprints still match.
+/// Clones the main checkout's target dir into `<slot>/target` without incremental caches (rustc
+/// never reuses them after a move), then copies mtimes so Cargo's fingerprints still match.
 fn seed(repo: &Path, slot: &Path) -> Result<()> {
-    if !repo.join("Cargo.toml").exists() {
-        return Ok(());
-    }
     // ponytail: assumes the default `<repo>/target`; ask `cargo metadata` if a repo sets target-dir
     let main_target = repo.join("target");
     if main_target.is_dir() {
-        clone_tree(&main_target, &slot.join("target"), 0)?;
+        let target = slot.join("target");
+        clone_tree(&main_target, &target, 0)?;
+        File::create(target.join(SEEDED))?;
     }
     copy_mtimes(repo, slot)
 }
@@ -337,7 +435,7 @@ mod tests {
         assert_eq!(n, 2);
         assert!(claim(&state, &[], 2).unwrap().is_none());
 
-        let slot = prepare(&repo, &state, 1, "u/first", "origin/main").unwrap();
+        let slot = prepare(&repo, &state, 1, "u/first", "origin/main", 60).unwrap();
         assert_eq!(
             git(&slot, &["branch", "--show-current"]).unwrap(),
             "u/first"
@@ -354,13 +452,58 @@ mod tests {
         assert_eq!(claim(&state, &[holder], 2).unwrap().unwrap().0, 1);
 
         // reuse: same worktree, new branch, previous task's leftovers gone
-        let again = prepare(&repo, &state, 1, "u/second", "origin/main").unwrap();
+        let again = prepare(&repo, &state, 1, "u/second", "origin/main", 60).unwrap();
         assert_eq!(again, slot);
         assert_eq!(
             git(&slot, &["branch", "--show-current"]).unwrap(),
             "u/second"
         );
         assert!(!slot.join("junk.txt").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn free_disk_skips_held_slots_and_counts_divergence() {
+        use std::time::Duration;
+        let root = std::env::temp_dir().join(format!("yogan-disk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let state = root.join("state");
+        for n in 1..=3 {
+            fs::create_dir_all(state.join(format!("slots/{n}/target/debug"))).unwrap();
+            fs::write(state.join(format!("slots/{n}/target/debug/lib")), [1; 8192]).unwrap();
+        }
+
+        // divergence counts only what was written after the seed
+        let target = state.join("slots/1/target");
+        let hour = Duration::from_secs(3600);
+        let at = |name: &str, t| {
+            let f = File::options().write(true).open(target.join(name)).unwrap();
+            f.set_modified(t).unwrap();
+        };
+        File::create(target.join(SEEDED)).unwrap();
+        at(SEEDED, SystemTime::now() - hour);
+        at("debug/lib", SystemTime::now() - 2 * hour);
+        assert_eq!(divergence(&target), 0);
+        fs::write(target.join("debug/new"), [1; 8192]).unwrap();
+        let new = fs::metadata(target.join("debug/new")).unwrap().blocks() * 512;
+        assert_eq!(divergence(&target), new);
+
+        // slot 1 has a running worker, slot 2 a task in Review; only slot 3 is idle
+        let (n, _worker) = claim(&state, &[], 1).unwrap().unwrap();
+        assert_eq!(n, 1);
+        let review = Task {
+            slot: Some(2),
+            ..Default::default()
+        };
+        // a threshold no disk meets, so every idle slot is cleaned
+        free_disk(&state, &[review], 3, u64::MAX >> 30).unwrap();
+        assert!(state.join("slots/1/target").exists());
+        assert!(state.join("slots/2/target").exists());
+        assert!(!state.join("slots/3/target").exists());
+        // enough free space cleans nothing
+        free_disk(&state, &[], 3, 0).unwrap();
+        assert!(state.join("slots/2/target").exists());
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -490,19 +633,19 @@ mod tests {
         assert!(repo.join("target/debug/incremental").is_dir());
 
         let state = root.join("state");
-        let slot = prepare(&repo, &state, 1, "u/a", "origin/main").unwrap();
+        let slot = prepare(&repo, &state, 1, "u/a", "origin/main", 60).unwrap();
         assert!(!slot.join("target/debug/incremental").exists());
         assert!(!build(&slot).contains("Compiling"), "seeded slot rebuilt");
 
         // an untracked file in a main-checkout dir keeps that dir's fresh mtime in the slot
         fs::write(repo.join("assets/new.txt"), "untracked").unwrap();
-        let slot = prepare(&repo, &state, 2, "u/b", "origin/main").unwrap();
+        let slot = prepare(&repo, &state, 2, "u/b", "origin/main", 60).unwrap();
         assert!(build(&slot).contains("Compiling seedling"));
         fs::remove_file(repo.join("assets/new.txt")).unwrap();
 
         // a file the main checkout has modified keeps its fresh mtime, so the slot rebuilds
         fs::write(repo.join("src/lib.rs"), "pub fn f() { /* local edit */ }\n").unwrap();
-        let slot = prepare(&repo, &state, 3, "u/c", "origin/main").unwrap();
+        let slot = prepare(&repo, &state, 3, "u/c", "origin/main", 60).unwrap();
         assert!(build(&slot).contains("Compiling seedling"));
 
         fs::remove_dir_all(&root).unwrap();

@@ -1,4 +1,4 @@
-- [ ] **T32 Disk cleanup**
+- [x] **T32 Disk cleanup**
 
 Plan: Workers › Disk and cargo clean.
 

@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 
 use crate::task::{self, Status, Task};
-use crate::{config, worker};
+use crate::{config, slot, worker};
 
 /// Under `sched.lock`, starts ready tasks up to `[worker] concurrency` and the free slots.
 pub fn run(repo: &Path) -> Result<()> {
@@ -17,10 +17,11 @@ pub fn run(repo: &Path) -> Result<()> {
     fs::create_dir_all(&state)?;
     let lock = File::create(state.join("sched.lock"))?;
     lock.lock()?;
+    let tasks = task::load_all(&state)?;
+    slot::free_disk(&state, &tasks, cfg.worker.slots, cfg.disk.min_free_gb)?;
     if parked(&state, now()) {
         return Ok(());
     }
-    let tasks = task::load_all(&state)?;
     for mut task in ready(&tasks, cfg.worker.concurrency, cfg.worker.slots) {
         task.status = Status::Running;
         task.pid = Some(worker::spawn(repo, &task.id, &[])?);
