@@ -42,7 +42,7 @@ const GROUPS: [(Status, &str); 7] = [
 const TABS: [&str; 5] = ["Summary", "Activity", "Gate", "Findings", "Diff"];
 const FINDINGS: usize = 3;
 
-const KEYS: [(&str, &str); 16] = [
+const KEYS: [(&str, &str); 18] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -59,6 +59,8 @@ const KEYS: [(&str, &str); 16] = [
     ("x", "discard"),
     ("?", "help"),
     ("q", "quit"),
+    ("c", "continue"),
+    ("w", "rewind"),
 ];
 
 /// Every color and glyph, so a light-terminal or ASCII variant is one swap. Nothing paints a
@@ -176,8 +178,13 @@ struct App {
     /// Sessions a task gets: its first plus `[watch] max_handoffs`.
     sessions: u32,
     /// What the reply modal is for when it isn't the lead: `r` upholds the selected finding,
-    /// `x` waives it.
-    on_finding: Option<char>,
+    /// `x` waives it, `t` retries a failed task and `w` rewinds one.
+    reply_for: Option<char>,
+    /// `w`'s picker: the worker's commits as `sha subject`, newest first, and the picked one.
+    commits: Vec<String>,
+    commit: usize,
+    /// A slot and session to continue in `claude` once the TUI is suspended.
+    interactive: Option<(PathBuf, String)>,
     /// The selected task's findings, and the cursor over their actionable ones.
     findings: Findings,
     finding: usize,
@@ -253,7 +260,10 @@ pub fn run(repo: &Path) -> Result<()> {
         edit: false,
         reply: None,
         answer: None,
-        on_finding: None,
+        reply_for: None,
+        commits: Vec::new(),
+        commit: 0,
+        interactive: None,
         findings: Findings::default(),
         finding: 0,
         disputed: Vec::new(),
@@ -298,6 +308,17 @@ pub fn run(repo: &Path) -> Result<()> {
                     .args(["diff", &diff])
                     .status()?;
                 terminal = ratatui::init();
+            }
+            if let Some((dir, session)) = app.interactive.take() {
+                ratatui::restore();
+                let ran = Command::new("claude")
+                    .args(["--resume", &session])
+                    .current_dir(&dir)
+                    .status();
+                terminal = ratatui::init();
+                if let Err(e) = ran {
+                    app.notice = Some(format!("claude: {e}"));
+                }
             }
             if std::mem::take(&mut app.edit) {
                 ratatui::restore();
@@ -547,7 +568,13 @@ impl App {
         }
         if let Some(input) = &mut self.reply {
             match key.code {
-                KeyCode::Esc => (self.reply, self.on_finding) = (None, None),
+                KeyCode::Esc => (self.reply, self.reply_for) = (None, None),
+                KeyCode::Up if self.reply_for == Some('w') => {
+                    self.commit = self.commit.saturating_sub(1);
+                }
+                KeyCode::Down if self.reply_for == Some('w') => {
+                    self.commit = (self.commit + 1).min(self.commits.len().saturating_sub(1));
+                }
                 _ if ctrl('s') => {
                     let text = input.lines().join("\n");
                     self.reply = None;
@@ -609,6 +636,7 @@ impl App {
             .task()
             .is_some_and(|(t, _)| t.status == Status::Proposed);
         let failed = self.request().is_some_and(|r| r.status == Phase::Failed);
+        let status = self.task().map(|(t, _)| t.status);
         let answered = self.request().is_some_and(|r| r.status == Phase::Done);
         if self.on_findings() {
             let n = self.findings.actionable().count();
@@ -624,12 +652,12 @@ impl App {
                 }
                 KeyCode::Char('x') if n > 0 => {
                     self.reply = Some(field("Why waive it? The reason goes in the PR body"));
-                    self.on_finding = Some('x');
+                    self.reply_for = Some('x');
                     return true;
                 }
                 KeyCode::Char('r') if disputed => {
                     self.reply = Some(field("Why the critic is right, for the worker"));
-                    self.on_finding = Some('r');
+                    self.reply_for = Some('r');
                     return true;
                 }
                 _ => {}
@@ -662,6 +690,28 @@ impl App {
                     self.notice = Some(format!("{e:#}"));
                 }
             }
+            KeyCode::Char('t') if status == Some(Status::Failed) => {
+                let model = self.task().and_then(|(t, _)| t.model.clone());
+                let keep = model.map_or(String::new(), |m| format!("; empty keeps {m}"));
+                self.reply = Some(field(&format!("Model to retry on{keep}")));
+                self.reply_for = Some('t');
+            }
+            KeyCode::Char('c') if matches!(status, Some(Status::Review | Status::Failed)) => {
+                let session = self.task().and_then(|(t, _)| t.sessions.last().cloned());
+                match (self.slot_dir(), session) {
+                    (Some(dir), Some(s)) => self.interactive = Some((dir, s)),
+                    _ => self.notice = Some("this task has no session to continue".into()),
+                }
+            }
+            KeyCode::Char('w') if status == Some(Status::Review) => match self.worker_commits() {
+                Ok(commits) if !commits.is_empty() => {
+                    (self.commits, self.commit) = (commits, 0);
+                    self.reply = Some(field("Why rewind? The worker resumes with this"));
+                    self.reply_for = Some('w');
+                }
+                Ok(_) => self.notice = Some("the worker made no commits".into()),
+                Err(e) => self.notice = Some(format!("{e:#}")),
+            },
             KeyCode::Char('m') => {
                 if let Err(e) = self.draft(None) {
                     self.notice = Some(format!("{e:#}"));
@@ -958,11 +1008,82 @@ impl App {
     }
 
     /// Sends `text` to the selected proposal's lead, which refiles its revised plan.
-    fn send_reply(&mut self, text: &str) -> Result<()> {
-        ensure!(!text.trim().is_empty(), "write a reply first");
-        if let Some(act) = self.on_finding.take() {
-            return self.act_on_finding(act, text.trim());
+    /// `t` on a failed task: resumes its session in its slot on `model` (empty keeps its own),
+    /// or queues it afresh when it never got a session.
+    fn retry_task(&mut self, model: &str) -> Result<()> {
+        let (t, _) = self.task().context("no task selected")?;
+        ensure!(
+            t.status == Status::Failed,
+            "only a failed task can be retried"
+        );
+        let mut t = t.clone();
+        if !model.is_empty() {
+            t.model = Some(model.into());
         }
+        t.nudges = 0;
+        if t.sessions.is_empty() {
+            // nothing to resume, so a fresh checkout loses nothing
+            (t.status, t.slot) = (Status::Approved, None);
+            t.save(&self.state)?;
+            sched::run(&self.repo)?;
+        } else {
+            t.save(&self.state)?;
+            let why = t.summary.as_deref().unwrap_or("unknown");
+            let prompt = format!(
+                "yogan stopped this task: {why}\n\nThe human retried it. Carry on from where you \
+                 left off; if the same problem comes back, stop and explain it."
+            );
+            worker::spawn(&self.repo, &t.id, &["--reply", &prompt])?;
+        }
+        self.info = Some("retrying".into());
+        Ok(())
+    }
+
+    /// The worker's commits in the selected task's slot, newest first, as `sha subject`.
+    fn worker_commits(&self) -> Result<Vec<String>> {
+        let dir = self.slot_dir().context("this task has no worktree")?;
+        let range = format!("{}..HEAD", self.base()?);
+        let log = git(&dir, &["log", "--format=%h %s", &range])?;
+        Ok(log.lines().map(String::from).collect())
+    }
+
+    /// `w`: resets the slot to the picked commit and resumes the worker with `reason`.
+    fn rewind(&mut self, reason: &str) -> Result<()> {
+        ensure!(!reason.is_empty(), "write a reason first");
+        let (t, _) = self.task().context("no task selected")?;
+        ensure!(
+            t.status == Status::Review,
+            "rewind a task once it's in Review"
+        );
+        let id = t.id.clone();
+        let dir = self.slot_dir().context("this task has no worktree")?;
+        let target = self.commits.get(self.commit).context("no commit picked")?;
+        let sha = target.split(' ').next().unwrap_or_default();
+        git(&dir, &["reset", "--quiet", "--hard", sha])?;
+        let dropped = match self.commit {
+            0 => "keeping every commit".to_string(),
+            n => format!(
+                "dropping these later commits:\n{}",
+                self.commits[..n].join("\n")
+            ),
+        };
+        let prompt = format!(
+            "The human rewound this branch to {target}, {dropped}\n\nTheir reason: {reason}\n\n\
+             Carry on from there."
+        );
+        worker::spawn(&self.repo, &id, &["--reply", &prompt])?;
+        self.info = Some(format!("rewound to {sha}; the worker is resuming"));
+        Ok(())
+    }
+
+    fn send_reply(&mut self, text: &str) -> Result<()> {
+        match self.reply_for.take() {
+            Some('t') => return self.retry_task(text.trim()),
+            Some('w') => return self.rewind(text.trim()),
+            Some(act) => return self.act_on_finding(act, text.trim()),
+            None => {}
+        }
+        ensure!(!text.trim().is_empty(), "write a reply first");
         if let Some(r) = self.request() {
             let id = r.id.clone();
             lead::follow_up(&self.repo, &self.state, &id, text.trim())?;
@@ -1119,7 +1240,11 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             .filter(|(k, _)| match *k {
                 "d" => selected.is_some_and(|t| t.slot.is_some()),
                 "x" => selected.is_some() || failed || answered,
-                "t" => failed,
+                "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
+                "c" => {
+                    selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed))
+                }
+                "w" => selected.is_some_and(|t| t.status == Status::Review),
                 "p" | "y" => answered,
                 "1-5" => selected.is_some(),
                 "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
@@ -1177,15 +1302,37 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     if let Some(input) = &app.reply {
         let all = f.area();
         f.buffer_mut().set_style(all, Style::new().dim());
-        let area = centered(all, 64, 8);
-        let title = match app.on_finding {
+        let picks = match app.reply_for {
+            Some('w') => app.commits.len() as u16 + 1,
+            _ => 0,
+        };
+        let area = centered(all, 64, 8 + picks);
+        let title = match app.reply_for {
             Some('x') => "Waive the finding",
+            Some('t') => "Retry the task",
+            Some('w') => "Rewind to a commit (↑↓)",
             Some(_) => "Uphold the finding",
             None => "Reply to the lead",
         };
         let block = pane(title, true, theme);
+        let [list, field] = Layout::vertical([Constraint::Length(picks), Constraint::Fill(1)])
+            .areas(block.inner(area));
+        let commits = app
+            .commits
+            .iter()
+            .enumerate()
+            .map(|(i, c)| match i == app.commit {
+                true => Line::from(vec![
+                    Span::styled(theme.bar, theme.accent),
+                    Span::raw(c.clone()),
+                ]),
+                false => Line::raw(format!(" {c}")).dim(),
+            });
         f.render_widget(Clear, area);
-        f.render_widget(input, block.inner(area));
+        if picks > 0 {
+            f.render_widget(Paragraph::new(commits.collect::<Vec<_>>()), list);
+        }
+        f.render_widget(input, field);
         f.render_widget(block, area);
     }
 }
@@ -1880,7 +2027,10 @@ mod tests {
             edit: false,
             reply: None,
             answer: None,
-            on_finding: None,
+            reply_for: None,
+            commits: Vec::new(),
+            commit: 0,
+            interactive: None,
             findings: Findings::default(),
             finding: 0,
             disputed: Vec::new(),
@@ -2450,6 +2600,78 @@ mod tests {
     }
 
     #[test]
+    fn rewind_picks_a_worker_commit_and_retry_asks_for_a_model() {
+        let (mut app, now) = app();
+        let state = std::env::temp_dir().join(format!("yogan-rewind-{}", std::process::id()));
+        let slot = state.join("slots/1");
+        fs::create_dir_all(&slot).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&slot)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "feat: one"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "fix: two"]);
+        app.state = state.clone();
+        app.tasks[0].0.save(&state).unwrap();
+        let press = |app: &mut App, code| app.key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        // w on the task in Review lists the worker's commits, newest first
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.reply_for, Some('w'), "{:?}", app.notice);
+        let subjects: Vec<_> = app
+            .commits
+            .iter()
+            .map(|c| c.split_once(' ').unwrap().1)
+            .collect();
+        assert_eq!(subjects, ["fix: two", "feat: one"]);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.commit, 1);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let rows = screen(&term);
+        assert!(
+            rows.iter().any(|r| r.contains("Rewind to a commit")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("▌") && r.contains("feat: one")),
+            "{rows:#?}"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.reply_for, None);
+
+        // c needs a session to continue
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.interactive.is_none());
+        app.tasks[0].0.sessions = vec!["s-1".into()];
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.interactive, Some((slot.clone(), "s-1".into())));
+
+        // t on the failed task asks for a model
+        app.interactive = None;
+        app.selected = 1;
+        app.tasks[1].0.model = Some("claude-opus-5-5".into());
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.reply_for, Some('t'));
+        let hint = app.reply.as_ref().unwrap().placeholder_text().to_string();
+        assert_eq!(hint, "Model to retry on; empty keeps claude-opus-5-5");
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
     fn waiving_a_finding() {
         let (mut app, _) = app();
         let state = std::env::temp_dir().join(format!("yogan-waive-{}", std::process::id()));
@@ -2459,7 +2681,7 @@ mod tests {
         app.load_tab();
         app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert_eq!(app.on_finding, Some('x'));
+        assert_eq!(app.reply_for, Some('x'));
         app.reply.as_mut().unwrap().insert_str("0 is fine here");
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.notice.is_none(), "{:?}", app.notice);
@@ -2594,7 +2816,7 @@ mod tests {
                 "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR  x discard  ? help  q quit             ",
+                " n new task  j/k move  tab pane  1-5 tabs  d diff  m open PR  x discard  ? help  q quit  c continue ",
             ]
         );
     }
