@@ -23,7 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::stream::{self, Content};
 use crate::task::{self, Status, Task};
-use crate::{config, git, sched, slot, worker};
+use crate::{config, git, pr, sched, slot, worker};
 
 /// List order, what needs you first; `Discarded` isn't shown.
 const GROUPS: [(Status, &str); 7] = [
@@ -38,12 +38,13 @@ const GROUPS: [(Status, &str); 7] = [
 
 const TABS: [&str; 4] = ["Summary", "Activity", "Gate", "Diff"];
 
-const KEYS: [(&str, &str); 8] = [
+const KEYS: [(&str, &str); 9] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
     ("1-4", "tabs"),
     ("d", "diff"),
+    ("m", "open PR"),
     ("x", "discard"),
     ("?", "help"),
     ("q", "quit"),
@@ -142,6 +143,14 @@ struct App {
     confirm: bool,
     /// A slot whose full diff to page once the TUI is suspended.
     pager: Option<PathBuf>,
+    /// Showing the selected task's PR draft.
+    preview: bool,
+    /// A task being drafted, with the draft it had, to preview once a new one lands.
+    awaiting: Option<(String, Option<pr::Draft>)>,
+    /// The instruction for `g` in the preview, while it's being typed.
+    instruction: Option<TextArea<'static>>,
+    /// Edit the PR draft in `$EDITOR` once the TUI is suspended.
+    edit: bool,
 }
 
 /// The `n` screen: a request whose first line is the title, and an optional ticket.
@@ -151,14 +160,16 @@ struct Compose {
     on_ticket: bool,
 }
 
+/// An empty input with a placeholder and no cursor-line underline.
+fn field(placeholder: &str) -> TextArea<'static> {
+    let mut t = TextArea::default();
+    t.set_cursor_line_style(Style::new());
+    t.set_placeholder_text(placeholder);
+    t
+}
+
 impl Compose {
     fn new() -> Compose {
-        let field = |placeholder: &str| {
-            let mut t = TextArea::default();
-            t.set_cursor_line_style(Style::new());
-            t.set_placeholder_text(placeholder);
-            t
-        };
         Compose {
             request: field("What should a worker do? The first line is the title."),
             ticket: field("e.g. CC-687"),
@@ -188,6 +199,10 @@ pub fn run(repo: &Path) -> Result<()> {
         loaded: None,
         confirm: false,
         pager: None,
+        preview: false,
+        awaiting: None,
+        instruction: None,
+        edit: false,
     };
     let theme = Theme::detect();
     let mut terminal = ratatui::init();
@@ -196,6 +211,7 @@ pub fn run(repo: &Path) -> Result<()> {
         loop {
             app.reload(&state)?;
             app.load_tab();
+            app.check_awaiting();
             let tick = (start.elapsed().as_millis() / 125) as usize; // spinner at 8 Hz
             // ratatui only writes cells that changed, so an idle screen draws nothing
             terminal.draw(|f| draw(f, &app, &theme, tick, SystemTime::now()))?;
@@ -217,6 +233,14 @@ pub fn run(repo: &Path) -> Result<()> {
                     .args(["diff", &diff])
                     .status()?;
                 terminal = ratatui::init();
+            }
+            if std::mem::take(&mut app.edit) {
+                ratatui::restore();
+                let edited = app.edit_draft();
+                terminal = ratatui::init();
+                if let Err(e) = edited {
+                    app.notice = Some(format!("{e:#}"));
+                }
             }
         }
     })();
@@ -287,6 +311,37 @@ impl App {
             }
             return true;
         }
+        if let Some(input) = &mut self.instruction {
+            match key.code {
+                KeyCode::Esc => self.instruction = None,
+                KeyCode::Enter => {
+                    let text = input.lines().join(" ");
+                    self.instruction = None;
+                    if let Err(e) = self.draft(Some(text.trim())) {
+                        self.notice = Some(format!("{e:#}"));
+                    }
+                }
+                _ => _ = input.input(key),
+            }
+            return true;
+        }
+        if self.preview {
+            match key.code {
+                KeyCode::Esc => self.preview = false,
+                KeyCode::Enter => {
+                    if let Err(e) = self.open_pr() {
+                        self.notice = Some(format!("{e:#}"));
+                    }
+                }
+                KeyCode::Char('g') => {
+                    self.instruction = Some(field("e.g. shorter, drop the critic line"));
+                }
+                KeyCode::Char('e') => self.edit = true,
+                KeyCode::Char('q') => return false,
+                _ => {}
+            }
+            return true;
+        }
         if self.confirm {
             self.confirm = false;
             if key.code == KeyCode::Char('y')
@@ -312,6 +367,11 @@ impl App {
                 None => self.notice = Some("this task has no worktree".into()),
             },
             KeyCode::Char('x') => self.confirm = !self.tasks.is_empty(),
+            KeyCode::Char('m') => {
+                if let Err(e) = self.draft(None) {
+                    self.notice = Some(format!("{e:#}"));
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.tasks.len().saturating_sub(1));
             }
@@ -359,6 +419,12 @@ impl App {
         {
             let _ = worker::stop(pid); // it may already have exited
         }
+        t.status = Status::Discarded;
+        self.free_slot(t, "discarded")
+    }
+
+    /// Runs `[scripts] teardown` in the task's slot, then saves it with the slot freed.
+    fn free_slot(&mut self, mut t: Task, done: &str) -> Result<()> {
         let mut teardown = Ok(());
         if let (Some(n), Some(dir)) = (t.slot, self.slot_dir()) {
             let cfg = config::load(&self.repo)?;
@@ -368,14 +434,98 @@ impl App {
                 teardown = slot::run_script(cmd, &dir, &env, &log);
             }
         }
-        t.status = Status::Discarded;
         t.slot = None;
         t.save(&self.state)?;
         sched::run(&self.repo)?;
         if let Err(e) = teardown {
-            bail!("discarded, but teardown failed: {e:#}");
+            bail!("{done}, but teardown failed: {e:#}");
         }
         Ok(())
+    }
+
+    /// `m`: previews the PR draft if it matches the branch, else has a worker rebase, re-gate
+    /// and draft it (following `instruction` when regenerating); the preview opens when it lands.
+    fn draft(&mut self, instruction: Option<&str>) -> Result<()> {
+        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        ensure!(
+            t.status == Status::Review && gate_passed(t),
+            "a PR needs a task in Review with a passing gate"
+        );
+        let dir = self.slot_dir().context("this task has no worktree")?;
+        let head = git(&dir, &["rev-parse", "HEAD"])?;
+        if instruction.is_none() && t.pr_draft.as_ref().is_some_and(|d| d.head == head) {
+            self.preview = true;
+            return Ok(());
+        }
+        let mut args = vec!["--pr"];
+        if let Some(text) = instruction {
+            args.extend(["--instruction", text]);
+        }
+        worker::spawn(&self.repo, &t.id, &args)?;
+        self.awaiting = Some((t.id.clone(), t.pr_draft.clone()));
+        self.preview = false;
+        Ok(())
+    }
+
+    /// Opens the preview once the awaited task has a new draft; gives up if it can't get one.
+    fn check_awaiting(&mut self) {
+        let Some((id, old)) = &self.awaiting else {
+            return;
+        };
+        let Some(i) = self.tasks.iter().position(|(t, _)| &t.id == id) else {
+            return;
+        };
+        let t = &self.tasks[i].0;
+        if t.status == Status::Review && t.pr_draft.is_some() && t.pr_draft != *old {
+            (self.selected, self.preview, self.awaiting) = (i, true, None);
+        } else if t.status == Status::Failed || (t.status == Status::Review && !gate_passed(t)) {
+            self.notice = Some("no PR draft: see the task's Summary and Gate tabs".into());
+            self.awaiting = None;
+        }
+    }
+
+    /// `e` in the preview: the draft as `title`, blank line, body in `$EDITOR`.
+    fn edit_draft(&mut self) -> Result<()> {
+        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        let mut t = t.clone();
+        let dir = self.slot_dir().context("this task has no worktree")?;
+        let draft = t.pr_draft.as_mut().context("no PR draft")?;
+        let file = self.state.join(format!("logs/{}.pr.md", t.id));
+        fs::write(&file, format!("{}\n\n{}\n", draft.title, draft.body))?;
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+        let edited = Command::new("sh")
+            .args(["-c", &format!("{editor} \"$1\""), "sh"])
+            .arg(&file)
+            .status()?;
+        ensure!(edited.success(), "{editor} exited with {edited}");
+        let text = fs::read_to_string(&file)?;
+        let (title, body) = text.trim().split_once('\n').unwrap_or((text.trim(), ""));
+        (draft.title, draft.body) = (pr::clean(title.trim()), pr::clean(body.trim()));
+        let cfg = config::load(&self.repo)?;
+        let migration = pr::migration(&dir, BASE)?;
+        draft.problem = pr::check_title(&draft.title, &cfg.pr.types, migration).err();
+        t.save(&self.state)
+    }
+
+    /// `enter` in the preview: pushes, opens the PR, then tears down and frees the slot.
+    fn open_pr(&mut self) -> Result<()> {
+        let (t, _) = self.tasks.get(self.selected).context("no task selected")?;
+        let mut t = t.clone();
+        let dir = self.slot_dir().context("this task has no worktree")?;
+        let draft = t.pr_draft.as_ref().context("no PR draft")?;
+        if let Some(problem) = &draft.problem {
+            bail!("fix the title first (e): {problem}");
+        }
+        ensure!(
+            git(&dir, &["rev-parse", "HEAD"])? == draft.head,
+            "the branch changed since this draft; press m to redraft"
+        );
+        let cfg = config::load(&self.repo)?;
+        // ponytail: pushes from the TUI, which freezes for the push; a worker can do it if slow
+        t.pr_url = Some(pr::open(&t, &dir, BASE, cfg.pr.draft)?);
+        t.status = Status::PrOpen;
+        self.preview = false;
+        self.free_slot(t, "PR opened")
     }
 
     /// Files the composed request as an approved task and starts whatever is ready.
@@ -517,8 +667,14 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     ])
     .areas(f.area());
     f.render_widget(header_line(app, theme), header);
+    let selected = app.tasks.get(app.selected).map(|(t, _)| t);
+    let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
         compose(f, body, c, theme);
+    } else if app.preview
+        && let Some(d) = draft
+    {
+        preview(f, body, d, app.instruction.as_ref(), theme);
     } else if body.width >= 100 {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(body);
@@ -529,15 +685,20 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     } else {
         list(f, body, app, theme, true, tick, now);
     }
-    let selected = app.tasks.get(app.selected).map(|(t, _)| t);
     let keys: Vec<(&str, &str)> = if app.compose.is_some() {
         vec![("tab", "field"), ("ctrl-s", "submit"), ("esc", "cancel")]
+    } else if app.instruction.is_some() {
+        vec![("enter", "redraft"), ("esc", "cancel")]
+    } else if app.preview {
+        let push = ("enter", "push and open PR");
+        vec![push, ("g", "regenerate"), ("e", "edit"), ("esc", "back")]
     } else {
         // only the keys that do something for the selected task
         KEYS.into_iter()
             .filter(|(k, _)| match *k {
                 "d" => selected.is_some_and(|t| t.slot.is_some()),
                 "x" | "1-4" => selected.is_some(),
+                "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
                 _ => true,
             })
             .collect()
@@ -575,6 +736,37 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         f.render_widget(Clear, area);
         let text = Paragraph::new(text).wrap(Wrap { trim: true });
         f.render_widget(text.block(pane("Discard", true, theme)), area);
+    }
+}
+
+fn gate_passed(t: &Task) -> bool {
+    t.gate.as_ref().is_some_and(|g| g.iter().all(|c| c.passed))
+}
+
+/// The PR draft in place of both panes, with the `g` instruction input below when open.
+fn preview(f: &mut Frame, area: Rect, d: &pr::Draft, input: Option<&TextArea>, theme: &Theme) {
+    let [text, ask] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(if input.is_some() { 3 } else { 0 }),
+    ])
+    .areas(area);
+    let mut lines = vec![Line::raw(d.title.clone()).bold()];
+    if let Some(problem) = &d.problem {
+        lines.push(Line::styled(format!("{} {problem}", theme.fail), theme.red));
+    }
+    lines.push(Line::raw(""));
+    lines.extend(d.body.lines().map(|l| Line::raw(l.to_string())));
+    let block = pane("PR preview", input.is_none(), theme);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        text,
+    );
+    if let Some(input) = input {
+        let block = pane("Regenerate with", true, theme);
+        f.render_widget(input, block.inner(ask));
+        f.render_widget(block, ask);
     }
 }
 
@@ -754,6 +946,7 @@ fn summary(f: &mut Frame, area: Rect, t: &Task) {
         None => m.clone(),
     }));
     meta.extend(t.ticket.clone());
+    meta.extend(t.pr_url.clone());
     let mut lines = vec![
         Line::raw(t.title.clone()).bold(),
         Line::raw(meta.join(" · ")).dim(),
@@ -955,6 +1148,10 @@ mod tests {
             loaded: None,
             confirm: false,
             pager: None,
+            preview: false,
+            awaiting: None,
+            instruction: None,
+            edit: false,
         };
         (app, now)
     }
@@ -999,7 +1196,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  x discard",
+                " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR",
             ]
         );
     }
@@ -1036,7 +1233,7 @@ mod tests {
                 "│ TodoWrite                                                │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  x discard",
+                " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR",
             ]
         );
     }
@@ -1103,7 +1300,38 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  x discard",
+                " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR",
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_preview_with_title_problem() {
+        let (mut app, _) = app();
+        app.tasks[0].0.pr_draft = Some(pr::Draft {
+            title: "feat(config): reject negative max_delay".into(),
+            body: "max_delay below zero now fails at parse time.\n\n- adds a check".into(),
+            head: "abc".into(),
+            problem: Some("expected `type(scope): description [TICKET-1]`".into()),
+        });
+        app.preview = true;
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
+                "╭ PR preview ──────────────────────────────────────────────╮",
+                "│ feat(config): reject negative max_delay                  │",
+                "│ ✗ expected `type(scope): description [TICKET-1]`         │",
+                "│                                                          │",
+                "│ max_delay below zero now fails at parse time.            │",
+                "│                                                          │",
+                "│ - adds a check                                           │",
+                "╰──────────────────────────────────────────────────────────╯",
+                " enter push and open PR  g regenerate  e edit  esc back     ",
             ]
         );
     }
@@ -1174,7 +1402,7 @@ mod tests {
                 "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-4 tabs  d diff  x discard  ? help  q quit                        ",
+                " n new task  j/k move  tab pane  1-4 tabs  d diff  m open PR  x discard  ? help  q quit             ",
             ]
         );
     }

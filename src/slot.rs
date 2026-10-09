@@ -29,6 +29,16 @@ pub fn claim(state: &Path, tasks: &[Task], count: u32) -> Result<Option<(u32, Fi
     Ok(None)
 }
 
+/// Locks slot `n`, which a task already holds, for as long as the file is kept.
+pub fn lock(state: &Path, n: u32) -> Result<File> {
+    let file = File::create(state.join(format!("slots/{n}.lock")))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => anyhow::bail!("slot {n} is busy"),
+        Err(TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 /// Checks out a fresh `branch` from `base` (e.g. `origin/main`) in slot `n`, adding and
 /// seeding the worktree on first use. Discards whatever the slot's previous task left behind.
 pub fn prepare(repo: &Path, state: &Path, n: u32, branch: &str, base: &str) -> Result<PathBuf> {

@@ -1,4 +1,4 @@
-- [ ] **T18 PR draft + preview**
+- [x] **T18 PR draft + preview**
 
 Plan: Gate, review and PRs › PR drafts; TUI › Screens › 8. PR preview.
 

@@ -14,7 +14,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run one task's lifecycle (internal, spawned detached)
-    Worker { id: String },
+    Worker {
+        id: String,
+        /// Rebase the task in Review, re-gate if it moved, and draft its PR
+        #[arg(long)]
+        pr: bool,
+        /// With --pr: redraft the current draft following this instruction
+        #[arg(long, requires = "pr")]
+        instruction: Option<String>,
+    },
     /// Task commands for the lead (internal)
     Task {
         #[command(subcommand)]
@@ -36,7 +44,14 @@ fn main() -> anyhow::Result<()> {
     }
     match Cli::parse().command {
         None => yogan_swarm::tui::run(&std::env::current_dir()?),
-        Some(Command::Worker { id }) => yogan_swarm::worker::run(&std::env::current_dir()?, &id),
+        Some(Command::Worker {
+            id,
+            pr,
+            instruction,
+        }) => {
+            let pr = pr.then(|| instruction.unwrap_or_default());
+            yogan_swarm::worker::run(&std::env::current_dir()?, &id, pr.as_deref())
+        }
         Some(Command::Task {
             command: TaskCommand::Propose,
         }) => anyhow::bail!("task propose: not built yet (T20)"),

@@ -8,10 +8,14 @@ use rustix::process::{Pid, test_kill_process};
 
 use yogan_swarm::task::{self, Status, Task};
 
-/// Stand-in for Claude: records its args, cwd and effort env, then emits an init with
-/// `$MCP` as its server, a leaked token, and a result denying `$DENIED`. Resumed, it commits.
+/// Stand-in for Claude: records its args, cwd, effort env and the task's status, then emits an
+/// init with `$MCP` as its server, a leaked token, and a result denying `$DENIED`. Resumed, it
+/// commits. Asked for JSON, it's the PR drafter.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
+case "$*" in *"--output-format json"*)
+  printf '%s\n' '{"result":"feat: do it [NO-TICKET]\n\nWhat and why \u2014 briefly."}'; exit 0 ;; esac
 out="$YOGAN_ROOT/.."
+grep '^status' "$YOGAN_DIR/tasks/$YOGAN_TASK_ID.toml" >> "$out/claude.status"
 printf '%s\n' "$@" > "$out/claude.args"
 pwd > "$out/claude.cwd"
 echo "${CLAUDE_CODE_EFFORT_LEVEL-unset}" > "$out/claude.effort"
@@ -83,6 +87,25 @@ fn worker_runs_setup_then_claude() {
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
+    // runs yogan in the checkout; returns whether it succeeded and the task it ran
+    let yogan = |args: &[&str], mcp: &str, denied: &str| {
+        let ok = Command::new(env!("CARGO_BIN_EXE_yogan"))
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("YOGAN_DIR", &state)
+            .env("PATH", &path)
+            .env("MCP", mcp)
+            .env("DENIED", denied)
+            .env("CLAUDE_CODE_EFFORT_LEVEL", "low")
+            .envs([("GIT_AUTHOR_NAME", "t"), ("GIT_COMMITTER_NAME", "t")])
+            .envs([("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_EMAIL", "t@t")])
+            .status()
+            .unwrap()
+            .success();
+        let tasks = task::load_all(&state).unwrap();
+        (ok, tasks.into_iter().find(|t| t.id == args[1]).unwrap())
+    };
     let worker = |id: &str, setup: &str, mcp: &str, denied: &str, effort: Option<&str>| {
         let worker_cfg = "[worker]\nmcp_config = \".mcp.json\"\nallowed_tools = [\"Read\"]\n\
                           read_tools = [\"mcp__graft__find\"]\ndeny = [\"Bash(curl *)\"]\n\
@@ -99,20 +122,7 @@ fn worker_runs_setup_then_claude() {
             ..Default::default()
         };
         task.save(&state).unwrap();
-        let ok = Command::new(env!("CARGO_BIN_EXE_yogan"))
-            .args(["worker", id])
-            .current_dir(&repo)
-            .env("HOME", &home)
-            .env("YOGAN_DIR", &state)
-            .env("PATH", &path)
-            .env("MCP", mcp)
-            .env("DENIED", denied)
-            .env("CLAUDE_CODE_EFFORT_LEVEL", "low")
-            .status()
-            .unwrap()
-            .success();
-        let tasks = task::load_all(&state).unwrap();
-        (ok, tasks.into_iter().find(|t| t.id == id).unwrap())
+        yogan(&["worker", id], mcp, denied)
     };
 
     let (ok, t1) = worker("t1", "echo ready", "graft", "", None);
@@ -132,7 +142,7 @@ fn worker_runs_setup_then_claude() {
         "--setting-sources\nproject\n",
         "--strict-mcp-config\n",
         "--mcp-config\n.mcp.json\n--resume\ns-1\n",
-        "--allowedTools\nRead\nmcp__graft__find\n--disallowedTools\nBash(git push *)\n",
+        "--allowedTools\nRead\nmcp__graft__find\nBash(git rebase *)\n--disallowedTools\n",
         "WebFetch\nBash(curl *)\n--append-system-prompt\n",
     ] {
         assert!(args.contains(want), "{want:?} not in {args}");
@@ -190,6 +200,45 @@ fn worker_runs_setup_then_claude() {
     assert_eq!(t5.status, Status::Failed);
     assert!(t5.summary.unwrap().contains("\"bogus\""));
     assert!(!state.join("logs/t5.jsonl").exists());
+
+    // m: a rebase that conflicts is aborted and the worker resumed to resolve it, then the
+    // gate runs again and the PR is drafted
+    let slot1 = state.join("slots/1");
+    fs::write(slot1.join("a.txt"), "the task's change").unwrap();
+    git(&slot1, &["commit", "-qam", "task edits a.txt"]);
+    fs::write(repo.join("a.txt"), "upstream change").unwrap();
+    git(&repo, &["commit", "-qam", "upstream edits a.txt"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    fs::remove_file(root.join("claude.status")).unwrap();
+    let (ok, t1) = yogan(&["worker", "t1", "--pr"], "graft", "");
+    assert!(ok);
+    let args = fs::read_to_string(root.join("claude.args")).unwrap();
+    assert!(
+        args.contains("--resume\ns-1\n") && args.contains("conflicted"),
+        "{args}"
+    );
+    let seen = fs::read_to_string(root.join("claude.status")).unwrap();
+    assert_eq!(
+        seen, "status = \"running\"\n",
+        "the resume ran with the task Running"
+    );
+    let rebasing = Command::new("git")
+        .args([
+            "-C",
+            slot1.to_str().unwrap(),
+            "rev-parse",
+            "-q",
+            "--verify",
+            "REBASE_HEAD",
+        ])
+        .status()
+        .unwrap();
+    assert!(!rebasing.success(), "the conflicted rebase was aborted");
+    assert_eq!(t1.status, Status::Review);
+    let draft = t1.pr_draft.unwrap();
+    assert_eq!(draft.title, "feat: do it [NO-TICKET]");
+    assert_eq!(draft.body, "What and why, briefly."); // no em dash
+    assert_eq!(draft.head.len(), 40);
 
     // queued tasks drain one at a time (concurrency 1), each worker starting the next on exit
     for id in ["t6", "t7"] {

@@ -1,4 +1,4 @@
-- [ ] **T17 Rebase on `m`**
+- [x] **T17 Rebase on `m`**
 
 Plan: Gate, review and PRs (Opening the PR steps 1–2, rebase conflict paragraph).
 

@@ -40,6 +40,9 @@ pub struct Task {
     pub effort: Option<String>,
     pub summary: Option<String>,
     pub gate: Option<Vec<crate::gate::Check>>,
+    /// Title and body awaiting approval.
+    pub pr_draft: Option<crate::pr::Draft>,
+    pub pr_url: Option<String>,
 }
 
 /// `$YOGAN_DIR`, else `~/.local/share/yogan/<repo>/`.
@@ -111,6 +114,8 @@ mod tests {
             effort: Some("high".into()),
             summary: None,
             gate: None,
+            pr_draft: None,
+            pr_url: None,
         };
         task.save(&dir).unwrap();
         task.status = Status::Review;

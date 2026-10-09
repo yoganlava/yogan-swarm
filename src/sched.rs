@@ -19,7 +19,7 @@ pub fn run(repo: &Path) -> Result<()> {
     let tasks = task::load_all(&state)?;
     for mut task in ready(&tasks, cfg.worker.concurrency, cfg.worker.slots) {
         task.status = Status::Running;
-        task.pid = Some(worker::spawn(repo, &task.id)?);
+        task.pid = Some(worker::spawn(repo, &task.id, &[])?);
         // saved before the lock drops, so a concurrent call can't start it twice
         task.save(&state)?;
     }

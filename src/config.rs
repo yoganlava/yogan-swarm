@@ -14,7 +14,7 @@ pub struct Config {
     pub branch_prefix: String,
     pub lead: Role,
     pub ask: Role,
-    pub pr: Role,
+    pub pr: Pr,
     pub critic: Critic,
     pub worker: Worker,
     pub ports: Option<Ports>,
@@ -22,6 +22,20 @@ pub struct Config {
     pub build: Build,
     pub cargo: Option<Cargo>,
     pub gate: Gate,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Pr {
+    pub model: String,
+    pub effort: String,
+    /// Open PRs as drafts.
+    pub draft: bool,
+    pub style: String,
+    /// e.g. `type(scope): desc [TICKET]`, given to the drafting model.
+    pub title_format: Option<String>,
+    /// Allowed title types; empty means no title check.
+    #[serde(default)]
+    pub types: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
