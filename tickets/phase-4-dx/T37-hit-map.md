@@ -1,4 +1,4 @@
-- [ ] **T37 Hit map: a click is a key**
+- [x] **T37 Hit map: a click is a key**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › How it's built › One hit map; Mouse map.
 
