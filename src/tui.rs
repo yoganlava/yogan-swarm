@@ -3467,7 +3467,7 @@ fn detail_body(
                 let shown = app.tasks.iter().find(|(o, _)| &o.id == p);
                 shown.map_or(p.clone(), |(o, _)| o.title.clone())
             });
-            summary(f, body, t, parent, app.sessions, &app.scroll)
+            summary(f, body, t, parent, app.sessions, theme, &app.scroll)
         }
         1 => activity_tab(f, body, &app.activity, theme, &app.scroll),
         2 => gate_tab(f, body, t, &app.gate_log, theme, &app.scroll),
@@ -3685,6 +3685,7 @@ fn summary(
     t: &Task,
     parent: Option<String>,
     sessions: u32,
+    theme: &Theme,
     scroll: &Scroll,
 ) {
     let label = status_rank(t.status).map_or("", |r| r.1);
@@ -3708,10 +3709,10 @@ fn summary(
         Line::raw(""),
     ];
     if let Some(summary) = &t.summary {
-        lines.extend(summary.lines().map(|l| Line::raw(l.to_string())));
+        lines.extend(markdown(summary, theme));
         lines.push(Line::raw(""));
     }
-    lines.extend(t.body.lines().map(|l| Line::raw(l.to_string()).dim()));
+    lines.extend(markdown(&t.body, theme).into_iter().map(|l| l.dim()));
     if !t.acceptance.is_empty() {
         lines.extend([Line::raw(""), Line::raw("Done when").bold()]);
         lines.extend(t.acceptance.iter().map(|a| Line::raw(format!("- {a}"))));
@@ -4492,14 +4493,18 @@ mod tests {
     }
 
     /// The detail pane alone (narrow layout) on `tab`.
-    fn tab_screen(mut app: App, tab: usize) -> Vec<String> {
+    fn tab_screen(app: App, tab: usize) -> Vec<String> {
+        screen(&tab_term(app, tab))
+    }
+
+    fn tab_term(mut app: App, tab: usize) -> Terminal<TestBackend> {
         app.detail = true;
         app.tab = tab;
         let mut term = Terminal::new(TestBackend::new(60, 17)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
-        screen(&term)
+        term
     }
 
     #[test]
@@ -4530,6 +4535,42 @@ mod tests {
                 " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
+    }
+
+    #[test]
+    fn summary_tab_markdown() {
+        let (mut app, _) = app();
+        app.tasks[0].0.summary = Some("**Fixed** the retry loop".into());
+        app.tasks[0].0.body = "- one\n- two\n```\nlet x = 1;\n```".into();
+        let term = tab_term(app, 0);
+        let rows = screen(&term);
+        assert_eq!(
+            rows[8..13],
+            [
+                "│ Fixed the retry loop                                     │",
+                "│                                                          │",
+                "│ • one                                                    │",
+                "│ • two                                                    │",
+                "│   let x = 1;                                             │",
+            ]
+        );
+        let buf = term.backend().buffer();
+        let fixed = buf.cell((2, 8)).unwrap().modifier;
+        assert!(fixed.contains(ratatui::style::Modifier::BOLD));
+        assert!(
+            !buf.cell((8, 8))
+                .unwrap()
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        for y in 10..13 {
+            assert!(
+                buf.cell((4, y))
+                    .unwrap()
+                    .modifier
+                    .contains(ratatui::style::Modifier::DIM)
+            );
+        }
     }
 
     #[test]
