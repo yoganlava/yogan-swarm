@@ -540,6 +540,8 @@ struct Hits {
     /// The detail tabs, where the wheel cycles them.
     tabs: Rect,
     palette: Rect,
+    /// The compose panes; a hint outside them, like Submit's, goes in the last one's border.
+    panes: Vec<Rect>,
     targets: Vec<(Rect, Target, String)>,
 }
 
@@ -2855,7 +2857,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             .set_style(*rect, Style::new().bg(theme.hover));
         let pane = [hits.list, hits.detail]
             .into_iter()
-            .find(|p| p.contains(at));
+            .chain(hits.panes.iter().copied())
+            .find(|p| p.contains(at))
+            .or(hits.panes.last().copied());
         let hint = Line::styled(format!(" {hint} "), theme.accent).right_aligned();
         let area = pane.unwrap_or(body).inner(Margin::new(1, 0));
         f.render_widget(Block::new().title_bottom(hint), area);
@@ -3141,6 +3145,7 @@ fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme, hits: &mut Hit
         let hint = format!("click · type the {}", title.to_lowercase());
         hits.targets.push((area, Target::Focus(i), hint));
     }
+    hits.panes = vec![mode, request, ticket];
 }
 
 /// ` yogan · repo  ● 2 need you  ⠋ 1 working  ○ 1 queued`, with the slot meter and spend flush
@@ -6897,22 +6902,26 @@ mod tests {
                 row: at.y,
                 modifiers: KeyModifiers::NONE,
             });
-            (tinted, screen(&term)[22].clone())
+            (tinted, screen(&term))
         };
         let focus = |app: &App| app.compose.as_ref().map(|c| (c.mode, c.focus));
 
-        let (tinted, border) = click(&mut app, "Plan");
-        assert!(tinted && border.contains(" click · Plan mode "), "{border}");
+        // a mode's hint goes in the Mode pane's bottom border
+        let (tinted, rows) = click(&mut app, "Plan");
+        assert!(
+            tinted && rows[3].ends_with(" click · Plan mode ╯"),
+            "{rows:#?}"
+        );
         assert_eq!(focus(&app), Some((Mode::Plan, 2)));
         click(&mut app, "Ask");
         assert_eq!(focus(&app), Some((Mode::Ask, 2)));
         click(&mut app, "Auto");
         assert_eq!(focus(&app), Some((Mode::Auto, 2)));
 
-        let (tinted, border) = click(&mut app, "Ticket");
+        let (tinted, rows) = click(&mut app, "Ticket");
         assert!(
-            tinted && border.contains(" click · type the ticket "),
-            "{border}"
+            tinted && rows[21].ends_with(" click · type the ticket ╯"),
+            "{rows:#?}"
         );
         assert_eq!(focus(&app), Some((Mode::Auto, 1)));
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -6924,8 +6933,13 @@ mod tests {
 
         // Submit with an empty request
         app.compose = Some(Compose::new(Mode::Auto, ""));
-        let (tinted, border) = click(&mut app, "[ Submit ]");
-        assert!(tinted && border.contains(" ctrl-s · submit "), "{border}");
+        // Submit's hint goes in the Ticket pane's border above, leaving its own row clear
+        let (tinted, rows) = click(&mut app, "[ Submit ]");
+        assert!(
+            tinted && rows[21].ends_with(" ctrl-s · submit ╯"),
+            "{rows:#?}"
+        );
+        assert_eq!(rows[22].trim_end(), " [ Submit ]");
         assert!(app.compose.is_some());
         assert_eq!(app.notice.as_deref(), Some("write a request first"));
     }
