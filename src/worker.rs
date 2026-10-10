@@ -778,10 +778,10 @@ fn lifecycle(
                 Some(true) => work(task, None, false)?,
                 Some(false) => task.gate.iter().flatten().all(|c| c.passed),
             };
+            // saved first, so a failed draft or push leaves the task in Review (see `run`)
+            task.status = Status::Review;
+            task.save(state)?;
             if merge {
-                // saved first, so a failing gate or rejected push leaves the task in Review
-                task.status = Status::Review;
-                task.save(state)?;
                 ensure!(passed, "the gate failed, so it wasn't pushed to main");
                 git(&dir, &["push", "--quiet", "origin", "HEAD:refs/heads/main"])?;
                 let _ = slot::stop_run(state, &task.id); // it may already have exited
@@ -797,9 +797,6 @@ fn lifecycle(
             }
             let instruction = instruction.unwrap_or_default();
             if passed {
-                // saved first, so a failed draft leaves the task in Review (see `run`)
-                task.status = Status::Review;
-                task.save(state)?;
                 let instruction = Some(instruction).filter(|i| !i.is_empty());
                 let findings = Findings::load(state, &task.id)?;
                 let draft = pr::draft(task, &dir, base, &cfg.pr, instruction, &findings)?;
