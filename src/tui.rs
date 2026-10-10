@@ -552,8 +552,8 @@ impl Hits {
 
 /// What a click does: press a key, or one of the things with no key: select a list row, fold
 /// a group, dismiss the info toast, start dragging the divider, scroll the detail pane to
-/// an offset, fold or unfold a Diff file, open Diff at a finding's file, select a finding, or
-/// run a palette row.
+/// an offset, fold or unfold a Diff file, open Diff at a finding's file, select a finding, run
+/// a palette row, or pick a compose mode or focus a compose field.
 /// `Hint` only shows its hint on hover.
 #[derive(Clone, Copy)]
 enum Target {
@@ -568,6 +568,8 @@ enum Target {
     Location(usize),
     Finding(usize),
     Command(usize),
+    Mode(usize),
+    Focus(usize),
 }
 
 /// The detail pane's scroll offset, and the scrollbar its tab asked for this frame as (area,
@@ -2062,6 +2064,16 @@ impl App {
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Finding(i))) if !modal => {
                 self.finding = i;
             }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Mode(i))) => {
+                if let Some(c) = &mut self.compose {
+                    (c.mode, c.focus) = (MODES[i].0, 2);
+                }
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Focus(i))) => {
+                if let Some(c) = &mut self.compose {
+                    c.focus = i;
+                }
+            }
             _ => {}
         }
         if self.selected != before {
@@ -2511,7 +2523,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
     let selected = app.task().map(|(t, _)| t);
     let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
-        compose(f, body, c, theme);
+        compose(f, body, c, theme, &mut app.hits.borrow_mut());
     } else if let Some(s) = &app.settings {
         settings(f, body, s, theme);
     } else if app.preview
@@ -3081,7 +3093,7 @@ fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
     f.render_widget(Paragraph::new(lines).block(block).scroll((top, 0)), area);
 }
 
-fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
+fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme, hits: &mut Hits) {
     let [mode, request, ticket, submit] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Fill(1),
@@ -3093,6 +3105,10 @@ fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
         true => Span::styled(" [ Submit ] ", theme.accent).bold(),
         false => Span::raw(" [ Submit ] ").dim(),
     };
+    let rect = Rect::new(submit.x, submit.y, button.width() as u16, 1).intersection(submit);
+    let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    hits.targets
+        .push((rect, Target::Key(key), "ctrl-s · submit".into()));
     f.render_widget(Line::from(button), submit);
     let modes = MODES.iter().flat_map(|(m, name)| {
         let name = match *m == c.mode {
@@ -3102,15 +3118,28 @@ fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
         [name, Span::raw("  ")]
     });
     let block = pane("Mode", c.focus == 2, theme);
-    f.render_widget(Line::from(modes.collect::<Vec<_>>()), block.inner(mode));
+    let inner = block.inner(mode);
+    let mut x = inner.x;
+    for (i, (_, name)) in MODES.iter().enumerate() {
+        let rect = Rect::new(x, inner.y, name.width() as u16, 1).intersection(inner);
+        hits.targets
+            .push((rect, Target::Mode(i), format!("click · {name} mode")));
+        x = x.saturating_add(name.width() as u16 + 2);
+    }
+    f.render_widget(Line::from(modes.collect::<Vec<_>>()), inner);
     f.render_widget(block, mode);
-    for (field, area, title, focused) in [
-        (&c.request, request, "Request", c.focus == 0),
-        (&c.ticket, ticket, "Ticket", c.focus == 1),
-    ] {
-        let block = pane(title, focused, theme);
+    for (i, (field, area, title)) in [
+        (&c.request, request, "Request"),
+        (&c.ticket, ticket, "Ticket"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let block = pane(title, c.focus == i, theme);
         f.render_widget(field, block.inner(area));
         f.render_widget(block, area);
+        let hint = format!("click · type the {}", title.to_lowercase());
+        hits.targets.push((area, Target::Focus(i), hint));
     }
 }
 
@@ -6841,6 +6870,64 @@ mod tests {
         assert_eq!(buf[m].bg, theme.hover);
         assert_eq!(buf[(m.x + 11, m.y)].bg, theme.hover);
         assert_ne!(buf[(m.x + 12, m.y)].bg, theme.hover);
+    }
+
+    #[test]
+    fn compose_is_clickable() {
+        let (mut app, now) = app();
+        app.compose = Some(Compose::new(Mode::Auto, ""));
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // draws, then hovers and clicks the first cell of `text`
+        let mut click = |app: &mut App, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows.iter().enumerate().find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let at = Position::new(
+                row[..row.find(text).unwrap()].chars().count() as u16,
+                y as u16,
+            );
+            app.hover(at);
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let tinted = term.backend().buffer()[at].bg == theme.hover;
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: at.x,
+                row: at.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            (tinted, screen(&term)[22].clone())
+        };
+        let focus = |app: &App| app.compose.as_ref().map(|c| (c.mode, c.focus));
+
+        let (tinted, border) = click(&mut app, "Plan");
+        assert!(tinted && border.contains(" click · Plan mode "), "{border}");
+        assert_eq!(focus(&app), Some((Mode::Plan, 2)));
+        click(&mut app, "Ask");
+        assert_eq!(focus(&app), Some((Mode::Ask, 2)));
+        click(&mut app, "Auto");
+        assert_eq!(focus(&app), Some((Mode::Auto, 2)));
+
+        let (tinted, border) = click(&mut app, "Ticket");
+        assert!(
+            tinted && border.contains(" click · type the ticket "),
+            "{border}"
+        );
+        assert_eq!(focus(&app), Some((Mode::Auto, 1)));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.compose.as_ref().unwrap().ticket.lines(), ["x"]);
+        click(&mut app, "Request");
+        assert_eq!(focus(&app), Some((Mode::Auto, 0)));
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.compose.as_ref().unwrap().request.lines(), ["y"]);
+
+        // Submit with an empty request
+        app.compose = Some(Compose::new(Mode::Auto, ""));
+        let (tinted, border) = click(&mut app, "[ Submit ]");
+        assert!(tinted && border.contains(" ctrl-s · submit "), "{border}");
+        assert!(app.compose.is_some());
+        assert_eq!(app.notice.as_deref(), Some("write a request first"));
     }
 
     #[test]
