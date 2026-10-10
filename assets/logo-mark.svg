@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 5 5" role="img" aria-label="yogan">
+  <rect x="0.08" y="0.08" width="0.84" height="0.84" rx="0.1" fill="#09090B"/>
+  <rect x="4.08" y="0.08" width="0.84" height="0.84" rx="0.1" fill="#09090B"/>
+  <rect x="1.08" y="1.08" width="0.84" height="0.84" rx="0.1" fill="#09090B"/>
+  <rect x="3.08" y="1.08" width="0.84" height="0.84" rx="0.1" fill="#09090B"/>
+  <rect x="2.08" y="2.08" width="0.84" height="0.84" rx="0.1" fill="#D0AEFA"/>
+  <rect x="2.08" y="3.08" width="0.84" height="0.84" rx="0.1" fill="#09090B"/>
+  <rect x="2.08" y="4.08" width="0.84" height="0.84" rx="0.1" fill="#09090B"/>
+</svg>

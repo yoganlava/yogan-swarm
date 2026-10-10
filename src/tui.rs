@@ -291,6 +291,9 @@ impl Settings {
     }
 }
 
+/// The mark on a 5x5 grid, two columns a cell: `#` is ink, `*` the junction in the accent.
+const LOGO: [&str; 5] = ["#...#", ".#.#.", "..*..", "..#..", "..#.."];
+
 /// Every color and glyph, so a light-terminal or ASCII variant is one swap. Only key and reason
 /// chips and the hovered target paint a background: elsewhere the terminal's own theme shows
 /// through.
@@ -351,7 +354,7 @@ impl Theme {
         let rgb = |r, g, b, ansi| if truecolor { Color::Rgb(r, g, b) } else { ansi };
         let glyphs = |fancy, plain| if ascii { plain } else { fancy };
         Theme {
-            accent: rgb(122, 162, 247, Color::Blue),
+            accent: rgb(208, 174, 250, Color::Magenta),
             key: rgb(42, 47, 69, Color::Black),
             ink: rgb(26, 27, 38, Color::Black),
             hover: rgb(59, 66, 97, Color::DarkGray),
@@ -384,6 +387,25 @@ impl Theme {
             need: glyphs("●", "*"),
             ascii,
         }
+    }
+
+    /// The mark with `yogan` beside its junction row; ink is the terminal's own foreground.
+    fn logo(&self) -> Vec<Line<'static>> {
+        let cell = if self.ascii { "##" } else { "██" };
+        let rows = LOGO.iter().enumerate().map(|(i, row)| {
+            let mut spans: Vec<_> = (row.chars())
+                .map(|c| match c {
+                    '#' => Span::raw(cell),
+                    '*' => Span::styled(cell, self.accent),
+                    _ => Span::raw("  "),
+                })
+                .collect();
+            if i == 2 {
+                spans.push(Span::styled("  yogan", self.accent).bold());
+            }
+            Line::from(spans)
+        });
+        rows.collect()
     }
 
     /// ` ready ` on `color`, or `[ready]` in ASCII.
@@ -2949,12 +2971,19 @@ fn palette(f: &mut Frame, app: &App, theme: &Theme) {
     };
     let rows = app.commands();
     let all = f.area();
+    // the mark and a blank line above the query, except in compact
+    let logo = if all.height < COMPACT { 0 } else { 6 };
     let n = rows
         .len()
-        .clamp(1, all.height.saturating_sub(9).max(1) as usize);
-    let area = centered(all, 68.min(all.width.saturating_sub(4)), n as u16 + 4);
+        .clamp(1, all.height.saturating_sub(9 + logo).max(1) as usize);
+    let area = centered(
+        all,
+        68.min(all.width.saturating_sub(4)),
+        n as u16 + 4 + logo,
+    );
     let block = pane("Commands", true, theme);
-    let [input, rule, list] = Layout::vertical([
+    let [mark, input, rule, list] = Layout::vertical([
+        Constraint::Length(logo),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -2962,6 +2991,7 @@ fn palette(f: &mut Frame, app: &App, theme: &Theme) {
     .areas(block.inner(area));
     f.render_widget(Clear, area);
     f.render_widget(block, area);
+    f.render_widget(Paragraph::new(theme.logo()), mark);
     let prompt = Line::from(vec![
         Span::styled("› ", theme.accent).bold(),
         Span::raw(query.clone()).bold(),
@@ -3564,7 +3594,14 @@ fn detail_body(
                 let spinner = theme.spinner[tick % theme.spinner.len()];
                 request(f, inner, r, app, spinner, theme)
             }
-            None => f.render_widget(Line::raw("No tasks yet.").dim(), inner),
+            None => {
+                let mut lines = match compact {
+                    true => Vec::new(),
+                    false => [theme.logo(), vec![Line::raw("")]].concat(),
+                };
+                lines.push(Line::raw("No tasks yet.").dim());
+                f.render_widget(Paragraph::new(lines), inner)
+            }
         }
         return;
     };
@@ -7232,7 +7269,7 @@ mod tests {
         app.selected = 1;
         app.palette = Some(("appr".into(), 0));
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let theme = Theme::new(false, false);
+        let theme = Theme::new(true, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
         assert_eq!(
@@ -7244,11 +7281,14 @@ mod tests {
                 "│   ✓ Reject negative max_delay      ready  ││                                                     │",
                 "│ ▌ ○ Bump sqlx to 0.9        1 to approve  ││ spend   ──────── $0.00/$5.00                        │",
                 "│                                           ││                                                     │",
-                "│ ▾ WORKING 1 ───────────────────────────── ││ NEXT   a  approve    e  edit                        │",
-                "│   ⠋ Retry webhook sends        working ·  ││                                                     │",
-                "│                                           ││  Summary  Activity  Gate  Findings  Diff  Run       │",
-                "│ ▾ LATER 1 ────╭ Commands ────────────────────────────────────────────────────────╮               │",
-                "│   ○ Split the │ › appr▏                              type to filter · ↑↓ · enter │               │",
+                "│ ▾ WORKING 1 ──╭ Commands ────────────────────────────────────────────────────────╮               │",
+                "│   ⠋ Retry webh│ ██      ██                                                       │               │",
+                "│               │   ██  ██                                                         │iff  Run       │",
+                "│ ▾ LATER 1 ────│     ██      yogan                                                │               │",
+                "│   ○ Split the │     ██                                                           │               │",
+                "│               │     ██                                                           │               │",
+                "│               │                                                                  │               │",
+                "│               │ › appr▏                              type to filter · ↑↓ · enter │               │",
                 "│               │ ──────────────────────────────────────────────────────────────── │               │",
                 "│               │ ▌ a    approve                                  Bump sqlx to 0.9 │               │",
                 "│               │   A    approve all                              Bump sqlx to 0.9 │               │",
@@ -7257,12 +7297,63 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
                 " a  approve  A  approve all  e  edit  r  reply to lead  x  discard task  n  new task  ?  more       ",
             ]
         );
+        // the junction is the accent; ASCII draws cells as ##
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(22, 9)].fg, Color::Rgb(208, 174, 250));
+        assert_eq!(buf[(18, 7)].fg, Color::Reset);
+        let theme = Theme::new(false, true);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        let rows: Vec<_> = screen(&term)[7..12]
+            .iter()
+            .map(|r| r.chars().skip(17).take(19).collect::<String>())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                " ##      ##        ",
+                "   ##  ##          ",
+                "     ##      yogan ",
+                "     ##            ",
+                "     ##            ",
+            ]
+        );
+        assert_eq!(term.backend().buffer()[(22, 9)].fg, Color::Magenta);
+    }
+
+    #[test]
+    fn logo_on_the_empty_state() {
+        let (mut app, _) = app();
+        app.tasks.clear();
+        app.detail = true;
+        for ascii in [false, true] {
+            let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            let theme = Theme::new(!ascii, ascii);
+            term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+                .unwrap();
+            let cell = if ascii { "##" } else { "██" };
+            let logo = [
+                "│ ██      ██                                               │",
+                "│   ██  ██                                                 │",
+                "│     ██      yogan                                        │",
+                "│     ██                                                   │",
+                "│     ██                                                   │",
+                "│                                                          │",
+                "│ No tasks yet.                                            │",
+            ]
+            .map(|r| r.replace("██", cell));
+            assert_eq!(screen(&term)[2..9], logo);
+            let accent = theme.accent;
+            assert_eq!(term.backend().buffer()[(6, 4)].fg, accent);
+        }
+        // compact (under 24 rows) keeps only the text
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| draw(f, &app, &Theme::new(true, false), 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert!(screen(&term)[1].contains("No tasks yet."));
     }
 }
