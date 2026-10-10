@@ -106,9 +106,26 @@ impl Findings {
     /// next critic to check once the worker has fixed it; returns it for the worker's prompt.
     pub fn uphold(&mut self, i: usize) -> Result<Finding> {
         anyhow::ensure!(self.is_disputed(i), "only a disputed finding can be upheld");
-        let f = self.take(i)?;
-        self.fixed.push(f.clone());
-        Ok(f)
+        Ok(self.send_back(&[i])?.remove(0))
+    }
+
+    /// `f`/`F`: moves the `picked` of `actionable` to `fixed`, for the next critic to check;
+    /// returns them in `actionable` order for the worker's prompt.
+    pub fn send_back(&mut self, picked: &[usize]) -> Result<Vec<Finding>> {
+        let mut picked = picked.to_vec();
+        picked.sort_unstable();
+        picked.dedup();
+        let n = self.actionable().count();
+        anyhow::ensure!(
+            picked.last().is_some_and(|&i| i < n),
+            "no such finding to send back"
+        );
+        let mut sent = (picked.iter().rev())
+            .map(|&i| self.take(i))
+            .collect::<Result<Vec<_>>>()?;
+        sent.reverse();
+        self.fixed.extend(sent.iter().cloned());
+        Ok(sent)
     }
 
     /// The blockers and majors to send back; unproven ones are in `optional` already.
@@ -333,5 +350,36 @@ mod tests {
         assert_eq!(findings.waived[0].reply.as_deref(), Some("style only"));
         assert_eq!(findings.actionable().count(), 0);
         assert!(findings.waive(0, "x").is_err());
+    }
+
+    #[test]
+    fn sending_findings_back() {
+        let finding = |claim: &str| Finding {
+            severity: Severity::Minor,
+            location: "src/lib.rs:1".into(),
+            claim: claim.into(),
+            evidence: String::new(),
+            reply: None,
+        };
+        let mut findings = Findings {
+            findings: vec![finding("a"), finding("b")],
+            disputed: vec![finding("c")],
+            optional: vec![finding("d")],
+            ..Default::default()
+        };
+        assert!(findings.send_back(&[]).is_err());
+        assert!(findings.send_back(&[1, 4]).is_err());
+        assert_eq!(
+            findings.actionable().count(),
+            4,
+            "nothing moves on an error"
+        );
+        // numbered as `actionable` numbers them, across its lists
+        let sent = findings.send_back(&[3, 0, 2, 0]).unwrap();
+        let claims = |fs: &[Finding]| fs.iter().map(|f| f.claim.clone()).collect::<Vec<_>>();
+        assert_eq!(claims(&sent), ["a", "c", "d"]);
+        assert_eq!(claims(&findings.fixed), ["a", "c", "d"]);
+        assert_eq!(claims(&findings.findings), ["b"]);
+        assert!(findings.disputed.is_empty() && findings.optional.is_empty());
     }
 }
