@@ -1598,9 +1598,17 @@ impl App {
 
     fn save_settings(&mut self) -> Result<PathBuf> {
         let s = self.settings.as_mut().context("Settings isn't open")?;
+        let row = SETTINGS
+            .iter()
+            .position(|r| (r.0, r.1) == ("worker", "concurrency"));
+        let concurrency = row.is_some_and(|i| s.values[i] != s.loaded[i]);
         let path = s.save(&self.repo, &config::home()?)?;
         let watch = config::load(&self.repo)?.watch;
         (self.sessions, self.stall_after) = (watch.max_handoffs + 1, watch.stall_after);
+        // a raised limit starts queued tasks now rather than on the next worker exit
+        if concurrency {
+            sched::run(&self.repo)?;
+        }
         Ok(path)
     }
 
