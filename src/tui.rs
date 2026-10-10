@@ -427,6 +427,8 @@ struct App {
     /// The selected task's findings, and the cursor over their actionable ones.
     findings: Findings,
     finding: usize,
+    /// The actionable findings marked with space for `f`; cleared when the findings reload.
+    marked: BTreeSet<usize>,
     /// Tasks in Review with a disputed finding.
     disputed: Vec<String>,
     /// The selected question's id, answer and the repo files the answer cites.
@@ -499,7 +501,8 @@ impl Hits {
 
 /// What a click does: press a key, or one of the things with no key: select a list row, fold
 /// a group, dismiss the info toast, start dragging the divider, scroll the detail pane to
-/// an offset, fold or unfold a Diff file, open Diff at a finding's file, or run a palette row.
+/// an offset, fold or unfold a Diff file, open Diff at a finding's file, select a finding, or
+/// run a palette row.
 /// `Hint` only shows its hint on hover.
 #[derive(Clone, Copy)]
 enum Target {
@@ -512,6 +515,7 @@ enum Target {
     Fold(usize),
     File(usize),
     Location(usize),
+    Finding(usize),
     Command(usize),
 }
 
@@ -539,6 +543,7 @@ fn key_of(label: &str) -> Option<KeyEvent> {
         "enter" => KeyCode::Enter,
         "esc" => KeyCode::Esc,
         "tab" => KeyCode::Tab,
+        "space" => KeyCode::Char(' '),
         "ctrl-s" => return Some(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
         _ => match label.chars().collect::<Vec<_>>()[..] {
             [c] => KeyCode::Char(c),
@@ -644,6 +649,7 @@ pub fn run(repo: &Path) -> Result<()> {
         scroll: Scroll::default(),
         findings: Findings::default(),
         finding: 0,
+        marked: BTreeSet::new(),
         disputed: Vec::new(),
         sessions: config::load(repo).map_or(0, |c| c.watch.max_handoffs + 1),
         run: RunTab::default(),
@@ -1288,6 +1294,18 @@ impl App {
                     self.reply_for = Some('r');
                     return true;
                 }
+                KeyCode::Char(' ') if n > 0 => {
+                    if !self.marked.remove(&self.finding) {
+                        self.marked.insert(self.finding);
+                    }
+                    return true;
+                }
+                KeyCode::Char(c @ ('f' | 'F')) => {
+                    if let Err(e) = self.send_findings(c == 'F') {
+                        self.notice = Some(format!("{e:#}"));
+                    }
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -1509,6 +1527,7 @@ impl App {
             self.findings = Findings::load(&self.state, &id).unwrap_or_default();
             let n = self.findings.actionable().count();
             self.finding = self.finding.min(n.saturating_sub(1));
+            self.marked.clear();
             self.loaded = key;
         }
     }
@@ -1941,6 +1960,9 @@ impl App {
                 // with only file `i` unfolded its row is `i`, so this puts it at the top
                 self.scroll.set(i as u16);
             }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Finding(i))) if !modal => {
+                self.finding = i;
+            }
             _ => {}
         }
         if self.selected != before {
@@ -2006,6 +2028,42 @@ impl App {
         );
         worker::spawn(&self.repo, &id, &["--reply", &prompt])?;
         self.info = Some("sent back to the worker".into());
+        Ok(())
+    }
+
+    /// `f`/`F`: sends the marked findings, else the selected one, or with `all` every actionable
+    /// one, back to the worker to fix.
+    fn send_findings(&mut self, all: bool) -> Result<()> {
+        let (t, _) = self.task().context("no task selected")?;
+        ensure!(
+            t.status == Status::Review,
+            "act on findings once the task is in Review"
+        );
+        let id = t.id.clone();
+        let mut findings = Findings::load(&self.state, &id)?;
+        let picked: Vec<usize> = match all {
+            true => (0..findings.actionable().count()).collect(),
+            false if self.marked.is_empty() => vec![self.finding],
+            false => self.marked.iter().copied().collect(),
+        };
+        let sent = findings.send_back(&picked)?;
+        findings.save(&self.state, &id)?;
+        // reloading clears the marks, whose indices are stale now
+        self.loaded = None;
+        let mut prompt =
+            "The human sends these findings back, so fix each one and commit.\n".to_string();
+        for (i, f) in sent.iter().enumerate() {
+            prompt.push_str(&format!(
+                "\n{}. [{:?}] {} - {}\n   Evidence: {}\n",
+                i + 1,
+                f.severity,
+                f.location,
+                f.claim,
+                f.evidence
+            ));
+        }
+        worker::spawn(&self.repo, &id, &["--reply", &prompt])?;
+        self.info = Some(format!("sent {} back to the worker", sent.len()));
         Ok(())
     }
 
@@ -2415,7 +2473,10 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         let mut keys = vec![("j/k", "finding")];
         let disputed = app.findings.is_disputed(app.finding);
         keys.extend(disputed.then_some(("r", "reply to worker")));
-        keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive finding")));
+        if app.findings.actionable().count() > 0 {
+            keys.extend([("x", "waive"), ("space", "mark")]);
+            keys.extend([("f", "fix"), ("F", "fix all")]);
+        }
         keys.extend([
             ("o", "open"),
             ("tab", "pane"),
@@ -4015,6 +4076,8 @@ fn findings_tab(f: &mut Frame, area: Rect, app: &App, cursor: Option<usize>, the
     let mut lines = Vec::new();
     // (line, column, width, diff file) of each location in the diff
     let mut locs = Vec::new();
+    // (line, actionable index) of each actionable finding's row
+    let mut rows = Vec::new();
     if let Some(e) = &fs.error {
         lines.push(Line::styled(
             format!("The critic didn't finish: {e}"),
@@ -4039,6 +4102,10 @@ fn findings_tab(f: &mut Frame, area: Rect, app: &App, cursor: Option<usize>, the
         lines.push(Line::raw(label).dim());
         for x in list {
             let sel = actionable && cursor == Some(i);
+            let marked = actionable && app.marked.contains(&i);
+            if actionable {
+                rows.push((lines.len(), i));
+            }
             i += usize::from(actionable);
             let glyph = match x.severity {
                 Severity::Blocker => Span::styled(theme.fail, theme.red),
@@ -4054,7 +4121,7 @@ fn findings_tab(f: &mut Frame, area: Rect, app: &App, cursor: Option<usize>, the
             }
             lines.push(Line::from(vec![
                 Span::styled(if sel { theme.bar } else { " " }, theme.accent),
-                Span::raw(" "),
+                Span::styled(if marked { theme.pass } else { " " }, theme.accent),
                 glyph,
                 Span::raw(" "),
                 match file {
@@ -4079,14 +4146,21 @@ fn findings_tab(f: &mut Frame, area: Rect, app: &App, cursor: Option<usize>, the
         |lines: &[Line<'static>]| Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
     scrolled(f, area, wrapped(&lines), &app.scroll);
     let top = app.scroll.get() as usize;
-    let targets = locs.into_iter().filter_map(|(line, x, w, file)| {
+    let y_of = |line: usize| {
         let row = wrapped(&lines[..line]).line_count(area.width);
-        let y = row.checked_sub(top).filter(|y| *y < area.height as usize)?;
-        let rect = Rect::new(area.x + x as u16, area.y + y as u16, w as u16, 1);
+        row.checked_sub(top).filter(|y| *y < area.height as usize)
+    };
+    // rows first, so a location on one still wins
+    let rows = rows.into_iter().filter_map(|(line, i)| {
+        let rect = Rect::new(area.x, area.y + y_of(line)? as u16, area.width, 1);
+        Some((rect, Target::Finding(i), "click · select".into()))
+    });
+    let targets = locs.into_iter().filter_map(|(line, x, w, file)| {
+        let rect = Rect::new(area.x + x as u16, area.y + y_of(line)? as u16, w as u16, 1);
         let hint = "click · show it in the diff".into();
         Some((rect.intersection(area), Target::Location(file), hint))
     });
-    app.hits.borrow_mut().targets.extend(targets);
+    app.hits.borrow_mut().targets.extend(rows.chain(targets));
 }
 
 /// One line per tool call, following the tail: edits in the accent, shell commands in a
@@ -4433,6 +4507,7 @@ mod tests {
             scroll: Scroll::default(),
             findings: Findings::default(),
             finding: 0,
+            marked: BTreeSet::new(),
             disputed: Vec::new(),
             sessions: 3,
             run: RunTab::default(),
@@ -4844,6 +4919,21 @@ mod tests {
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
         let rows = screen(&term);
+        // the rest of a row selects its finding
+        let row = rows
+            .iter()
+            .position(|r| r.contains("may overflow"))
+            .unwrap();
+        let column = rows[row][..rows[row].find("may overflow").unwrap()]
+            .chars()
+            .count();
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column as u16 + 2,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!((app.tab, app.finding), (FINDINGS, 2));
         let row = rows
             .iter()
             .position(|r| r.contains("src/retry.rs:9"))
@@ -5324,7 +5414,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " j/k  finding  r  reply to worker  ?  more                  ",
+                " j/k  finding  r  reply to worker  x  waive  ?  more        ",
             ]
         );
     }
@@ -5340,7 +5430,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             screen(&term)[29],
-            " j/k  finding  r  reply to worker  x  waive finding  o  open  tab  pane  1-6  tabs  ?  more         "
+            " j/k  finding  r  reply to worker  x  waive  space  mark  f  fix  F  fix all  o  open  ?  more      "
         );
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.reply_for, Some('x'));
@@ -5586,6 +5676,45 @@ mod tests {
         // the tab shows it too, so the cursor can't act on a stale row
         app.load_tab();
         assert_eq!(app.findings, saved);
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn marking_findings_to_fix() {
+        let (mut app, _) = app();
+        let state = std::env::temp_dir().join(format!("yogan-mark-{}", std::process::id()));
+        sample_findings().save(&state, "t1").unwrap();
+        app.state = state.clone();
+        (app.detail, app.tab) = (true, FINDINGS);
+        app.load_tab();
+        let press = |app: &mut App, c| app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        press(&mut app, ' ');
+        press(&mut app, 'j');
+        press(&mut app, 'j');
+        press(&mut app, ' ');
+        press(&mut app, 'k');
+        press(&mut app, ' ');
+        press(&mut app, ' ');
+        assert_eq!(app.marked, BTreeSet::from([0, 2]));
+        let mut term = Terminal::new(TestBackend::new(60, 32)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        let rows = screen(&term);
+        let row = |claim| rows.iter().find(|r| r.contains(claim)).unwrap().clone();
+        assert!(row("-1 still parses").starts_with("│  ✓✗ src/config.rs:41"));
+        assert!(row("no test for zero").starts_with("│ ▌ ◆ src/retry.rs:9"));
+        assert!(row("may overflow").starts_with("│  ✓◆ src/lib.rs:3"));
+
+        // only a task in Review takes findings back
+        app.tasks[0].0.status = Status::Running;
+        for c in ['f', 'F'] {
+            app.notice = None;
+            press(&mut app, c);
+            assert!(app.notice.as_deref().unwrap().contains("in Review"));
+        }
+        assert_eq!(Findings::load(&state, "t1").unwrap(), sample_findings());
+        assert_eq!(app.marked, BTreeSet::from([0, 2]));
         fs::remove_dir_all(&state).unwrap();
     }
 
