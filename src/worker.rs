@@ -394,17 +394,24 @@ pub fn alive(pid: u32) -> bool {
 
 /// The worker's main. With `pr` (an instruction, or empty), it rebases a task in Review and
 /// drafts its PR instead of starting fresh; with `reply`, it resumes the task's session with it
-/// and runs the gate and critic again. Any error marks the task `Failed`, with the error as its
-/// summary. On exit it starts whatever is ready next.
-pub fn run(repo: &Path, id: &str, pr: Option<&str>, reply: Option<&str>) -> Result<()> {
+/// and runs the gate and critic again; with `merge`, it rebases like `pr` and pushes to main.
+/// Any error marks the task `Failed`, with the error as its summary. On exit it starts whatever
+/// is ready next.
+pub fn run(
+    repo: &Path,
+    id: &str,
+    pr: Option<&str>,
+    reply: Option<&str>,
+    merge: bool,
+) -> Result<()> {
     let state = task::state_dir(repo)?;
     let mut task = task::load_all(&state)?
         .into_iter()
         .find(|t| t.id == id)
         .with_context(|| format!("no task {id}"))?;
-    let res = lifecycle(repo, &state, &mut task, pr, reply);
+    let res = lifecycle(repo, &state, &mut task, pr, reply, merge);
     if let Err(e) = &res
-        && (pr.is_some() || reply.is_some())
+        && (pr.is_some() || reply.is_some() || merge)
         && task.status == Status::Review
     {
         // the work is intact: the fetch, rebase or draft failed, or another worker holds the slot
@@ -432,9 +439,10 @@ fn lifecycle(
     task: &mut Task,
     pr: Option<&str>,
     reply: Option<&str>,
+    merge: bool,
 ) -> Result<()> {
     // a task in Review keeps its slot and worktree
-    let existing = pr.is_some() || reply.is_some();
+    let existing = pr.is_some() || reply.is_some() || merge;
     let cfg = config::load(repo)?;
     if let Some(nofile) = cfg.cargo.as_ref().and_then(|c| c.nofile) {
         let hard = getrlimit(Resource::Nofile).maximum;
@@ -445,6 +453,12 @@ fn lifecycle(
         setrlimit(Resource::Nofile, limit).context("[cargo] nofile")?;
     }
     let tasks = task::load_all(state)?;
+    let base = task::base(task, tasks.iter());
+    let base = base.as_str();
+    ensure!(
+        !merge || base == "origin/main",
+        "it builds on {base}, so it can only go to main once that's merged"
+    );
     let (n, _lock) = match existing {
         true => {
             let n = task.slot.context("the task has no slot")?;
@@ -457,16 +471,15 @@ fn lifecycle(
     check_effort(&effort)?;
     task.model = Some(model.clone());
     task.effort = Some(effort.clone());
-    // --pr leaves the task in Review until something runs, so a failed fetch keeps it there
-    if pr.is_none() {
+    // --pr and --merge leave the task in Review until something runs, so a failed fetch keeps it
+    // there
+    if pr.is_none() && !merge {
         task.status = Status::Running;
     }
     task.slot = Some(n);
     task.pid = Some(std::process::id());
     task.save(state)?;
 
-    let base = task::base(task, tasks.iter());
-    let base = base.as_str();
     let dir = match existing {
         true => state.join("slots").join(n.to_string()),
         false => slot::prepare(repo, state, n, &task.branch, base, cfg.disk.max_target_gb)?,
@@ -754,21 +767,36 @@ fn lifecycle(
     };
 
     match (pr, reply) {
-        (None, None) => {
+        (None, None) if !merge => {
             let prompt = prompt(task);
             work(task, Some((&prompt, false)), true)?;
         }
         (None, Some(reply)) => _ = work(task, Some((reply, true)), true)?,
-        (Some(instruction), _) => {
+        (instruction, _) => {
             let passed = match rebase(&dir, base)? {
                 None => work(task, Some((&conflict(base), true)), false)?,
                 Some(true) => work(task, None, false)?,
                 Some(false) => task.gate.iter().flatten().all(|c| c.passed),
             };
-            if passed {
-                // saved first, so a failed draft leaves the task in Review (see `run`)
-                task.status = Status::Review;
+            // saved first, so a failed draft or push leaves the task in Review (see `run`)
+            task.status = Status::Review;
+            task.save(state)?;
+            if merge {
+                ensure!(passed, "the gate failed, so it wasn't pushed to main");
+                git(&dir, &["push", "--quiet", "origin", "HEAD:refs/heads/main"])?;
+                let _ = slot::stop_run(state, &task.id); // it may already have exited
+                if let Some(cmd) = cfg.scripts.as_ref().and_then(|s| s.teardown.as_deref()) {
+                    let log = logs.join(format!("{}.teardown.log", task.id));
+                    // it's merged either way; a failure is in the teardown log
+                    let _ = slot::run_script(cmd, &dir, &env, &log);
+                }
+                task.status = Status::Merged;
+                task.slot = None;
                 task.save(state)?;
+                return Ok(());
+            }
+            let instruction = instruction.unwrap_or_default();
+            if passed {
                 let instruction = Some(instruction).filter(|i| !i.is_empty());
                 let findings = Findings::load(state, &task.id)?;
                 let draft = pr::draft(task, &dir, base, &cfg.pr, instruction, &findings)?;

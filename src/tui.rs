@@ -50,7 +50,11 @@ const GROUPS: [(&str, &[(Status, &str)]); 3] = [
     ),
     (
         "Later",
-        &[(Status::Approved, "Queued"), (Status::PrOpen, "PR open")],
+        &[
+            (Status::Approved, "Queued"),
+            (Status::PrOpen, "PR open"),
+            (Status::Merged, "Merged"),
+        ],
     ),
 ];
 
@@ -395,7 +399,7 @@ impl Theme {
             Status::Running => Span::styled(self.spinner[tick % self.spinner.len()], self.accent),
             Status::Checking => Span::styled(self.checking, self.accent),
             Status::Review if gate_failed => Span::styled(self.fail, self.red),
-            Status::Review | Status::PrOpen => Span::styled(self.pass, self.green),
+            Status::Review | Status::PrOpen | Status::Merged => Span::styled(self.pass, self.green),
             Status::Failed => Span::styled(self.fail, self.red),
             Status::Proposed => Span::styled(self.queued, self.amber),
             Status::Approved | Status::Discarded => Span::raw(self.queued).dim(),
@@ -3256,6 +3260,7 @@ fn list(
                     Some(n) => format!("PR #{n}"),
                     None => "PR open".into(),
                 },
+                Status::Merged => "Merged".into(),
                 _ => format!("{}{age}", serving.unwrap_or_default()),
             };
             let mut right: Vec<_> = reason.map(|(r, c)| theme.chip(&r, c)).into_iter().collect();
@@ -3617,7 +3622,7 @@ fn pipeline(t: &Task, theme: &Theme, spinner: &'static str) -> Line<'static> {
         Status::Failed if !gate_failed => 2,
         Status::Checking | Status::Failed => 3,
         Status::Review => 4,
-        Status::PrOpen | Status::Discarded => 5,
+        Status::PrOpen | Status::Merged | Status::Discarded => 5,
     };
     let stages = ["plan", "queue", "run", "check", "review", "pr"];
     let mut spans = Vec::new();

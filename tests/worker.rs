@@ -440,6 +440,85 @@ fn worker_runs_setup_then_claude() {
     );
     assert!(t9.pr_draft.is_some());
 
+    // --merge on a task built on an unmerged parent stays in Review with the reason
+    let (ok, t9) = yogan(&["worker", "t9", "--merge"], "graft", "");
+    assert!(!ok);
+    assert_eq!(t9.status, Status::Review);
+    let err = fs::read_to_string(state.join("logs/t9.pr.log")).unwrap();
+    assert!(err.contains("origin/u/t1"), "{err}");
+
+    // --merge with origin unchanged keeps the last gate, and a failed one stops the push
+    let (ok, mut t10) = worker("t10", "true", "graft", "", None);
+    assert!(ok);
+    let head = |dir: &Path, rev: &str| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let main_before = head(&origin, "main");
+    t10.gate.as_mut().unwrap()[0].passed = false;
+    t10.save(&state).unwrap();
+    let (ok, mut t10) = yogan(&["worker", "t10", "--merge"], "graft", "");
+    assert!(!ok);
+    assert_eq!(t10.status, Status::Review);
+    let err = fs::read_to_string(state.join("logs/t10.pr.log")).unwrap();
+    assert!(err.contains("gate failed"), "{err}");
+    assert_eq!(head(&origin, "main"), main_before);
+
+    // a push origin rejects stays in Review too
+    t10.gate.as_mut().unwrap()[0].passed = true;
+    t10.save(&state).unwrap();
+    let hook = origin.join("hooks/pre-receive");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let (ok, t10) = yogan(&["worker", "t10", "--merge"], "graft", "");
+    fs::remove_file(&hook).unwrap();
+    assert!(!ok);
+    assert_eq!(t10.status, Status::Review);
+    let err = fs::read_to_string(state.join("logs/t10.pr.log")).unwrap();
+    assert!(err.contains("push"), "{err}");
+    assert_eq!(head(&origin, "main"), main_before);
+
+    // a successful --merge after upstream moved re-gates, pushes the head to main, stops the
+    // run script, runs teardown and frees the slot
+    let slot10 = state.join(format!("slots/{}", t10.slot.unwrap()));
+    let cfg = fs::read_to_string(&project).unwrap();
+    let cfg = cfg.replace("[cargo]", "teardown = \"echo bye\"\n[cargo]");
+    fs::write(&project, cfg).unwrap();
+    fs::write(repo.join("d.txt"), "d").unwrap();
+    git(&repo, &["add", "d.txt"]);
+    git(&repo, &["commit", "-qm", "upstream adds d.txt"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let main_before = head(&origin, "main");
+    fs::remove_file(state.join("logs/t10.gate.log")).unwrap();
+    let run = yogan_swarm::slot::start_run(&state, "t10", "sleep 60", &slot10, &[]).unwrap();
+    let (ok, t10) = yogan(&["worker", "t10", "--merge"], "graft", "");
+    assert!(ok);
+    assert_eq!((t10.status, t10.slot), (Status::Merged, None));
+    assert!(
+        state.join("logs/t10.gate.log").exists(),
+        "the moved branch was re-gated"
+    );
+    assert!(!state.join("logs/t10.run.pid").exists());
+    let start = Instant::now();
+    while test_kill_process(Pid::from_raw(run as i32).unwrap()).is_ok() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "run script still alive"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(head(&origin, "main"), head(&slot10, "HEAD"));
+    assert_ne!(head(&origin, "main"), main_before);
+    assert_eq!(
+        fs::read_to_string(state.join("logs/t10.teardown.log")).unwrap(),
+        "bye\n"
+    );
+
     // queued tasks drain one at a time (concurrency 1), each worker starting the next on exit
     for id in ["t6", "t7"] {
         let task = Task {
