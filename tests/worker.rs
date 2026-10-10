@@ -483,14 +483,35 @@ fn worker_runs_setup_then_claude() {
     assert!(err.contains("push"), "{err}");
     assert_eq!(head(&origin, "main"), main_before);
 
-    // a successful --merge pushes the head to main, runs teardown and frees the slot
+    // a successful --merge after upstream moved re-gates, pushes the head to main, stops the
+    // run script, runs teardown and frees the slot
     let slot10 = state.join(format!("slots/{}", t10.slot.unwrap()));
     let cfg = fs::read_to_string(&project).unwrap();
     let cfg = cfg.replace("[cargo]", "teardown = \"echo bye\"\n[cargo]");
     fs::write(&project, cfg).unwrap();
+    fs::write(repo.join("d.txt"), "d").unwrap();
+    git(&repo, &["add", "d.txt"]);
+    git(&repo, &["commit", "-qm", "upstream adds d.txt"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let main_before = head(&origin, "main");
+    fs::remove_file(state.join("logs/t10.gate.log")).unwrap();
+    let run = yogan_swarm::slot::start_run(&state, "t10", "sleep 60", &slot10, &[]).unwrap();
     let (ok, t10) = yogan(&["worker", "t10", "--merge"], "graft", "");
     assert!(ok);
     assert_eq!((t10.status, t10.slot), (Status::Merged, None));
+    assert!(
+        state.join("logs/t10.gate.log").exists(),
+        "the moved branch was re-gated"
+    );
+    assert!(!state.join("logs/t10.run.pid").exists());
+    let start = Instant::now();
+    while test_kill_process(Pid::from_raw(run as i32).unwrap()).is_ok() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "run script still alive"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert_eq!(head(&origin, "main"), head(&slot10, "HEAD"));
     assert_ne!(head(&origin, "main"), main_before);
     assert_eq!(
