@@ -3110,27 +3110,24 @@ fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme, hits: &mut Hit
         false => Span::raw(" [ Submit ] ").dim(),
     };
     let rect = Rect::new(submit.x, submit.y, button.width() as u16, 1).intersection(submit);
-    let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-    hits.targets
-        .push((rect, Target::Key(key), "ctrl-s · submit".into()));
+    let target = key_of("ctrl-s").map(|key| (rect, Target::Key(key), "ctrl-s · submit".into()));
+    hits.targets.extend(target);
     f.render_widget(Line::from(button), submit);
-    let modes = MODES.iter().flat_map(|(m, name)| {
-        let name = match *m == c.mode {
+    let block = pane("Mode", c.focus == 2, theme);
+    let inner = block.inner(mode);
+    let mut modes = Vec::new();
+    for (i, (m, name)) in MODES.iter().enumerate() {
+        let span = match *m == c.mode {
             true => Span::styled(*name, theme.accent).bold().underlined(),
             false => Span::raw(*name).dim(),
         };
-        [name, Span::raw("  ")]
-    });
-    let block = pane("Mode", c.focus == 2, theme);
-    let inner = block.inner(mode);
-    let mut x = inner.x;
-    for (i, (_, name)) in MODES.iter().enumerate() {
-        let rect = Rect::new(x, inner.y, name.width() as u16, 1).intersection(inner);
+        let x = inner.x + Line::from(modes.clone()).width() as u16;
+        let rect = Rect::new(x, inner.y, span.width() as u16, 1).intersection(inner);
         hits.targets
             .push((rect, Target::Mode(i), format!("click · {name} mode")));
-        x = x.saturating_add(name.width() as u16 + 2);
+        modes.extend([span, Span::raw("  ")]);
     }
-    f.render_widget(Line::from(modes.collect::<Vec<_>>()), inner);
+    f.render_widget(Line::from(modes), inner);
     f.render_widget(block, mode);
     for (i, (field, area, title)) in [
         (&c.request, request, "Request"),
