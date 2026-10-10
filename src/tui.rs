@@ -117,7 +117,7 @@ const MODELS: &[&str] = &[
 ];
 
 /// What Settings edits, as (table, key, label, field); an empty label continues the row above.
-const SETTINGS: [(&str, &str, &str, Field); 16] = [
+const SETTINGS: [(&str, &str, &str, Field); 17] = [
     ("lead", "model", "lead", Field::Pick(MODELS)),
     ("lead", "effort", "", Field::Pick(worker::EFFORTS)),
     ("ask", "model", "questions", Field::Pick(MODELS)),
@@ -128,6 +128,12 @@ const SETTINGS: [(&str, &str, &str, Field); 16] = [
     ("worker", "effort", "", Field::Pick(worker::EFFORTS)),
     ("pr", "model", "PR drafts", Field::Pick(MODELS)),
     ("pr", "effort", "", Field::Pick(worker::EFFORTS)),
+    (
+        "worker",
+        "concurrency",
+        "concurrency",
+        Field::Step(1.0, 1.0, 16.0),
+    ),
     (
         "watch",
         "stall_after",
@@ -160,8 +166,10 @@ const SETTINGS: [(&str, &str, &str, Field); 16] = [
         Field::Step(1.0, 0.0, 9.0),
     ),
 ];
+/// The first workers row.
+const WORKERS: usize = 10;
 /// The first watch row.
-const WATCH: usize = 10;
+const WATCH: usize = 11;
 
 /// The `,` screen: the `SETTINGS` values in effect for the file it saves to, as loaded and as
 /// edited.
@@ -2850,7 +2858,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Each role's model and effort, then the watch thresholds; `•` marks an unsaved change.
+/// Each role's model and effort, then worker limits and the watch thresholds; `•` marks an unsaved change.
 fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
     let file = if s.global { "global" } else { "project" };
     let mut lines = vec![
@@ -2860,6 +2868,9 @@ fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
     ];
     let mut selected = 0;
     for (i, ((_, key, label, _), v)) in SETTINGS.iter().zip(&s.values).enumerate() {
+        if i == WORKERS {
+            lines.extend([Line::raw(""), Line::raw("Workers").dim()]);
+        }
         if i == WATCH {
             lines.extend([Line::raw(""), Line::raw("Watch").dim()]);
         }
@@ -2872,7 +2883,7 @@ fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
             true => Span::raw(format!("‹ {value} ›")).bold(),
             false => Span::raw(value),
         };
-        let name = match i < WATCH {
+        let name = match i < WORKERS {
             true => format!("{label:<11}{key:<8}"),
             false => format!("{label:<19}"),
         };
@@ -4676,14 +4687,16 @@ mod tests {
         s.cycle(true); // workers' effort: high to xhigh
         s.row = WATCH;
         s.cycle(true); // stall after: 15m to 20m
-        s.row = 14;
+        s.row = 15;
         s.cycle(false); // handoff at: 0.8 to 0.75
+        s.row = WORKERS;
+        s.cycle(false); // concurrency: 4 to 3
         s.row = 4;
         s.cycle(true); // critic: fable wraps round to opus
 
         let (mut app, _) = app();
         app.settings = Some(s);
-        let mut term = Terminal::new(TestBackend::new(60, 26)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 29)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
@@ -4705,6 +4718,9 @@ mod tests {
                 "│              effort  xhigh •                             │",
                 "│   PR drafts  model   claude-opus-5-5                     │",
                 "│              effort  medium                              │",
+                "│                                                          │",
+                "│ Workers                                                  │",
+                "│   concurrency        3 •                                 │",
                 "│                                                          │",
                 "│ Watch                                                    │",
                 "│   stall after        20m •                               │",
@@ -4738,7 +4754,7 @@ mod tests {
         assert_eq!(again.loaded, again.values);
         // only the changed keys are written
         let written: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(written["worker"].as_table().unwrap().len(), 1);
+        assert_eq!(written["worker"].as_table().unwrap().len(), 2);
         assert!(written.get("lead").is_none());
         fs::remove_dir_all(&root).unwrap();
     }
