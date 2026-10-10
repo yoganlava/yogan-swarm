@@ -79,13 +79,14 @@ const RUN: usize = 5;
 /// Lines a scroll key moves the detail pane.
 const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 24] = [
+const KEYS: [(&str, &str); 25] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
     ("1-6", "tabs"),
     ("d", "diff"),
     ("m", "open PR"),
+    ("M", "merge to main"),
     ("a", "approve"),
     ("A", "approve all"),
     ("e", "edit"),
@@ -445,15 +446,15 @@ struct App {
     unfolded: BTreeSet<usize>,
     /// Which task and file version `gate_log` and `diff` were read for.
     loaded: Option<(String, Option<SystemTime>)>,
-    /// Asking whether to discard the selected task.
-    confirm: bool,
+    /// Asking whether to do the selection's `x` (discard) or `M` (merge to main).
+    confirm: Option<char>,
     /// A slot, its base and optionally one file, whose diff to page once the TUI is suspended.
     pager: Option<(PathBuf, String, Option<String>)>,
     /// Showing the selected task's PR draft.
     preview: bool,
     /// A task being drafted, with the draft it had and the drafting worker's pid, to preview
-    /// once a new one lands.
-    awaiting: Option<(String, Option<pr::Draft>, u32)>,
+    /// once a new one lands; or, when the bool is set, being merged to main.
+    awaiting: Option<(String, Option<pr::Draft>, u32, bool)>,
     /// The instruction for `g` in the preview, while it's being typed.
     instruction: Option<TextArea<'static>>,
     /// Edit the PR draft, or else the selected proposal, in `$EDITOR` once the TUI is
@@ -684,7 +685,7 @@ pub fn run(repo: &Path) -> Result<()> {
         hunks: Vec::new(),
         unfolded: BTreeSet::new(),
         loaded: None,
-        confirm: false,
+        confirm: None,
         pager: None,
         preview: false,
         awaiting: None,
@@ -1279,11 +1280,13 @@ impl App {
             }
             return true;
         }
-        if self.confirm {
-            self.confirm = false;
-            if key.code == KeyCode::Char('y')
-                && let Err(e) = self.discard()
-            {
+        if let Some(action) = self.confirm.take() {
+            let res = match (key.code, action) {
+                (KeyCode::Char('y'), 'M') => self.merge(),
+                (KeyCode::Char('y'), _) => self.discard(),
+                _ => Ok(()),
+            };
+            if let Err(e) = res {
                 self.notice = Some(format!("{e:#}"));
             }
             return true;
@@ -1427,7 +1430,10 @@ impl App {
                 Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default(), None)),
                 None => self.notice = Some("this task has no worktree".into()),
             },
-            KeyCode::Char('x') => self.confirm = self.task().is_some() || failed || answered,
+            KeyCode::Char('x') => {
+                self.confirm = (self.task().is_some() || failed || answered).then_some('x');
+            }
+            KeyCode::Char('M') if valid(self, "M") => self.confirm = Some('M'),
             KeyCode::Char('t') if failed => {
                 if let Err(e) = self.retry() {
                     self.notice = Some(format!("{e:#}"));
@@ -1701,19 +1707,30 @@ impl App {
         }
         let _ = fs::remove_file(self.state.join(format!("logs/{}.pr.log", t.id))); // may not exist
         let pid = worker::spawn(&self.repo, &t.id, &args)?;
-        self.awaiting = Some((t.id.clone(), t.pr_draft.clone(), pid));
+        self.awaiting = Some((t.id.clone(), t.pr_draft.clone(), pid, false));
         self.preview = false;
+        Ok(())
+    }
+
+    /// `M` once confirmed: has a worker rebase, re-gate and push the selected task to main.
+    fn merge(&mut self) -> Result<()> {
+        ensure!(self.awaiting.is_none(), "a PR draft or merge is on its way");
+        let (t, _) = self.task().context("no task selected")?;
+        let id = t.id.clone();
+        let _ = fs::remove_file(self.state.join(format!("logs/{id}.pr.log"))); // may not exist
+        let pid = worker::spawn(&self.repo, &id, &["--merge"])?;
+        self.awaiting = Some((id, None, pid, true));
         Ok(())
     }
 
     /// Opens the preview once the awaited task has a new draft; gives up if it can't get one
     /// or its worker `exited` without one.
     fn check_awaiting(&mut self, exited: bool) {
-        let Some((id, old, _)) = &self.awaiting else {
+        let Some((id, old, _, merge)) = &self.awaiting else {
             return;
         };
         // never move the selection under an open modal, whose keys would then act on it
-        let modal = self.confirm || self.palette.is_some() || self.reply.is_some();
+        let modal = self.confirm.is_some() || self.palette.is_some() || self.reply.is_some();
         let modal = modal || self.compose.is_some();
         if modal || self.instruction.is_some() {
             return;
@@ -1723,7 +1740,19 @@ impl App {
             return;
         };
         let t = &self.tasks[i].0;
-        if t.status == Status::Review && t.pr_draft.is_some() && t.pr_draft != *old {
+        if *merge {
+            // it may pass through Checking or Running on the way; one left in Review has its
+            // reason in the log
+            if t.status != Status::Merged && !exited {
+                return;
+            }
+            if t.status == Status::Review {
+                let log = self.state.join(format!("logs/{id}.pr.log"));
+                let why = fs::read_to_string(log).unwrap_or("the worker exited".into());
+                self.notice = Some(format!("not merged: {}", why.trim()));
+            }
+            self.awaiting = None;
+        } else if t.status == Status::Review && t.pr_draft.is_some() && t.pr_draft != *old {
             let i = self.requests.len() + i;
             (self.selected, self.preview, self.awaiting) = (i, true, None);
         } else if t.status == Status::Failed || (t.status == Status::Review && !gate_passed(t)) {
@@ -1920,7 +1949,7 @@ impl App {
         let modal = self.compose.is_some() || self.settings.is_some() || self.reply.is_some();
         let modal = modal
             || self.preview
-            || self.confirm
+            || self.confirm.is_some()
             || self.palette.is_some()
             || self.instruction.is_some();
         let at = Position::new(m.column, m.row);
@@ -1964,7 +1993,7 @@ impl App {
             }
             // the second half of a double-click that opened the confirm doesn't answer it
             (MouseEventKind::Down(MouseButton::Left), Some(Target::Key(_)))
-                if self.confirm
+                if self.confirm.is_some()
                     && self.last_click.is_some_and(|(p, t)| {
                         p == at && t.elapsed() < Duration::from_millis(400)
                     }) => {}
@@ -2659,23 +2688,34 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             rule,
         );
     }
-    if app.palette.is_some() || app.confirm || app.reply.is_some() {
+    if app.palette.is_some() || app.confirm.is_some() || app.reply.is_some() {
         // only an open modal's own targets respond
         app.hits.borrow_mut().targets.clear();
     }
     palette(f, app, theme);
-    let confirm = match (app.request(), selected) {
-        (Some(r), _) => Some((
+    let confirm = match (app.confirm, app.request(), selected) {
+        (None, ..) => None,
+        (Some('M'), None, Some(t)) => Some((
+            "Merge",
+            t.title.as_str(),
+            "rebase, re-gate and push it straight to main, with no PR",
+            "Cancel",
+        )),
+        (_, Some(r), _) => Some((
             "Dismiss",
             r.text.lines().next().unwrap_or_default(),
             "dismiss it",
+            "Keep it",
         )),
-        (None, Some(t)) => Some(("Discard", t.title.as_str(), "discard and free its slot")),
+        (_, None, Some(t)) => Some((
+            "Discard",
+            t.title.as_str(),
+            "discard and free its slot",
+            "Keep it",
+        )),
         _ => None,
     };
-    if app.confirm
-        && let Some((verb, title, does)) = confirm
-    {
+    if let Some((verb, title, does, keep)) = confirm {
         // a modal over the dimmed screen
         let all = f.area();
         f.buffer_mut().set_style(all, Style::new().dim());
@@ -2692,10 +2732,7 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
         let mut x = buttons.x;
         let mut row = Vec::new();
-        for (key, label, code) in [
-            ("y", verb, KeyCode::Char('y')),
-            ("esc", "Keep it", KeyCode::Esc),
-        ] {
+        for (key, label, code) in [("y", verb, KeyCode::Char('y')), ("esc", keep, KeyCode::Esc)] {
             let button = [
                 Span::styled(format!(" {key} "), theme.accent)
                     .bold()
@@ -2835,6 +2872,12 @@ fn valid(app: &App, k: &str) -> bool {
         "1-6" => selected.is_some(),
         "R" => selected.is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id)),
         "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
+        "M" => selected.is_some_and(|t| {
+            let merged = |p: &String| {
+                (app.tasks.iter()).any(|(o, _)| &o.id == p && o.status == Status::Merged)
+            };
+            t.status == Status::Review && gate_passed(t) && t.parent.as_ref().is_none_or(merged)
+        }),
         "r" => {
             answered
                 || selected.is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
@@ -2850,7 +2893,7 @@ fn actions(app: &App) -> Vec<(&'static str, &'static str)> {
     let status = app.task().map(|(t, _)| t.status);
     let answered = app.request().is_some_and(|r| r.status == Phase::Done);
     let first: &[&str] = match status {
-        Some(Status::Review) => &["m", "r", "d", "x", "c", "w", "R", "o"],
+        Some(Status::Review) => &["m", "M", "r", "d", "x", "c", "w", "R", "o"],
         Some(Status::Failed) => &["t", "c", "x", "d", "o"],
         Some(Status::Proposed) => &["a", "A", "e", "r", "x"],
         _ if answered => &["p", "r", "y", "x"],
@@ -4551,7 +4594,7 @@ mod tests {
             hunks: Vec::new(),
             unfolded: BTreeSet::new(),
             loaded: None,
-            confirm: false,
+            confirm: None,
             pager: None,
             preview: false,
             awaiting: None,
@@ -4639,7 +4682,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
+                " yogan   ● 2    m  open PR  M  merge to main  ?  more       ",
             ]
         );
     }
@@ -4727,7 +4770,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
+                " yogan   ● 2    m  open PR  M  merge to main  ?  more       ",
             ]
         );
     }
@@ -4803,7 +4846,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
+                " yogan   ● 2    m  open PR  M  merge to main  ?  more       ",
             ]
         );
     }
@@ -5036,7 +5079,7 @@ mod tests {
             head: "abc".into(),
             problem: None,
         };
-        app.awaiting = Some(("t1".into(), None, 1));
+        app.awaiting = Some(("t1".into(), None, 1, false));
         app.check_awaiting(false);
         assert!(app.awaiting.is_some() && !app.preview, "still drafting");
         let err = app.draft(None).unwrap_err().to_string();
@@ -5045,10 +5088,10 @@ mod tests {
         // a new draft opens the preview on its task, once no modal would act on it
         app.selected = 2;
         app.tasks[0].0.pr_draft = Some(draft.clone());
-        app.confirm = true;
+        app.confirm = Some('x');
         app.check_awaiting(false);
         assert!(app.awaiting.is_some() && !app.preview && app.selected == 2);
-        app.confirm = false;
+        app.confirm = None;
         app.check_awaiting(false);
         assert!(app.awaiting.is_none() && app.preview && app.selected == 0);
 
@@ -5057,7 +5100,7 @@ mod tests {
         fs::create_dir_all(state.join("logs")).unwrap();
         fs::write(state.join("logs/t1.pr.log"), "claude exited with 1\n").unwrap();
         app.state = state.clone();
-        app.awaiting = Some(("t1".into(), Some(draft.clone()), 1));
+        app.awaiting = Some(("t1".into(), Some(draft.clone()), 1, false));
         app.check_awaiting(true);
         assert!(app.awaiting.is_none());
         assert_eq!(
@@ -5067,14 +5110,14 @@ mod tests {
         fs::remove_dir_all(&state).unwrap();
 
         // a failed task or gate gives up; so does a task that's gone
-        app.awaiting = Some(("t2".into(), None, 1));
+        app.awaiting = Some(("t2".into(), None, 1, false));
         app.check_awaiting(false);
         assert!(app.awaiting.is_none() && app.notice.take().is_some());
         app.tasks[0].0.gate.as_mut().unwrap()[0].passed = false;
-        app.awaiting = Some(("t1".into(), Some(draft), 1));
+        app.awaiting = Some(("t1".into(), Some(draft), 1, false));
         app.check_awaiting(false);
         assert!(app.awaiting.is_none() && app.notice.take().is_some());
-        app.awaiting = Some(("gone".into(), None, 1));
+        app.awaiting = Some(("gone".into(), None, 1, false));
         app.check_awaiting(false);
         assert!(app.awaiting.is_none() && app.notice.is_none());
     }
@@ -5277,13 +5320,76 @@ mod tests {
                 "│                                           ││ max_delay below zero now fails at parse time.       │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan   ● 2    m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more      ",
+                " yogan   ● 2    m  open PR  M  merge to main  r  reply to worker  d  diff  x  discard task  ?  more ",
             ]
         );
         // past half of the 15m stall_after, the quiet time turns amber
         let buf = term.backend().buffer();
         assert_ne!(buf[(36, 4)].fg, theme.amber);
         assert_eq!(buf[(36, 6)].fg, theme.amber);
+    }
+
+    #[test]
+    fn merging_to_main() {
+        let (mut app, now) = app();
+        let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert!(
+            app.commands()
+                .iter()
+                .any(|c| c.0 == "M" && c.1 == "merge to main")
+        );
+        assert!(app.key(press('M')) && app.confirm == Some('M'));
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                "╭ Tasks ───────────────────────────────────────────────────╮",
+                "│ ▌ ✓ Reject negative max_delay                  ready  4m │",
+                "│   ✗ Bump sqlx to 0.9                          failed  1h │",
+                "│   ╭ Merge ───────────────────────────────────────────╮2m │",
+                "│   │ Merge “Reject negative max_delay”?               │ot │",
+                "│   │ rebase, re-gate and push it straight to main,    │   │",
+                "│   │ with no PR                                       │   │",
+                "│   │  y  Merge     esc  Cancel                        │   │",
+                "│   ╰──────────────────────────────────────────────────╯   │",
+                "│                                                          │",
+                "╰──────────────────────────────────────────────────────────╯",
+                " yogan   ● 2    m  open PR  M  merge to main  ?  more       ",
+            ]
+        );
+        // esc starts nothing
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm.is_none() && app.awaiting.is_none());
+
+        // not until the parent is Merged, nor for a task not in Review
+        app.tasks[0].0.parent = Some("t2".into());
+        assert!(!actions(&app).iter().any(|(k, _)| *k == "M"));
+        assert!(app.key(press('M')) && app.confirm.is_none());
+        app.tasks[1].0.status = Status::Merged;
+        assert!(valid(&app, "M"));
+        app.selected = 2;
+        assert!(!valid(&app, "M"));
+
+        // a merge worker that exits with the task in Review shows why
+        let state = std::env::temp_dir().join(format!("yogan-merging-{}", std::process::id()));
+        fs::create_dir_all(state.join("logs")).unwrap();
+        fs::write(state.join("logs/t1.pr.log"), "the gate failed\n").unwrap();
+        app.state = state.clone();
+        app.awaiting = Some(("t1".into(), None, 1, true));
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_some() && app.notice.is_none());
+        // re-gating a moved head passes through Checking
+        app.tasks[0].0.status = Status::Checking;
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_some() && app.notice.is_none());
+        app.tasks[0].0.status = Status::Review;
+        app.check_awaiting(true);
+        assert!(app.awaiting.is_none());
+        let notice = app.notice.take();
+        assert_eq!(notice.as_deref(), Some("not merged: the gate failed"));
+        fs::remove_dir_all(&state).unwrap();
     }
 
     #[test]
@@ -5301,7 +5407,7 @@ mod tests {
         app.reload(&state).unwrap();
         app.selected = 0;
         let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        assert!(app.key(press('x')) && app.confirm);
+        assert!(app.key(press('x')) && app.confirm.is_some());
         assert!(app.key(press('y')) && app.notice.is_none());
         assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Dismissed);
         app.reload(&state).unwrap();
@@ -5508,7 +5614,7 @@ mod tests {
         );
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.reply_for, Some('x'));
-        assert!(!app.confirm);
+        assert!(app.confirm.is_none());
     }
 
     #[test]
@@ -5541,7 +5647,7 @@ mod tests {
             "Reject negative",
         );
         send(&mut app, left, "x   discard task");
-        assert!(app.confirm && app.reply_for.is_none());
+        assert!(app.confirm == Some('x') && app.reply_for.is_none());
         let m = app.last_click.unwrap().0;
         app.mouse(MouseEvent {
             kind: left,
@@ -5549,10 +5655,10 @@ mod tests {
             row: m.y,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(app.confirm);
+        assert!(app.confirm.is_some());
 
         // the preview's footer is the preview's, even on the Diff tab
-        app.confirm = false;
+        app.confirm = None;
         app.tasks[0].0.pr_draft = Some(pr::Draft {
             title: "feat(config): reject negative max_delay".into(),
             body: "max_delay below zero now fails at parse time.".into(),
@@ -6087,7 +6193,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+                " m  open PR  M  merge to main  r  reply to worker  d  diff  x  discard task  c  continue  ?  more   ",
             ]
         );
     }
@@ -6180,8 +6286,8 @@ mod tests {
             [
                 (
                     "review",
-                    " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more ".into(),
-                    " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ".into(),
+                    " m  open PR  M  merge to main  r  reply to worker  d  diff  ?  more             ".into(),
+                    " m  open PR  M  merge to main  r  reply to worker  d  diff  x  discard task  c  continue  ?  more   ".into(),
                 ),
                 (
                     "failed",
@@ -6227,7 +6333,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan   ● 2    m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more      ",
+                " yogan   ● 2    m  open PR  M  merge to main  r  reply to worker  d  diff  x  discard task  ?  more ",
             ]
         );
 
@@ -6282,10 +6388,11 @@ mod tests {
         app.state = state.clone();
         app.reload(&state).unwrap();
         app.selected = 0;
-        assert!(click(&mut app, " x  discard") && app.confirm);
-        assert!(click(&mut app, " esc  Keep it") && !app.confirm);
-        assert!(click(&mut app, " x  discard") && app.confirm);
-        assert!(click(&mut app, " y  Dismiss") && !app.confirm && app.notice.is_none());
+        assert!(click(&mut app, " x  discard") && app.confirm.is_some());
+        assert!(click(&mut app, " esc  Keep it") && app.confirm.is_none());
+        assert!(click(&mut app, " x  discard") && app.confirm.is_some());
+        let dismissed = click(&mut app, " y  Dismiss") && app.confirm.is_none();
+        assert!(dismissed && app.notice.is_none());
         assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Dismissed);
         fs::remove_dir_all(&state).unwrap();
     }
@@ -6621,7 +6728,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰──────────────────────────────────────── m · open PR ╯",
-                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+                " m  open PR  M  merge to main  r  reply to worker  d  diff  x  discard task  c  continue  ?  more   ",
             ]
         );
         let buf = term.backend().buffer();
@@ -6714,7 +6821,7 @@ mod tests {
                 "│                                                                                                  │",
                 "│                                                                                                  │",
                 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
-                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+                " m  open PR  M  merge to main  r  reply to worker  d  diff  x  discard task  c  continue  ?  more   ",
             ]
         );
         // the border label unzooms; z zooms again and esc goes back
@@ -6746,7 +6853,7 @@ mod tests {
                 "│                                           ││                       │ this task has no worktree │ │",
                 "│                                           ││                       ╰───────────────────────────╯ │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+                " m  open PR  M  merge to main  r  reply to worker  d  diff  x  discard task  c  continue  ?  more   ",
             ]
         );
 
@@ -6866,7 +6973,7 @@ mod tests {
                 "│ read    f19.rs                                           ┃",
                 "│ read    f20.rs                                           ┃",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
+                " yogan   ● 2    m  open PR  M  merge to main  ?  more       ",
             ]
         );
 
