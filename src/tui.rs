@@ -102,11 +102,13 @@ const KEYS: [(&str, &str); 24] = [
     ("]", "next for you"),
 ];
 
-/// How a Settings field changes: cycling through choices, or stepping a number within bounds.
+/// How a Settings field changes: cycling through choices, stepping a number within bounds, or
+/// flipping a bool.
 #[derive(Clone, Copy)]
 enum Field {
     Pick(&'static [&'static str]),
     Step(f64, f64, f64),
+    Toggle,
 }
 
 const MODELS: &[&str] = &[
@@ -117,7 +119,7 @@ const MODELS: &[&str] = &[
 ];
 
 /// What Settings edits, as (table, key, label, field); an empty label continues the row above.
-const SETTINGS: [(&str, &str, &str, Field); 17] = [
+const SETTINGS: [(&str, &str, &str, Field); 26] = [
     ("lead", "model", "lead", Field::Pick(MODELS)),
     ("lead", "effort", "", Field::Pick(worker::EFFORTS)),
     ("ask", "model", "questions", Field::Pick(MODELS)),
@@ -133,6 +135,31 @@ const SETTINGS: [(&str, &str, &str, Field); 17] = [
         "concurrency",
         "concurrency",
         Field::Step(1.0, 1.0, 16.0),
+    ),
+    ("worker", "slots", "slots", Field::Step(1.0, 1.0, 16.0)),
+    (
+        "worker",
+        "budget_usd",
+        "budget usd",
+        Field::Step(1.0, 0.0, 100.0),
+    ),
+    (
+        "build",
+        "max_cargo",
+        "cargo builds",
+        Field::Step(1.0, 1.0, 16.0),
+    ),
+    (
+        "critic",
+        "max_rounds",
+        "fix rounds",
+        Field::Step(1.0, 0.0, 9.0),
+    ),
+    (
+        "ask",
+        "concurrency",
+        "questions at once",
+        Field::Step(1.0, 1.0, 8.0),
     ),
     (
         "watch",
@@ -165,11 +192,29 @@ const SETTINGS: [(&str, &str, &str, Field); 17] = [
         "max handoffs",
         Field::Step(1.0, 0.0, 9.0),
     ),
+    (
+        "disk",
+        "max_target_gb",
+        "max target gb",
+        Field::Step(10.0, 10.0, 500.0),
+    ),
+    (
+        "disk",
+        "min_free_gb",
+        "min free gb",
+        Field::Step(10.0, 0.0, 1000.0),
+    ),
+    ("pr", "draft", "draft PRs", Field::Toggle),
+    ("tui", "mouse", "mouse", Field::Toggle),
 ];
-/// The first workers row.
-const WORKERS: usize = 10;
-/// The first watch row.
-const WATCH: usize = 11;
+/// Each Settings section's first row and heading.
+const SECTIONS: [(usize, &str); 5] = [
+    (0, "Models"),
+    (10, "Workers"),
+    (16, "Watch"),
+    (22, "Disk"),
+    (24, "Other"),
+];
 
 /// The `,` screen: the `SETTINGS` values in effect for the file it saves to, as loaded and as
 /// edited.
@@ -223,6 +268,7 @@ impl Settings {
             (Field::Step(step, min, max), toml::Value::Float(x)) => {
                 (((x + sign * step).clamp(min, max) * 100.0).round() / 100.0).into()
             }
+            (Field::Toggle, toml::Value::Boolean(b)) => (!b).into(),
             (_, v) => v.clone(),
         };
     }
@@ -2858,21 +2904,14 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Each role's model and effort, then worker limits and the watch thresholds; `•` marks an unsaved change.
+/// Each role's model and effort, then one row per limit or threshold, by section; `•` marks an unsaved change.
 fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
     let file = if s.global { "global" } else { "project" };
-    let mut lines = vec![
-        Line::raw(s.path.clone()).dim(),
-        Line::raw(""),
-        Line::raw("Models").dim(),
-    ];
+    let mut lines = vec![Line::raw(s.path.clone()).dim()];
     let mut selected = 0;
     for (i, ((_, key, label, _), v)) in SETTINGS.iter().zip(&s.values).enumerate() {
-        if i == WORKERS {
-            lines.extend([Line::raw(""), Line::raw("Workers").dim()]);
-        }
-        if i == WATCH {
-            lines.extend([Line::raw(""), Line::raw("Watch").dim()]);
+        if let Some((_, heading)) = SECTIONS.iter().find(|(first, _)| *first == i) {
+            lines.extend([Line::raw(""), Line::raw(*heading).dim()]);
         }
         let sel = i == s.row;
         let value = match v {
@@ -2883,7 +2922,7 @@ fn settings(f: &mut Frame, area: Rect, s: &Settings, theme: &Theme) {
             true => Span::raw(format!("‹ {value} ›")).bold(),
             false => Span::raw(value),
         };
-        let name = match i < WORKERS {
+        let name = match i < SECTIONS[1].0 {
             true => format!("{label:<11}{key:<8}"),
             false => format!("{label:<19}"),
         };
@@ -4685,18 +4724,20 @@ mod tests {
         assert_eq!(err, "nothing changed");
         s.row = 7;
         s.cycle(true); // workers' effort: high to xhigh
-        s.row = WATCH;
+        s.row = 16;
         s.cycle(true); // stall after: 15m to 20m
-        s.row = 15;
+        s.row = 20;
         s.cycle(false); // handoff at: 0.8 to 0.75
-        s.row = WORKERS;
+        s.row = 10;
         s.cycle(false); // concurrency: 4 to 3
+        s.row = 25;
+        s.cycle(true); // mouse: true to false
         s.row = 4;
         s.cycle(true); // critic: fable wraps round to opus
 
         let (mut app, _) = app();
         app.settings = Some(s);
-        let mut term = Terminal::new(TestBackend::new(60, 29)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 41)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
@@ -4721,6 +4762,11 @@ mod tests {
                 "│                                                          │",
                 "│ Workers                                                  │",
                 "│   concurrency        3 •                                 │",
+                "│   slots              5                                   │",
+                "│   budget usd         5.0                                 │",
+                "│   cargo builds       2                                   │",
+                "│   fix rounds         2                                   │",
+                "│   questions at once  2                                   │",
                 "│                                                          │",
                 "│ Watch                                                    │",
                 "│   stall after        20m •                               │",
@@ -4730,6 +4776,13 @@ mod tests {
                 "│   handoff at         0.75 •                              │",
                 "│   max handoffs       2                                   │",
                 "│                                                          │",
+                "│ Disk                                                     │",
+                "│   max target gb      60                                  │",
+                "│   min free gb        100                                 │",
+                "│                                                          │",
+                "│ Other                                                    │",
+                "│   draft PRs          true                                │",
+                "│   mouse              false •                             │",
                 "╰──────────────────────────────────────────────────────────╯",
                 " j/k  field  ←→  change  g  global file  ctrl-s  save  esc  ",
             ]
@@ -4743,7 +4796,7 @@ mod tests {
         let rows = screen(&term);
         assert!(
             rows.iter()
-                .any(|r| r.contains("max handoffs") && r.contains("‹ 2 ›")),
+                .any(|r| r.contains("mouse") && r.contains("‹ false ›")),
             "{rows:#?}"
         );
 
@@ -4755,6 +4808,7 @@ mod tests {
         // only the changed keys are written
         let written: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
         assert_eq!(written["worker"].as_table().unwrap().len(), 2);
+        assert_eq!(written["tui"]["mouse"].as_bool(), Some(false));
         assert!(written.get("lead").is_none());
         fs::remove_dir_all(&root).unwrap();
     }
