@@ -3952,27 +3952,18 @@ fn request(f: &mut Frame, area: Rect, r: &Request, app: &App, spinner: &str, the
         }
         None => lines.extend(r.text.lines().map(|l| Line::raw(l.to_string()).dim())),
     }
-    // the lead's live activity under the request, following its tail
+    // the lead's live activity under the request, the whole following its tail
     if r.status == Phase::Planning {
-        let width = area.width as usize;
-        let high: usize = (lines.iter())
-            .map(|l| wrap(&l.to_string(), width).len())
-            .sum();
-        let [top, _, below] = Layout::vertical([
-            Constraint::Length(high.min(area.height as usize / 2) as u16),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .areas(area);
-        let text = Paragraph::new(lines).wrap(Wrap { trim: false });
-        f.render_widget(text, top);
+        lines.push(Line::raw(""));
         match acts.is_empty() {
-            true => f.render_widget(
-                Line::raw(format!("{spinner} waiting for the lead")).dim(),
-                below,
-            ),
-            false => activity_tab(f, below, acts, theme, scroll),
+            true => lines.push(Line::raw(format!("{spinner} waiting for the lead")).dim()),
+            false => lines.extend(act_lines(acts, area.width as usize, theme)),
         }
+        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let len = p.line_count(area.width);
+        let below = from_tail(len, area, scroll);
+        let top = len.saturating_sub(area.height as usize + below);
+        f.render_widget(p.scroll((top as u16, 0)), area);
         return;
     }
     scrolled(
@@ -4313,7 +4304,14 @@ fn activity_tab(f: &mut Frame, area: Rect, acts: &[Act], theme: &Theme, scroll: 
         f.render_widget(Line::raw("No tool calls yet.").dim(), area);
         return;
     }
-    let width = area.width as usize;
+    let lines = act_lines(acts, area.width as usize, theme);
+    let end = lines.len() - from_tail(lines.len(), area, scroll);
+    let start = end.saturating_sub(area.height as usize);
+    f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
+}
+
+/// The Activity tab's lines for `acts`, each at most `width` columns.
+fn act_lines(acts: &[Act], width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for a in acts {
         if a.tool == TEXT {
@@ -4354,9 +4352,7 @@ fn activity_tab(f: &mut Frame, area: Rect, acts: &[Act], theme: &Theme, scroll: 
         let left = [Span::styled(format!("{verb:<7} "), style), target];
         lines.push(Line::from([&left[..], &[Span::raw(pad)], &right].concat()));
     }
-    let end = lines.len() - from_tail(lines.len(), area, scroll);
-    let start = end.saturating_sub(area.height as usize);
-    f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
+    lines
 }
 
 /// `s` split at spaces into lines of at most `width` columns, where its words fit.
@@ -5510,7 +5506,8 @@ mod tests {
         let state = std::env::temp_dir().join(format!("yogan-answering-{}", std::process::id()));
         let asking = Request {
             id: "r6".into(),
-            text: "How are tasks saved?".into(),
+            // a long word wraps to more rows than it has lines
+            text: format!("How are tasks saved?\nhttps://{}.rs", "x".repeat(100)),
             mode: Mode::Ask,
             status: Phase::Planning,
             ..Default::default()
@@ -5527,7 +5524,7 @@ mod tests {
         app.selected = 0;
         app.load_tab();
         let rows = draw_rows(&app);
-        assert!(rows[6].contains("⠋ waiting for the lead"), "{rows:#?}");
+        assert!(rows[9].contains("⠋ waiting for the lead"), "{rows:#?}");
 
         let call = |id: &str, name: &str, input: &str| {
             format!(
@@ -5551,12 +5548,12 @@ mod tests {
             draw_rows(&app),
             [
                 "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
-                "│ ▌ ⠋ How are tasks saved?        answering ││ How are tasks saved?                                │",
-                "│       fetch https://man7.org/re… quiet 2m ││ Planning                                            │",
-                "│                                           ││                                                     │",
-                "│                                           ││ How are tasks saved?                                │",
-                "│                                           ││                                                     │",
-                "│                                           ││ read    src/task.rs                                 │",
+                "│ ▌ ⠋ How are tasks saved?        answering ││ https://xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx │",
+                "│       fetch https://man7.org/re… quiet 2m ││ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx │",
+                "│                                           ││ xxxxxx.rs                                           │",
+                "│                                           ││                                                     ┃",
+                "│                                           ││ search  fn save                                     ┃",
+                "│                                           ││ read    src/task.rs                                 ┃",
                 "│                                           ││   │ Saves go through a tmp file.                    ┃",
                 "│                                           ││ web     atomic rename posix                         ┃",
                 "│                                           ││ fetch   https://man7.org/rename.2.html              ┃",
@@ -5564,6 +5561,11 @@ mod tests {
                 " yogan  ✓ nothing needs you   n  new task  j/k  move  tab  pane  q  quit  ?  more                   ",
             ]
         );
+        // scrolling back reaches the whole request
+        app.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        let rows = draw_rows(&app);
+        assert!(rows[1].contains("│ How are tasks saved?"), "{rows:#?}");
+        assert!(rows[7].contains("xxx.rs"), "{rows:#?}");
     }
 
     #[test]
