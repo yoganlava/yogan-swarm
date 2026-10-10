@@ -2050,19 +2050,7 @@ impl App {
         findings.save(&self.state, &id)?;
         // reloading clears the marks, whose indices are stale now
         self.loaded = None;
-        let mut prompt =
-            "The human sends these findings back, so fix each one and commit.\n".to_string();
-        for (i, f) in sent.iter().enumerate() {
-            prompt.push_str(&format!(
-                "\n{}. [{:?}] {} - {}\n   Evidence: {}\n",
-                i + 1,
-                f.severity,
-                f.location,
-                f.claim,
-                f.evidence
-            ));
-        }
-        worker::spawn(&self.repo, &id, &["--reply", &prompt])?;
+        worker::spawn(&self.repo, &id, &["--reply", &send_prompt(&sent)])?;
         self.info = Some(format!("sent {} back to the worker", sent.len()));
         Ok(())
     }
@@ -2470,13 +2458,15 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         let push = ("enter", "push and open PR");
         vec![push, ("g", "regenerate"), ("e", "edit"), ("esc", "back")]
     } else if app.on_findings() {
+        // space, f and F first, so they're the last a narrow footer drops
         let mut keys = vec![("j/k", "finding")];
+        let any = app.findings.actionable().count() > 0;
+        if any {
+            keys.extend([("space", "mark"), ("f", "fix"), ("F", "fix all")]);
+        }
         let disputed = app.findings.is_disputed(app.finding);
         keys.extend(disputed.then_some(("r", "reply to worker")));
-        if app.findings.actionable().count() > 0 {
-            keys.extend([("x", "waive"), ("space", "mark")]);
-            keys.extend([("f", "fix"), ("F", "fix all")]);
-        }
+        keys.extend(any.then_some(("x", "waive")));
         keys.extend([
             ("o", "open"),
             ("tab", "pane"),
@@ -2753,6 +2743,23 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
 
 fn gate_passed(t: &Task) -> bool {
     t.gate.as_ref().is_some_and(|g| g.iter().all(|c| c.passed))
+}
+
+/// `f`/`F`'s reply to the worker, listing the findings sent back.
+fn send_prompt(sent: &[crate::critic::Finding]) -> String {
+    let mut prompt =
+        "The human sends these findings back, so fix each one and commit.\n".to_string();
+    for (i, f) in sent.iter().enumerate() {
+        prompt.push_str(&format!(
+            "\n{}. [{:?}] {} - {}\n   Evidence: {}\n",
+            i + 1,
+            f.severity,
+            f.location,
+            f.claim,
+            f.evidence
+        ));
+    }
+    prompt
 }
 
 /// Whether the `KEYS` key `k` does something for the selection.
@@ -5414,7 +5421,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " j/k  finding  r  reply to worker  x  waive  ?  more        ",
+                " j/k  finding  space  mark  f  fix  F  fix all  ?  more     ",
             ]
         );
     }
@@ -5430,7 +5437,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             screen(&term)[29],
-            " j/k  finding  r  reply to worker  x  waive  space  mark  f  fix  F  fix all  o  open  ?  more      "
+            " j/k  finding  space  mark  f  fix  F  fix all  r  reply to worker  x  waive  o  open  ?  more      "
         );
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.reply_for, Some('x'));
@@ -5715,6 +5722,39 @@ mod tests {
         }
         assert_eq!(Findings::load(&state, "t1").unwrap(), sample_findings());
         assert_eq!(app.marked, BTreeSet::from([0, 2]));
+
+        // in Review, f moves the marked ones to Fixed; the missing repo stops the worker starting
+        app.tasks[0].0.status = Status::Review;
+        app.repo = state.join("no-repo");
+        press(&mut app, 'f');
+        let saved = Findings::load(&state, "t1").unwrap();
+        let claims =
+            |fs: &[crate::critic::Finding]| fs.iter().map(|f| f.claim.clone()).collect::<Vec<_>>();
+        assert_eq!(claims(&saved.fixed), ["-1 still parses", "may overflow"]);
+        assert_eq!(claims(&saved.disputed), ["no test for zero"]);
+        app.load_tab();
+        assert!(app.marked.is_empty());
+        // with none marked, f sends the one under the cursor
+        sample_findings().save(&state, "t1").unwrap();
+        app.load_tab();
+        app.finding = 1;
+        press(&mut app, 'f');
+        let saved = Findings::load(&state, "t1").unwrap();
+        assert_eq!(claims(&saved.fixed), ["no test for zero"]);
+        // F sends every open, disputed and optional one
+        sample_findings().save(&state, "t1").unwrap();
+        press(&mut app, 'F');
+        let saved = Findings::load(&state, "t1").unwrap();
+        assert_eq!(saved.actionable().count(), 0);
+        let all = ["-1 still parses", "no test for zero", "may overflow"];
+        assert_eq!(claims(&saved.fixed), all);
+        assert_eq!(saved.waived, sample_findings().waived);
+
+        let prompt = send_prompt(&saved.fixed[..2]);
+        assert!(prompt.contains(
+            "1. [Blocker] src/config.rs:41 - -1 still parses\n   Evidence: cargo test negative fails"
+        ));
+        assert!(prompt.contains("2. [Major] src/retry.rs:9 - no test for zero"));
         fs::remove_dir_all(&state).unwrap();
     }
 
