@@ -2,6 +2,7 @@
 //! the state directory; workers run detached, so closing it changes nothing.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -14,11 +15,12 @@ use ratatui::crossterm::event::{
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use regex::Regex;
@@ -31,16 +33,40 @@ use crate::stream::{self, Content};
 use crate::task::{self, Status, Task};
 use crate::{config, git, pr, sched, slot, worker};
 
-/// List order, what needs you first; `Discarded` isn't shown.
-const GROUPS: [(Status, &str); 7] = [
-    (Status::Review, "Review"),
-    (Status::Failed, "Failed"),
-    (Status::Proposed, "Proposed"),
-    (Status::Running, "Running"),
-    (Status::Checking, "Checking"),
-    (Status::Approved, "Queued"),
-    (Status::PrOpen, "PR open"),
+/// The inbox: each group's statuses in list order, with their labels; `Discarded` isn't shown.
+/// Answered questions and failed requests need you too, and planning requests are working.
+const GROUPS: [(&str, &[(Status, &str)]); 3] = [
+    (
+        "Needs you",
+        &[
+            (Status::Review, "Review"),
+            (Status::Failed, "Failed"),
+            (Status::Proposed, "Proposed"),
+        ],
+    ),
+    (
+        "Working",
+        &[(Status::Running, "Running"), (Status::Checking, "Checking")],
+    ),
+    (
+        "Later",
+        &[(Status::Approved, "Queued"), (Status::PrOpen, "PR open")],
+    ),
 ];
+
+/// A status's position in list order and its label.
+fn status_rank(s: Status) -> Option<(usize, &'static str)> {
+    let mut all = GROUPS.iter().flat_map(|g| g.1).enumerate();
+    all.find(|(_, (g, _))| *g == s).map(|(i, (_, l))| (i, *l))
+}
+
+/// The inbox group a status is in.
+fn group_of(s: Status) -> usize {
+    GROUPS
+        .iter()
+        .position(|g| g.1.iter().any(|(g, _)| *g == s))
+        .unwrap_or(GROUPS.len() - 1)
+}
 
 const TABS: [&str; 6] = ["Summary", "Activity", "Gate", "Findings", "Diff", "Run"];
 const FINDINGS: usize = 3;
@@ -49,7 +75,7 @@ const RUN: usize = 5;
 /// Lines a scroll key moves the detail pane.
 const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 22] = [
+const KEYS: [(&str, &str); 24] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -64,7 +90,7 @@ const KEYS: [(&str, &str); 22] = [
     ("p", "plan it"),
     ("y", "copy"),
     ("x", "discard"),
-    ("?", "help"),
+    ("?", "commands"),
     ("q", "quit"),
     ("c", "continue"),
     ("w", "rewind"),
@@ -72,6 +98,8 @@ const KEYS: [(&str, &str); 22] = [
     ("o", "open"),
     (",", "settings"),
     ("pgup/pgdn", "scroll"),
+    ("z", "zoom"),
+    ("]", "next for you"),
 ];
 
 /// How a Settings field changes: cycling through choices, or stepping a number within bounds.
@@ -204,10 +232,17 @@ impl Settings {
     }
 }
 
-/// Every color and glyph, so a light-terminal or ASCII variant is one swap. Nothing paints a
-/// background: the terminal's own theme shows through.
+/// Every color and glyph, so a light-terminal or ASCII variant is one swap. Only key and reason
+/// chips and the hovered target paint a background: elsewhere the terminal's own theme shows
+/// through.
 pub struct Theme {
     accent: Color,
+    /// Behind a footer key.
+    key: Color,
+    /// Text on a reason chip.
+    ink: Color,
+    /// Behind the target under the mouse.
+    hover: Color,
     /// Shell commands in Activity.
     shell: Color,
     green: Color,
@@ -219,9 +254,27 @@ pub struct Theme {
     queued: &'static str,
     bar: &'static str,
     ellipsis: &'static str,
+    /// Before the agent's text in Activity.
+    gutter: &'static str,
+    /// Before a markdown list item.
+    bullet: &'static str,
     /// Before a child task, under its parent.
     tree: &'static str,
+    /// Pipeline links up to the current stage and after it, the current stage's mark, a passed
+    /// gate check, and a gauge's empty cells (`done` fills it).
+    done: &'static str,
+    todo: &'static str,
+    current: &'static str,
+    dot: &'static str,
+    rest: &'static str,
     spinner: &'static [&'static str],
+    /// A slot meter's held and free cells.
+    slot: (&'static str, &'static str),
+    /// A group heading's unfolded and folded marks, and its rule.
+    fold: (&'static str, &'static str),
+    rule: &'static str,
+    need: &'static str,
+    ascii: bool,
 }
 
 impl Theme {
@@ -240,6 +293,9 @@ impl Theme {
         let glyphs = |fancy, plain| if ascii { plain } else { fancy };
         Theme {
             accent: rgb(122, 162, 247, Color::Blue),
+            key: rgb(42, 47, 69, Color::Black),
+            ink: rgb(26, 27, 38, Color::Black),
+            hover: rgb(59, 66, 97, Color::DarkGray),
             shell: rgb(125, 207, 255, Color::Cyan),
             green: rgb(158, 206, 106, Color::Green),
             amber: rgb(224, 175, 104, Color::Yellow),
@@ -250,12 +306,32 @@ impl Theme {
             queued: glyphs("○", "o"),
             bar: glyphs("▌", ">"),
             ellipsis: glyphs("…", "~"),
+            gutter: glyphs("│", "|"),
+            bullet: glyphs("•", "-"),
             tree: glyphs("└ ", "- "),
+            done: glyphs("━", "="),
+            todo: glyphs("┄", "-"),
+            current: glyphs("◉", "(*)"),
+            dot: glyphs("●", "*"),
+            rest: glyphs("─", "-"),
             spinner: if ascii {
                 &["|", "/", "-", "\\"]
             } else {
                 &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             },
+            slot: if ascii { ("#", ".") } else { ("▰", "▱") },
+            fold: if ascii { ("v", ">") } else { ("▾", "▸") },
+            rule: glyphs("─", "-"),
+            need: glyphs("●", "*"),
+            ascii,
+        }
+    }
+
+    /// ` ready ` on `color`, or `[ready]` in ASCII.
+    fn chip(&self, text: &str, color: Color) -> Span<'static> {
+        match self.ascii {
+            true => Span::styled(format!("[{text}]"), color).bold(),
+            false => Span::styled(format!(" {text} "), self.ink).bg(color).bold(),
         }
     }
 
@@ -289,20 +365,26 @@ struct App {
     selected: usize,
     /// Narrow layout shows the detail pane instead of the list.
     detail: bool,
-    help: bool,
+    /// The command palette's query and selected row, while it's open.
+    palette: Option<(String, usize)>,
     compose: Option<Compose>,
-    /// An error to show in the footer until the next key.
+    /// An error to show as a toast until `esc` or a click on it.
     notice: Option<String>,
-    /// Progress or an outcome to show in the footer until the next key.
+    /// Progress or an outcome to show as a toast for 4 s, or until a click on it.
     info: Option<String>,
-    /// Push and open the previewed PR once the "pushing" footer has been drawn.
+    /// The `info` being shown and when it first was, for `expire`.
+    info_since: Option<(String, Instant)>,
+    /// Push and open the previewed PR once the "pushing" toast has been drawn.
     opening: bool,
     tab: usize,
-    /// The selected task's tool calls as (tool, target), newest last.
-    activity: Vec<(String, String)>,
+    /// The selected task's Activity lines, newest last.
+    activity: Vec<Act>,
     gate_log: String,
     /// The selected task's changed files as (path, added, deleted).
     diff: Vec<(String, u64, u64)>,
+    /// Each of `diff`'s files' hunk lines, and which files the Diff tab shows them for.
+    hunks: Vec<Vec<String>>,
+    unfolded: BTreeSet<usize>,
     /// Which task and file version `gate_log` and `diff` were read for.
     loaded: Option<(String, Option<SystemTime>)>,
     /// Asking whether to discard the selected task.
@@ -333,7 +415,7 @@ struct App {
     interactive: Option<(PathBuf, String)>,
     /// How far the detail pane is scrolled: down from the top, or up from the tail in Activity
     /// and the Gate output. Drawing clamps it.
-    scroll: Cell<u16>,
+    scroll: Scroll,
     /// The selected task's findings, and the cursor over their actionable ones.
     findings: Findings,
     finding: usize,
@@ -344,6 +426,10 @@ struct App {
     run: RunTab,
     /// Tasks whose run script is running.
     serving: Vec<String>,
+    /// Each Running task's latest tool call and when its stream last wrote.
+    steps: Vec<(String, (String, String), SystemTime)>,
+    /// `[watch] stall_after`; a Running row's quiet time turns amber at half of it.
+    stall_after: Duration,
     settings: Option<Settings>,
     /// Running in VS Code's terminal.
     vscode: bool,
@@ -353,19 +439,110 @@ struct App {
     open_at: Option<(PathBuf, Option<u32>)>,
     /// The cursor over the Diff tab's files.
     diff_file: usize,
+    /// The cursor file moved or folded, so the Diff tab scrolls it into view once.
+    follow: Cell<bool>,
+    /// The detail pane has the full width.
+    zoom: bool,
+    /// The last row click, to spot a double-click.
+    last_click: Option<(Position, Instant)>,
+    /// The list pane's width in columns, set by dragging the divider.
+    split: u16,
+    /// The divider is being dragged.
+    dragging: bool,
+    /// The selected Running task's context in tokens, from its stream's latest message.
+    context: Option<u64>,
+    /// `[worker] budget_usd`, for a task without its own.
+    budget: f64,
+    /// `[watch] autocompact` and `handoff_at`, for the context gauge.
+    window: (u64, f64),
+    /// Which `GROUPS` are folded, for the session.
+    folded: [bool; 3],
+    /// `[worker] slots`, one cell each in the header's slot meter.
+    slots: u32,
     /// Where the last frame drew things, for the mouse.
     hits: RefCell<Hits>,
+    /// The mouse's cell, whose target gets a tint and its hint in its pane's bottom border.
+    hover: Option<Position>,
+    /// Where a right-click opened the selection's actions menu.
+    menu: Option<Position>,
 }
 
 /// A file `e` edits, as (task id, whether it's the PR draft, path).
 type Edit = (String, bool, PathBuf);
 
-/// The list and detail panes, and each list row's screen line and row index.
+/// The list and detail panes, for the wheel, and each clickable rect with its hover hint, in
+/// drawing order.
 #[derive(Default)]
 struct Hits {
     list: Rect,
     detail: Rect,
-    rows: Vec<(u16, usize)>,
+    /// The detail tabs, where the wheel cycles them.
+    tabs: Rect,
+    palette: Rect,
+    targets: Vec<(Rect, Target, String)>,
+}
+
+impl Hits {
+    /// The topmost target at `p`.
+    fn at(&self, p: Position) -> Option<&(Rect, Target, String)> {
+        self.targets.iter().rev().find(|(r, ..)| r.contains(p))
+    }
+}
+
+/// What a click does: press a key, or one of the things with no key: select a list row, fold
+/// a group, dismiss the info toast, start dragging the divider, scroll the detail pane to
+/// an offset, fold or unfold a Diff file, open Diff at a finding's file, or run a palette row.
+/// `Hint` only shows its hint on hover.
+#[derive(Clone, Copy)]
+enum Target {
+    Hint,
+    Key(KeyEvent),
+    Row(usize),
+    Info,
+    Divider,
+    Scroll(u16),
+    Fold(usize),
+    File(usize),
+    Location(usize),
+    Command(usize),
+}
+
+/// The detail pane's scroll offset, and the scrollbar its tab asked for this frame as (area,
+/// largest offset, whether the offset counts up from the tail).
+#[derive(Default)]
+struct Scroll {
+    offset: Cell<u16>,
+    bar: Cell<Option<(Rect, u16, bool)>>,
+}
+
+impl Scroll {
+    fn get(&self) -> u16 {
+        self.offset.get()
+    }
+
+    fn set(&self, offset: u16) {
+        self.offset.set(offset);
+    }
+}
+
+/// The key a footer label stands for; pairs like `j/k` stand for none.
+fn key_of(label: &str) -> Option<KeyEvent> {
+    let code = match label {
+        "enter" => KeyCode::Enter,
+        "esc" => KeyCode::Esc,
+        "tab" => KeyCode::Tab,
+        "ctrl-s" => return Some(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        _ => match label.chars().collect::<Vec<_>>()[..] {
+            [c] => KeyCode::Char(c),
+            _ => return None,
+        },
+    };
+    Some(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// The digit key for the `i`th detail tab.
+fn digit(i: usize) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char((b'1' + i as u8) as char), KeyModifiers::NONE)
 }
 
 /// The Run tab: the slot's ports and `[scripts]`, read when the task changes, and the run
@@ -422,6 +599,7 @@ pub fn run(repo: &Path) -> Result<()> {
     let state = task::state_dir(repo)?;
     reap(&state)?;
     let name = state.file_name().unwrap_or_default().to_string_lossy();
+    let cfg = config::load(repo).ok();
     let mut app = App {
         repo: repo.to_path_buf(),
         state: state.clone(),
@@ -430,15 +608,18 @@ pub fn run(repo: &Path) -> Result<()> {
         tasks: Vec::new(),
         selected: 0,
         detail: false,
-        help: false,
+        palette: None,
         compose: None,
         notice: None,
         info: None,
+        info_since: None,
         opening: false,
         tab: 0,
         activity: Vec::new(),
         gate_log: String::new(),
         diff: Vec::new(),
+        hunks: Vec::new(),
+        unfolded: BTreeSet::new(),
         loaded: None,
         confirm: false,
         pager: None,
@@ -452,19 +633,33 @@ pub fn run(repo: &Path) -> Result<()> {
         commits: Vec::new(),
         commit: 0,
         interactive: None,
-        scroll: Cell::new(0),
+        scroll: Scroll::default(),
         findings: Findings::default(),
         finding: 0,
         disputed: Vec::new(),
         sessions: config::load(repo).map_or(0, |c| c.watch.max_handoffs + 1),
         run: RunTab::default(),
         serving: Vec::new(),
+        steps: Vec::new(),
+        stall_after: config::load(repo).map_or(Duration::MAX, |c| c.watch.stall_after),
         settings: None,
         vscode: vscode(),
         editing: None,
         open_at: None,
         diff_file: 0,
+        follow: Cell::new(false),
+        zoom: false,
+        last_click: None,
+        split: 45,
+        dragging: false,
+        context: None,
+        budget: cfg.as_ref().map_or(0.0, |c| c.worker.budget_usd),
+        folded: [false; 3],
+        slots: cfg.as_ref().map_or(0, |c| c.worker.slots),
+        window: cfg.map_or((0, 1.0), |c| (c.watch.autocompact, c.watch.handoff_at)),
         hits: RefCell::default(),
+        hover: None,
+        menu: None,
     };
     let theme = Theme::detect();
     let mouse = config::load(repo).is_ok_and(|c| c.tui.mouse);
@@ -486,6 +681,11 @@ pub fn run(repo: &Path) -> Result<()> {
                 std::io::stdout().flush()?;
             }
             in_review = Some(review);
+            app.expire(Instant::now());
+            // compact draws no headings to unfold a group with
+            if terminal.size()?.height < COMPACT {
+                app.folded = [false; 3];
+            }
             let tick = (start.elapsed().as_millis() / 125) as usize; // spinner at 8 Hz
             // ratatui only writes cells that changed, so an idle screen draws nothing
             terminal.draw(|f| draw(f, &app, &theme, tick, SystemTime::now()))?;
@@ -499,14 +699,22 @@ pub fn run(repo: &Path) -> Result<()> {
             }
             let running = app.tasks.iter().any(|(t, _)| running(t));
             let wait = Duration::from_millis(if running { 125 } else { 250 });
-            if event::poll(wait)? {
+            let until = Instant::now() + wait;
+            while event::poll(until.saturating_duration_since(Instant::now()))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press && !app.key(key) => {
                         return Ok(());
                     }
-                    Event::Mouse(m) => app.mouse(m),
+                    // a move that keeps the same hovered target doesn't redraw
+                    Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                        if !app.hover(Position::new(m.column, m.row)) {
+                            continue;
+                        }
+                    }
+                    Event::Mouse(m) if !app.mouse(m) => return Ok(()),
                     _ => {}
                 }
+                break;
             }
             if let Some((dir, base, path)) = app.pager.take() {
                 restore(mouse);
@@ -755,7 +963,7 @@ impl App {
         // planning and failed first, then the questions
         requests.sort_by_key(|r| (r.status == Phase::Done, r.id.clone()));
         self.requests = requests;
-        let rank = |s: Status| GROUPS.iter().position(|(g, _)| *g == s);
+        let rank = |s| status_rank(s).map(|r| r.0);
         let tasks: Vec<_> = task::load_all(state)?
             .into_iter()
             .filter(|t| rank(t.status).is_some())
@@ -775,6 +983,14 @@ impl App {
         let same = id.and_then(|id| ids.position(|i| *i == id));
         let rows = self.requests.len() + self.tasks.len();
         self.selected = same.unwrap_or(self.selected.min(rows.saturating_sub(1)));
+        // the selected row is never hidden in a folded group
+        if let Some(g) = self
+            .groups()
+            .iter()
+            .position(|g| g.contains(&self.selected))
+        {
+            self.folded[g] = false;
+        }
         let review = self
             .tasks
             .iter()
@@ -789,17 +1005,66 @@ impl App {
             .filter(|(t, _)| t.slot.is_some() && slot::running(state, &t.id).is_some())
             .map(|(t, _)| t.id.clone())
             .collect();
+        self.steps = (self.tasks.iter())
+            .filter(|(t, _)| t.status == Status::Running)
+            .filter_map(|(t, _)| {
+                let log = state.join(format!("logs/{}.jsonl", t.id));
+                let quiet = fs::metadata(&log).and_then(|m| m.modified()).ok()?;
+                let slot = t.slot.map(|n| state.join("slots").join(n.to_string()));
+                let acts = activity(&log, &slot.unwrap_or_default());
+                let call = acts.into_iter().rfind(|a| a.tool != TEXT)?;
+                Some((t.id.clone(), (call.tool, call.target), quiet))
+            })
+            .collect();
         Ok(())
     }
 
-    /// Whether `j/k`, `r` and `x` act on the Findings tab's findings.
+    /// Whether `j/k`, `r` and `x` act on the Findings tab's findings, whichever pane has focus.
     fn on_findings(&self) -> bool {
-        self.detail && self.tab == FINDINGS && self.task().is_some()
+        self.tab == FINDINGS && self.task().is_some()
     }
 
-    /// Whether `j/k` and `enter` act on the Diff tab's files.
+    /// Whether `j/k`, `enter` and `o` act on the Diff tab's files.
     fn on_diff(&self) -> bool {
         self.detail && self.tab == DIFF && self.task().is_some()
+    }
+
+    /// Each of `GROUPS`' rows in list order, as indexes into requests then tasks; a group's
+    /// requests come after its tasks.
+    fn groups(&self) -> [Vec<usize>; 3] {
+        let mut groups: [Vec<usize>; 3] = Default::default();
+        let n = self.requests.len();
+        for (i, (t, _)) in self.tasks.iter().enumerate() {
+            groups[group_of(t.status)].push(n + i);
+        }
+        for (i, r) in self.requests.iter().enumerate() {
+            groups[usize::from(r.status == Phase::Planning)].push(i);
+        }
+        groups
+    }
+
+    /// Moves the selection to the next shown row down, or up; folded groups are skipped.
+    fn move_by(&mut self, down: bool) {
+        let groups = self.groups().into_iter().zip(self.folded);
+        let rows: Vec<_> = groups.filter(|g| !g.1).flat_map(|g| g.0).collect();
+        let at = rows.iter().position(|&r| r == self.selected);
+        let i = match (at, down) {
+            (None, _) => 0,
+            (Some(i), true) => (i + 1).min(rows.len() - 1),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        if let Some(&r) = rows.get(i) {
+            self.selected = r;
+        }
+    }
+
+    /// `]`: selects the next Needs you row, wrapping round, and unfolds the group.
+    fn next_need(&mut self) {
+        let need = &self.groups()[0];
+        let at = need.iter().position(|&r| r == self.selected);
+        if let Some(&r) = need.get(at.map_or(0, |i| (i + 1) % need.len())) {
+            (self.selected, self.folded[0]) = (r, false);
+        }
     }
 
     /// The selected row's request, if it's one.
@@ -820,14 +1085,38 @@ impl App {
         self.tasks.get(i)
     }
 
+    /// Clears `info` 4 s after it first showed.
+    fn expire(&mut self, now: Instant) {
+        match (&self.info, &self.info_since) {
+            (Some(i), Some((shown, at))) if i == shown => {
+                if now.duration_since(*at) >= Duration::from_secs(4) {
+                    (self.info, self.info_since) = (None, None);
+                }
+            }
+            (Some(i), _) => self.info_since = Some((i.clone(), now)),
+            (None, _) => self.info_since = None,
+        }
+    }
+
     /// Returns false to quit.
     fn key(&mut self, key: KeyEvent) -> bool {
+        self.press(key, false)
+    }
+
+    /// `action` runs the key as the task action the menu and palette label it, so the Findings
+    /// and Diff tabs' own `x`, `r`, `o`, `j/k` and `enter` don't take it.
+    fn press(&mut self, key: KeyEvent, action: bool) -> bool {
         let ctrl =
             |c| key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c);
-        self.notice = None;
-        self.info = None;
         if ctrl('c') {
             return false;
+        }
+        // any key closes the actions menu, and all but esc then act as usual
+        if self.menu.take().is_some() && key.code == KeyCode::Esc {
+            return true;
+        }
+        if key.code == KeyCode::Esc && self.notice.take().is_some() {
+            return true;
         }
         if let Some(c) = &mut self.compose {
             let ctrl_enter = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -935,12 +1224,33 @@ impl App {
             }
             return true;
         }
+        if self.palette.is_some() {
+            let n = self.commands().len();
+            let Some((query, row)) = &mut self.palette else {
+                return true;
+            };
+            match key.code {
+                KeyCode::Esc => self.palette = None,
+                KeyCode::Enter => {
+                    let row = *row;
+                    return self.command(row);
+                }
+                KeyCode::Down => *row = (*row + 1).min(n.saturating_sub(1)),
+                KeyCode::Up => *row = row.saturating_sub(1),
+                KeyCode::Backspace => {
+                    query.pop();
+                    *row = 0;
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    *row = 0;
+                }
+                _ => {}
+            }
+            return true;
+        }
         if key.code == KeyCode::Char('q') {
             return false;
-        }
-        if self.help {
-            self.help = false;
-            return true;
         }
         let proposed = self
             .task()
@@ -948,7 +1258,7 @@ impl App {
         let failed = self.request().is_some_and(|r| r.status == Phase::Failed);
         let status = self.task().map(|(t, _)| t.status);
         let answered = self.request().is_some_and(|r| r.status == Phase::Done);
-        if self.on_findings() {
+        if !action && self.on_findings() {
             let n = self.findings.actionable().count();
             let disputed = self.findings.is_disputed(self.finding);
             match key.code {
@@ -973,18 +1283,27 @@ impl App {
                 _ => {}
             }
         }
-        if self.on_diff() {
+        if !action && self.on_diff() {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     let n = self.diff.len();
                     self.diff_file = (self.diff_file + 1).min(n.saturating_sub(1));
+                    self.follow.set(true);
                     return true;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.diff_file = self.diff_file.saturating_sub(1);
+                    self.follow.set(true);
                     return true;
                 }
                 KeyCode::Enter => {
+                    if !self.unfolded.remove(&self.diff_file) {
+                        self.unfolded.insert(self.diff_file);
+                    }
+                    self.follow.set(true);
+                    return true;
+                }
+                KeyCode::Char('o') => {
                     if let Err(e) = self.open_diff() {
                         self.notice = Some(format!("{e:#}"));
                     }
@@ -997,7 +1316,7 @@ impl App {
         match key.code {
             // before `d`, which would take ctrl-d too
             _ if ctrl('d') || ctrl('u') => self.scroll_by(ctrl('d')),
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?' | ':') => self.palette = Some((String::new(), 0)),
             KeyCode::Char(',') => self.open_settings(false),
             KeyCode::Char('n') => self.compose = Some(Compose::new(Mode::Auto, "")),
             KeyCode::Char('p') if answered => {
@@ -1014,6 +1333,10 @@ impl App {
                 }
             }
             KeyCode::Char(c @ '1'..='6') => self.tab = c as usize - '1' as usize,
+            KeyCode::Right => self.tab = (self.tab + 1) % TABS.len(),
+            KeyCode::Left => self.tab = (self.tab + TABS.len() - 1) % TABS.len(),
+            KeyCode::Char('z') => self.zoom = !self.zoom,
+            KeyCode::Esc => self.zoom = false,
             KeyCode::Char('R') => {
                 if let Err(e) = self.toggle_run() {
                     self.notice = Some(format!("{e:#}"));
@@ -1074,11 +1397,9 @@ impl App {
             KeyCode::Char('r') if status == Some(Status::Review) => {
                 self.reply = Some(field("What should the worker change?"));
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let rows = self.requests.len() + self.tasks.len();
-                self.selected = (self.selected + 1).min(rows.saturating_sub(1));
-            }
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_by(true),
+            KeyCode::Up | KeyCode::Char('k') => self.move_by(false),
+            KeyCode::Char(']') => self.next_need(),
             KeyCode::Tab => self.detail = !self.detail,
             KeyCode::PageDown | KeyCode::PageUp => self.scroll_by(key.code == KeyCode::PageDown),
             _ => {}
@@ -1086,6 +1407,9 @@ impl App {
         if (self.selected, self.tab) != before {
             self.scroll.set(0);
             self.diff_file = 0;
+        }
+        if self.selected != before.0 {
+            self.unfolded.clear();
         }
         true
     }
@@ -1124,9 +1448,15 @@ impl App {
         let Some((id, since)) = self.task().map(|(t, since)| (t.id.clone(), *since)) else {
             return;
         };
+        let log = self.state.join(format!("logs/{id}.jsonl"));
         if self.tab == 1 {
-            let log = self.state.join(format!("logs/{id}.jsonl"));
             self.activity = activity(&log, &self.slot_dir().unwrap_or_default());
+        }
+        if self
+            .task()
+            .is_some_and(|(t, _)| t.status == Status::Running)
+        {
+            self.context = context(&log);
         }
         if self.tab == RUN {
             let slot = self.task().and_then(|(t, _)| t.slot);
@@ -1158,13 +1488,14 @@ impl App {
             self.run.log = String::from_utf8_lossy(&tail(&log, 64 << 10)).into_owned();
         }
         let key = Some((id.clone(), since));
-        if self.tab >= 2 && self.loaded != key {
+        // the verdict shows the gate, findings and diffstat on every tab
+        if self.loaded != key {
             let log = self.state.join(format!("logs/{id}.gate.log"));
             self.gate_log = fs::read_to_string(log).unwrap_or_default();
             let base = self.base().unwrap_or_default();
-            self.diff = self
+            (self.diff, self.hunks) = self
                 .slot_dir()
-                .map(|d| diffstat(&d, &base))
+                .map(|d| (diffstat(&d, &base), hunks(&d, &base)))
                 .unwrap_or_default();
             self.diff_file = self.diff_file.min(self.diff.len().saturating_sub(1));
             self.findings = Findings::load(&self.state, &id).unwrap_or_default();
@@ -1214,7 +1545,8 @@ impl App {
     fn save_settings(&mut self) -> Result<PathBuf> {
         let s = self.settings.as_mut().context("Settings isn't open")?;
         let path = s.save(&self.repo, &config::home()?)?;
-        self.sessions = config::load(&self.repo)?.watch.max_handoffs + 1;
+        let watch = config::load(&self.repo)?.watch;
+        (self.sessions, self.stall_after) = (watch.max_handoffs + 1, watch.stall_after);
         Ok(path)
     }
 
@@ -1296,7 +1628,8 @@ impl App {
             return;
         };
         // never move the selection under an open modal, whose keys would then act on it
-        let modal = self.confirm || self.help || self.reply.is_some() || self.compose.is_some();
+        let modal = self.confirm || self.palette.is_some() || self.reply.is_some();
+        let modal = modal || self.compose.is_some();
         if modal || self.instruction.is_some() {
             return;
         }
@@ -1394,7 +1727,7 @@ impl App {
         Ok(())
     }
 
-    /// `enter` on the Diff tab: the selected file's diff in VS Code's diff editor against its
+    /// `o` on the Diff tab: the selected file's diff in VS Code's diff editor against its
     /// base version, else paged.
     fn open_diff(&mut self) -> Result<()> {
         let (t, _) = self.task().context("no task selected")?;
@@ -1431,43 +1764,183 @@ impl App {
         ])
     }
 
-    /// Click selects a row; the wheel scrolls the detail pane or moves through the list.
-    fn mouse(&mut self, m: MouseEvent) {
-        let modal = self.compose.is_some() || self.settings.is_some() || self.reply.is_some();
-        if modal || self.preview || self.confirm || self.help || self.instruction.is_some() {
-            return;
-        }
-        let at = Position::new(m.column, m.row);
-        let (in_list, in_detail, row) = {
-            let hits = self.hits.borrow();
-            let row = hits.rows.iter().find(|(y, _)| *y == m.row).map(|(_, i)| *i);
-            (hits.list.contains(at), hits.detail.contains(at), row)
+    /// The palette's rows matching its query by subsequence: the selection's actions, the other
+    /// keys valid here, then `Go to` each task, as (key, label, context, what it runs).
+    fn commands(&self) -> Vec<(&'static str, String, String, Target)> {
+        let query = self.palette.as_ref().map_or("", |p| &p.0).to_lowercase();
+        let here = match (self.task(), self.request()) {
+            (Some((t, _)), _) => t.title.clone(),
+            (_, Some(r)) => r.text.lines().next().unwrap_or_default().to_string(),
+            _ => String::new(),
         };
-        let before = self.selected;
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) if in_list => {
-                if let Some(i) = row {
-                    self.selected = i;
+        let actions = actions(self);
+        let others = KEYS
+            .into_iter()
+            .filter(|(k, _)| *k != "?" && valid(self, k) && !actions.iter().any(|(a, _)| a == k));
+        let keys = (actions.iter().map(|&(k, l)| (k, l, here.clone())))
+            .chain(others.map(|(k, l)| (k, l, "anywhere".to_string())))
+            .filter_map(|(k, l, at)| Some((k, l.to_string(), at, Target::Key(key_of(k)?))));
+        let n = self.requests.len();
+        let go = self.tasks.iter().enumerate().map(|(i, (t, _))| {
+            let status = status_rank(t.status).map_or("", |(_, l)| l);
+            let label = format!("Go to {}", t.title);
+            ("", label, status.to_string(), Target::Row(n + i))
+        });
+        let matches = |(k, l, ..): &(&str, String, String, Target)| {
+            let hay = format!("{k} {l}").to_lowercase();
+            let mut hay = hay.chars();
+            query.chars().all(|c| hay.any(|h| h == c))
+        };
+        keys.chain(go).filter(matches).collect()
+    }
+
+    /// Closes the palette and runs its `i`th row. Returns false to quit.
+    fn command(&mut self, i: usize) -> bool {
+        let commands = self.commands();
+        let target = commands
+            .get(i.min(commands.len().saturating_sub(1)))
+            .map(|c| c.3);
+        self.palette = None;
+        match target {
+            Some(Target::Key(key)) => return self.press(key, true),
+            Some(Target::Row(i)) if i != self.selected => {
+                self.selected = i;
+                self.scroll.set(0);
+                self.diff_file = 0;
+                self.unfolded.clear();
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Moves the hover to `at`; true when that changes the hovered target, which needs a redraw.
+    /// Hovering a palette row selects it.
+    fn hover(&mut self, at: Position) -> bool {
+        let hits = self.hits.borrow();
+        let rect = |p: Option<Position>| p.and_then(|p| hits.at(p)).map(|(r, ..)| *r);
+        let changed = rect(self.hover) != rect(Some(at));
+        if let (Some((_, row)), Some((_, Target::Command(i), _))) = (&mut self.palette, hits.at(at))
+        {
+            *row = *i;
+        }
+        drop(hits);
+        self.hover = Some(at);
+        changed
+    }
+
+    /// A click presses the key of the target under it or selects its row; the wheel scrolls the
+    /// detail pane or moves through the list. Returns false to quit.
+    fn mouse(&mut self, m: MouseEvent) -> bool {
+        let modal = self.compose.is_some() || self.settings.is_some() || self.reply.is_some();
+        let modal = modal
+            || self.preview
+            || self.confirm
+            || self.palette.is_some()
+            || self.instruction.is_some();
+        let at = Position::new(m.column, m.row);
+        let (in_list, in_detail, in_tabs, in_palette, hit) = {
+            let hits = self.hits.borrow();
+            (
+                hits.list.contains(at),
+                hits.detail.contains(at),
+                hits.tabs.contains(at),
+                hits.palette.contains(at),
+                hits.at(at).map(|(_, t, _)| *t),
+            )
+        };
+        // a click on an actions menu item presses its key; any click closes the menu
+        if self.menu.is_some() {
+            if let MouseEventKind::Down(_) = m.kind {
+                self.menu = None;
+                if let Some(Target::Key(key)) = hit {
+                    self.last_click = Some((at, Instant::now()));
+                    return self.press(key, true);
                 }
             }
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            return true;
+        }
+        let before = self.selected;
+        match (m.kind, hit) {
+            (MouseEventKind::Down(MouseButton::Right), Some(Target::Row(i))) if !modal => {
+                self.selected = i;
+                self.menu = Some(at);
+            }
+            (MouseEventKind::Drag(MouseButton::Left), _) if self.dragging => {
+                self.split = (m.column + 1).clamp(30, 70);
+            }
+            (MouseEventKind::Up(MouseButton::Left), _) => self.dragging = false,
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Command(i))) => {
+                self.last_click = Some((at, Instant::now()));
+                return self.command(i);
+            }
+            (MouseEventKind::Down(_), _) if self.palette.is_some() && !in_palette => {
+                self.palette = None;
+            }
+            // the second half of a double-click that opened the confirm doesn't answer it
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Key(_)))
+                if self.confirm
+                    && self.last_click.is_some_and(|(p, t)| {
+                        p == at && t.elapsed() < Duration::from_millis(400)
+                    }) => {}
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Key(key))) => {
+                return self.key(key);
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Divider)) if !modal => {
+                self.dragging = true;
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Scroll(offset))) if !modal => {
+                self.scroll.set(offset);
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Row(i))) if !modal => {
+                // crossterm doesn't report double-clicks: two Downs on one cell within 400 ms
+                let now = Instant::now();
+                let double = i == self.selected
+                    && self.last_click.is_some_and(|(p, t)| {
+                        p == at && now.duration_since(t) < Duration::from_millis(400)
+                    });
+                self.zoom |= double;
+                self.last_click = (!double).then_some((at, now));
+                self.selected = i;
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Info)) => self.info = None,
+            (MouseEventKind::ScrollDown | MouseEventKind::ScrollUp, _) if !modal => {
                 let down = m.kind == MouseEventKind::ScrollDown;
-                if in_detail {
+                if in_tabs {
+                    let n = TABS.len();
+                    return self.key(digit((self.tab + if down { 1 } else { n - 1 }) % n));
+                } else if in_detail {
                     self.scroll_by(down);
                 } else if in_list {
-                    let rows = self.requests.len() + self.tasks.len();
-                    self.selected = match down {
-                        true => (self.selected + 1).min(rows.saturating_sub(1)),
-                        false => self.selected.saturating_sub(1),
-                    };
+                    self.move_by(down);
                 }
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Fold(g))) if !modal => {
+                self.folded[g] = !self.folded[g];
+                if self.folded[g] && self.groups()[g].contains(&self.selected) {
+                    self.move_by(true);
+                }
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::File(i))) if !modal => {
+                (self.detail, self.diff_file) = (true, i);
+                if !self.unfolded.remove(&i) {
+                    self.unfolded.insert(i);
+                }
+            }
+            (MouseEventKind::Down(MouseButton::Left), Some(Target::Location(i))) if !modal => {
+                (self.detail, self.tab, self.diff_file) = (true, DIFF, i);
+                self.unfolded = BTreeSet::from([i]);
+                // with only file `i` unfolded its row is `i`, so this puts it at the top
+                self.scroll.set(i as u16);
             }
             _ => {}
         }
         if self.selected != before {
             self.scroll.set(0);
             self.diff_file = 0;
+            self.unfolded.clear();
         }
+        true
     }
 
     /// `enter` in the preview: pushes, opens the PR, then tears down and frees the slot.
@@ -1678,9 +2151,25 @@ const NUDGE: &str = "↻";
 /// The Activity tab's tool name for a worker's handoff to a fresh session.
 const HANDOFF: &str = "⇢";
 
-/// Tool calls, nudges and handoffs from the tail of a Claude stream log, as (tool, target), with `slot/`
-/// paths made relative.
-fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
+/// The Activity tab's tool name for the agent's text.
+const TEXT: &str = "│";
+
+/// An Activity line: a tool call, the agent's text, a nudge or a handoff.
+#[derive(Debug, Default, PartialEq)]
+struct Act {
+    tool: String,
+    target: String,
+    /// Lines added and removed, for an `Edit`.
+    edit: Option<(usize, usize)>,
+    /// Whether the call's result wasn't an error, once it has one.
+    ok: Option<bool>,
+    /// A failed shell call's exit code.
+    exit: Option<i64>,
+}
+
+/// Tool calls with their results, the agent's text, nudges and handoffs from the tail of a
+/// Claude stream log, with `slot/` paths made relative.
+fn activity(log: &Path, slot: &Path) -> Vec<Act> {
     // ponytail: only the last 256 KiB, so redrawing a long session stays cheap
     let bytes = tail(log, 256 << 10);
     let prefix = format!("{}/", slot.display());
@@ -1688,33 +2177,73 @@ fn activity(log: &Path, slot: &Path) -> Vec<(String, String)> {
     let events = text
         .lines()
         .filter_map(|l| serde_json::from_str::<stream::Event>(l).ok());
-    let line = |c| match c {
-        Content::ToolUse { name, input, .. } => {
-            let key = match name.as_str() {
-                "Bash" => "command",
-                "Grep" | "Glob" => "pattern",
-                _ => "file_path",
-            };
-            let target = input[key]
-                .as_str()
-                .unwrap_or("")
-                .lines()
-                .next()
-                .unwrap_or("");
-            Some((name, target.replace(&prefix, "")))
-        }
-        _ => None,
+    let note = |tool: &str, target: String| Act {
+        tool: tool.into(),
+        target,
+        ..Default::default()
     };
-    events
-        .flat_map(|e| match e {
+    let (mut acts, mut calls) = (Vec::new(), std::collections::HashMap::new());
+    for e in events {
+        match e {
             stream::Event::Assistant { message } => {
-                message.content.into_iter().filter_map(line).collect()
+                for c in message.content {
+                    match c {
+                        Content::Text { text } => acts.push(note(TEXT, text)),
+                        Content::ToolUse { id, name, input } => {
+                            let key = match name.as_str() {
+                                "Bash" => "command",
+                                "Grep" | "Glob" => "pattern",
+                                _ => "file_path",
+                            };
+                            let target = input[key].as_str().unwrap_or("").lines().next();
+                            let target = target.unwrap_or("").replace(&prefix, "");
+                            let lines =
+                                |k: &str| input[k].as_str().map_or(0, |s| s.lines().count());
+                            let edit = (name == "Edit")
+                                .then(|| (lines("new_string"), lines("old_string")));
+                            calls.insert(id, acts.len());
+                            acts.push(Act {
+                                edit,
+                                ..note(&name, target)
+                            });
+                        }
+                        Content::Other => {}
+                    }
+                }
             }
-            stream::Event::Nudge { reason } => vec![(NUDGE.into(), reason)],
-            stream::Event::Handoff { reason } => vec![(HANDOFF.into(), reason)],
-            _ => Vec::new(),
+            stream::Event::User { message } => {
+                for r in message["content"].as_array().into_iter().flatten() {
+                    let id = r["tool_use_id"].as_str();
+                    let Some(act) = id.and_then(|id| calls.get(id)).map(|&i| &mut acts[i]) else {
+                        continue;
+                    };
+                    let failed = r["is_error"].as_bool().unwrap_or(false);
+                    act.ok = Some(!failed);
+                    // Claude Code starts a failed Bash result with `Exit code N`
+                    act.exit = (r["content"].as_str())
+                        .and_then(|s| s.strip_prefix("Exit code "))
+                        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+                        .filter(|_| failed);
+                }
+            }
+            stream::Event::Nudge { reason } => acts.push(note(NUDGE, reason)),
+            stream::Event::Handoff { reason } => acts.push(note(HANDOFF, reason)),
+            _ => {}
+        }
+    }
+    acts
+}
+
+/// Tokens in context at the latest assistant message in the tail of a Claude stream log.
+fn context(log: &Path) -> Option<u64> {
+    let bytes = tail(log, 256 << 10);
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .rev()
+        .find_map(|l| match serde_json::from_str(l).ok()? {
+            stream::Event::Assistant { message } => Some(message.usage.context()),
+            _ => None,
         })
-        .collect()
 }
 
 /// Up to the last `max` bytes of `file`; empty if it can't be read.
@@ -1731,25 +2260,52 @@ fn tail(file: &Path, max: u64) -> Vec<u8> {
 }
 
 /// Draws `p` scrolled down by the detail pane's offset, clamped to its last page.
-fn scrolled(f: &mut Frame, area: Rect, p: Paragraph, scroll: &Cell<u16>) {
+fn scrolled(f: &mut Frame, area: Rect, p: Paragraph, scroll: &Scroll) {
     let max = p
         .line_count(area.width)
         .saturating_sub(area.height as usize);
     scroll.set(scroll.get().min(max as u16));
+    if max > 0 {
+        scroll.bar.set(Some((area, max as u16, false)));
+    }
     f.render_widget(p.scroll((scroll.get(), 0)), area);
 }
 
 /// For a view that follows its tail: how many of `len` lines to hide below, clamped so a full
-/// page of `height` stays in view.
-fn from_tail(len: usize, height: u16, scroll: &Cell<u16>) -> usize {
-    let max = len.saturating_sub(height as usize);
+/// page of `area` stays in view.
+fn from_tail(len: usize, area: Rect, scroll: &Scroll) -> usize {
+    let max = len.saturating_sub(area.height as usize);
     scroll.set(scroll.get().min(max as u16));
+    if max > 0 {
+        scroll.bar.set(Some((area, max as u16, true)));
+    }
     scroll.get() as usize
+}
+
+/// A thumb over the pane border column `track`, for top offsets `0..=max` at `top`; returns the
+/// top offset each of its rows jumps to.
+fn scrollbar(f: &mut Frame, track: Rect, max: usize, top: usize) -> Vec<(Rect, usize)> {
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(None)
+        .thumb_symbol("┃");
+    let mut state = ScrollbarState::new(max + 1)
+        .position(top)
+        .viewport_content_length(track.height as usize);
+    f.render_stateful_widget(bar, track, &mut state);
+    let last = track.height.saturating_sub(1).max(1) as usize;
+    track
+        .rows()
+        .enumerate()
+        .map(|(i, row)| (row, (i * max + last / 2) / last))
+        .collect()
 }
 
 /// `git diff --numstat` against the base, as (path, added, deleted); binaries count 0.
 fn diffstat(slot: &Path, base: &str) -> Vec<(String, u64, u64)> {
-    let out = git(slot, &["diff", "--numstat", &format!("{base}...HEAD")]).unwrap_or_default();
+    let range = format!("{base}...HEAD");
+    let out = git(slot, &["diff", "--numstat", "--no-renames", &range]).unwrap_or_default();
     out.lines()
         .filter_map(|l| {
             let mut parts = l.splitn(3, '\t');
@@ -1761,6 +2317,24 @@ fn diffstat(slot: &Path, base: &str) -> Vec<(String, u64, u64)> {
             ))
         })
         .collect()
+}
+
+/// Each file's lines from its first `@@` in `git diff` against the base, in `diffstat`'s order.
+fn hunks(slot: &Path, base: &str) -> Vec<Vec<String>> {
+    let out = git(slot, &["diff", "--no-renames", &format!("{base}...HEAD")]).unwrap_or_default();
+    let out = format!("\n{out}");
+    // a type change (file to symlink) is two sections under one header but one numstat line
+    let mut files: Vec<(&str, Vec<String>)> = Vec::new();
+    for f in out.split("\ndiff --git ").skip(1) {
+        let head = f.lines().next().unwrap_or_default();
+        let lines = f.lines().skip_while(|l| !l.starts_with("@@"));
+        let lines = lines.map(|l| l.replace('\t', "    "));
+        match files.last_mut() {
+            Some((h, l)) if *h == head => l.extend(lines),
+            _ => files.push((head, lines.collect())),
+        }
+    }
+    files.into_iter().map(|(_, l)| l).collect()
 }
 
 /// Below this many rows, the header and footer share one line, the list drops its group headings
@@ -1776,10 +2350,10 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         Constraint::Length(1),
     ])
     .areas(f.area());
-    f.render_widget(header_line(app, theme), header);
+    if !compact {
+        f.render_widget(header_line(app, theme, header, false), header);
+    }
     let selected = app.task().map(|(t, _)| t);
-    let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
-    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
     let draft = selected.and_then(|t| t.pr_draft.as_ref());
     if let Some(c) = &app.compose {
         compose(f, body, c, theme);
@@ -1789,13 +2363,26 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         && let Some(d) = draft
     {
         preview(f, body, d, app.instruction.as_ref(), theme);
+    } else if app.zoom {
+        detail(f, body, app, theme, true, tick, now);
     } else if body.width >= 100 {
         let [left, right] =
-            Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(body);
+            Layout::horizontal([Constraint::Length(app.split), Constraint::Fill(1)]).areas(body);
+        // the two border columns between the panes; row targets drawn later win on the list's
+        let divider = Rect::new(
+            left.right() - 1,
+            body.y + 1,
+            2,
+            body.height.saturating_sub(2),
+        );
+        app.hits
+            .borrow_mut()
+            .targets
+            .push((divider, Target::Divider, "drag · resize".into()));
         list(f, left, app, theme, !app.detail, tick, now);
-        detail(f, right, app, theme, app.detail);
+        detail(f, right, app, theme, app.detail, tick, now);
     } else if app.detail {
-        detail(f, body, app, theme, true);
+        detail(f, body, app, theme, true, tick, now);
     } else {
         list(f, body, app, theme, true, tick, now);
     }
@@ -1811,80 +2398,155 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         vec![("tab", "field"), ("ctrl-s", "submit"), ("esc", "cancel")]
     } else if app.reply.is_some() {
         vec![("ctrl-s", "send"), ("esc", "cancel")]
-    } else if app.on_findings() {
-        let mut keys = vec![("j/k", "finding")];
-        keys.extend((app.findings.is_disputed(app.finding)).then_some(("r", "uphold")));
-        keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive")));
-        keys.extend([
-            ("o", "open"),
-            ("tab", "pane"),
-            ("1-6", "tabs"),
-            ("?", "help"),
-        ]);
-        keys
-    } else if app.on_diff() {
-        let keys = [("j/k", "file"), ("enter", "file diff"), ("d", "full diff")];
-        [
-            &keys[..],
-            &[("tab", "pane"), ("1-6", "tabs"), ("?", "help")],
-        ]
-        .concat()
     } else if app.instruction.is_some() {
         vec![("enter", "redraft"), ("esc", "cancel")]
     } else if app.preview {
         let push = ("enter", "push and open PR");
         vec![push, ("g", "regenerate"), ("e", "edit"), ("esc", "back")]
-    } else {
-        // only the keys that do something for the selected task
-        KEYS.into_iter()
-            .filter(|(k, _)| match *k {
-                "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
-                "x" => selected.is_some() || failed || answered,
-                "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
-                "c" => {
-                    selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed))
-                }
-                "w" => selected.is_some_and(|t| t.status == Status::Review),
-                "p" | "y" => answered,
-                "1-6" => selected.is_some(),
-                "R" => selected
-                    .is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id)),
-                "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
-                "r" => {
-                    answered
-                        || selected
-                            .is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
-                }
-                "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
-                "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
-                _ => true,
-            })
-            .collect()
-    };
-    let keys = keys.iter().flat_map(|(key, label)| {
+    } else if app.on_findings() {
+        let mut keys = vec![("j/k", "finding")];
+        let disputed = app.findings.is_disputed(app.finding);
+        keys.extend(disputed.then_some(("r", "reply to worker")));
+        keys.extend((app.findings.actionable().count() > 0).then_some(("x", "waive finding")));
+        keys.extend([
+            ("o", "open"),
+            ("tab", "pane"),
+            ("1-6", "tabs"),
+            ("?", "more"),
+        ]);
+        keys
+    } else if app.on_diff() {
+        let keys = [
+            ("j/k", "file"),
+            ("enter", "fold"),
+            ("o", "file diff"),
+            ("d", "full diff"),
+        ];
         [
-            Span::styled(format!(" {key} "), theme.accent),
-            Span::raw(format!("{label} ")).dim(),
+            &keys[..],
+            &[("tab", "pane"), ("1-6", "tabs"), ("?", "more")],
         ]
-    });
-    let mut line = match (&app.notice, &app.info) {
-        (Some(notice), _) => vec![Span::styled(format!(" {notice}"), theme.red)],
-        (None, Some(info)) => vec![Span::styled(format!(" {info}"), theme.accent)],
-        (None, None) if app.editing.is_some() => {
+        .concat()
+    } else {
+        // up to six keys that do something for the selection, the one that moves it on first
+        let global = ["n", "1-6", "j/k", "tab", "q"]
+            .into_iter()
+            .filter(|k| valid(app, k));
+        let mut keys = actions(app);
+        keys.extend(global.filter_map(|k| KEYS.into_iter().find(|(key, _)| *key == k)));
+        keys.truncate(6);
+        keys.push(("?", "more"));
+        keys
+    };
+    let chip = |(key, label): &(&str, &str)| {
+        [
+            Span::styled(format!(" {key} "), theme.accent)
+                .bold()
+                .bg(theme.key),
+            Span::raw(format!(" {label} ")).dim(),
+        ]
+    };
+    let prefix = if compact {
+        header_line(app, theme, footer, true).spans
+    } else {
+        Vec::new()
+    };
+    let width = |keys: &[(&str, &str)]| {
+        let spans = prefix.iter().cloned().chain(keys.iter().flat_map(chip));
+        Line::from(spans.collect::<Vec<_>>()).width()
+    };
+    // a `? more` footer drops keys from before it until the line fits, keeping the first
+    let mut keys = keys;
+    let more = keys.last() == Some(&("?", "more"));
+    while more && keys.len() > 2 && width(&keys) > footer.width as usize {
+        keys.remove(keys.len() - 2);
+    }
+    // still too wide: drop the target from labels like `reply to worker`
+    if more && width(&keys) > footer.width as usize {
+        for (_, label) in &mut keys {
+            *label = label.split(' ').next().unwrap_or_default();
+        }
+    }
+    let mut line = match app.editing {
+        Some(_) => {
             vec![Span::styled(
                 " editing in VS Code; close its tab to apply",
                 theme.accent,
             )]
         }
-        (None, None) => keys.collect(),
+        None => {
+            let mut x = footer.x + Line::from(prefix.clone()).width() as u16;
+            for k in &keys {
+                let w = Line::from(chip(k).to_vec()).width() as u16;
+                let rect = Rect::new(x, footer.y, w, 1).intersection(footer);
+                let hint = format!("{} · {}", k.0, k.1);
+                let target = key_of(k.0).map(|key| (rect, Target::Key(key), hint));
+                app.hits.borrow_mut().targets.extend(target);
+                x = x.saturating_add(w);
+            }
+            keys.iter().flat_map(chip).collect()
+        }
     };
-    if compact {
-        line.splice(0..0, header_line(app, theme).spans);
-    }
+    line.splice(0..0, prefix);
     f.render_widget(Line::from(line), footer);
-    if app.help {
-        help(f, theme);
+    if let Some(at) = app.menu {
+        // the selection's actions at the cursor; only its items respond
+        app.hits.borrow_mut().targets.clear();
+        let mut items = actions(app);
+        let own = items.len();
+        items.extend([("z", "zoom"), ("]", "next for you")]);
+        let all = f.area();
+        let (w, h) = (28.min(all.width), items.len() as u16 + 3);
+        let x = (at.x + 1).min(all.right().saturating_sub(w));
+        let y = (at.y + 1).min(all.bottom().saturating_sub(h));
+        let area = Rect::new(x, y, w, h).intersection(all);
+        let title = match (app.request(), selected) {
+            (Some(r), _) => r.text.lines().next().unwrap_or_default(),
+            (None, Some(t)) => t.title.as_str(),
+            _ => "",
+        };
+        let block = pane(title, true, theme);
+        let inner = block.inner(area);
+        f.render_widget(Clear, area);
+        f.render_widget(block, area);
+        for (i, (key, label)) in items.into_iter().enumerate() {
+            // a rule between the task's keys and the global ones
+            let row = inner.y + i as u16 + u16::from(i >= own);
+            // discard is red; it still goes through the confirm
+            let color = if key == "x" { theme.red } else { theme.accent };
+            let line = Line::from(vec![
+                Span::styled(format!("{key:<4}"), color).bold(),
+                Span::raw(label).fg(if key == "x" { theme.red } else { Color::Reset }),
+            ]);
+            let rect =
+                Rect::new(area.x + 1, row, area.width.saturating_sub(2), 1).intersection(all);
+            let text = Rect {
+                y: row,
+                height: 1,
+                ..inner
+            }
+            .intersection(all);
+            f.render_widget(line, text);
+            let hint = format!("{key} · {label}");
+            let target = key_of(key).map(|k| (rect, Target::Key(k), hint));
+            app.hits.borrow_mut().targets.extend(target);
+        }
+        let rule = Rect {
+            y: inner.y + own as u16,
+            height: 1,
+            ..inner
+        }
+        .intersection(all);
+        f.render_widget(
+            Line::raw(theme.rule.repeat(inner.width as usize)).dim(),
+            rule,
+        );
     }
+    if app.palette.is_some() || app.confirm || app.reply.is_some() {
+        // only an open modal's own targets respond
+        app.hits.borrow_mut().targets.clear();
+    }
+    palette(f, app, theme);
     let confirm = match (app.request(), selected) {
         (Some(r), _) => Some((
             "Dismiss",
@@ -1900,19 +2562,42 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         // a modal over the dimmed screen
         let all = f.area();
         f.buffer_mut().set_style(all, Style::new().dim());
-        let area = centered(f.area(), 52, 5);
-        let text = vec![
+        let area = centered(f.area(), 52, 6);
+        let block = pane(verb, true, theme);
+        let [text, buttons] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(block.inner(area));
+        let lines = vec![
             Line::raw(format!("{verb} “{title}”?")),
-            Line::from(vec![
-                Span::styled("y ", theme.accent),
-                Span::raw(format!("{does}   ")).dim(),
-                Span::styled("any key ", theme.accent),
-                Span::raw("cancel").dim(),
-            ]),
+            Line::raw(does).dim(),
         ];
         f.render_widget(Clear, area);
-        let text = Paragraph::new(text).wrap(Wrap { trim: true });
-        f.render_widget(text.block(pane(verb, true, theme)), area);
+        f.render_widget(block, area);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
+        let mut x = buttons.x;
+        let mut row = Vec::new();
+        for (key, label, code) in [
+            ("y", verb, KeyCode::Char('y')),
+            ("esc", "Keep it", KeyCode::Esc),
+        ] {
+            let button = [
+                Span::styled(format!(" {key} "), theme.accent)
+                    .bold()
+                    .bg(theme.key),
+                Span::raw(format!(" {label} ")).bg(theme.key),
+                Span::raw("   "),
+            ];
+            let w = Line::from(button[..2].to_vec()).width() as u16;
+            let rect = Rect::new(x, buttons.y, w, 1).intersection(buttons);
+            let hint = format!("{key} · {label}");
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            app.hits
+                .borrow_mut()
+                .targets
+                .push((rect, Target::Key(key), hint));
+            x = x.saturating_add(w + 3);
+            row.extend(button);
+        }
+        f.render_widget(Line::from(row), buttons);
     }
     if let Some(input) = &app.reply {
         let all = f.area();
@@ -1953,10 +2638,179 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
         f.render_widget(input, field);
         f.render_widget(block, area);
     }
+    // toasts over the bottom right of the body, the info above the error
+    let mut bottom = body.bottom().saturating_sub(1);
+    for (text, err) in [(&app.notice, true), (&app.info, false)] {
+        let Some(text) = text else { continue };
+        let color = if err { theme.red } else { theme.accent };
+        let w = (Line::raw(text).width() as u16 + 4).min(64.min(body.width.saturating_sub(4)));
+        let para = Paragraph::new(text.as_str()).wrap(Wrap { trim: true });
+        let para = if err { para.fg(theme.red) } else { para };
+        let h = para.line_count(w.saturating_sub(4)) as u16 + 2;
+        let x = body.right().saturating_sub(w + 2);
+        let area = Rect::new(x, bottom.saturating_sub(h), w, h).intersection(body);
+        bottom = area.y;
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(color)
+            .padding(Padding::horizontal(1));
+        f.render_widget(Clear, area);
+        f.render_widget(para.block(block), area);
+        let (target, hint) = match err {
+            true => (
+                Target::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                "esc",
+            ),
+            false => (Target::Info, "click"),
+        };
+        let hint = format!("{hint} · dismiss");
+        app.hits.borrow_mut().targets.push((area, target, hint));
+    }
+    // the hovered target gets a tint, and its hint in the bottom border of its pane
+    let hits = app.hits.borrow();
+    if let Some(at) = app.hover
+        && let Some((rect, _, hint)) = hits.at(at)
+    {
+        f.buffer_mut()
+            .set_style(*rect, Style::new().bg(theme.hover));
+        let pane = [hits.list, hits.detail]
+            .into_iter()
+            .find(|p| p.contains(at));
+        let hint = Line::styled(format!(" {hint} "), theme.accent).right_aligned();
+        let area = pane.unwrap_or(body).inner(Margin::new(1, 0));
+        f.render_widget(Block::new().title_bottom(hint), area);
+    }
 }
 
 fn gate_passed(t: &Task) -> bool {
     t.gate.as_ref().is_some_and(|g| g.iter().all(|c| c.passed))
+}
+
+/// Whether the `KEYS` key `k` does something for the selection.
+fn valid(app: &App, k: &str) -> bool {
+    let selected = app.task().map(|(t, _)| t);
+    let failed = app.request().is_some_and(|r| r.status == Phase::Failed);
+    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
+    match k {
+        "d" | "o" => selected.is_some_and(|t| t.slot.is_some()),
+        "x" => selected.is_some() || failed || answered,
+        "t" => failed || selected.is_some_and(|t| t.status == Status::Failed),
+        "c" => selected.is_some_and(|t| matches!(t.status, Status::Review | Status::Failed)),
+        "w" => selected.is_some_and(|t| t.status == Status::Review),
+        "p" | "y" => answered,
+        "1-6" => selected.is_some(),
+        "R" => selected.is_some_and(|t| t.status == Status::Review || app.serving.contains(&t.id)),
+        "m" => selected.is_some_and(|t| t.status == Status::Review && gate_passed(t)),
+        "r" => {
+            answered
+                || selected.is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
+        }
+        "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
+        "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
+        _ => true,
+    }
+}
+
+/// The selection's valid keys as (key, label), the one that moves it on first.
+fn actions(app: &App) -> Vec<(&'static str, &'static str)> {
+    let status = app.task().map(|(t, _)| t.status);
+    let answered = app.request().is_some_and(|r| r.status == Phase::Done);
+    let first: &[&str] = match status {
+        Some(Status::Review) => &["m", "r", "d", "x", "c", "w", "R", "o"],
+        Some(Status::Failed) => &["t", "c", "x", "d", "o"],
+        Some(Status::Proposed) => &["a", "A", "e", "r", "x"],
+        _ if answered => &["p", "r", "y", "x"],
+        _ => &["t", "d", "o", "R", "x"],
+    };
+    first
+        .iter()
+        .filter(|k| valid(app, k))
+        .filter_map(|k| KEYS.into_iter().find(|(key, _)| key == k))
+        .map(|(k, label)| match (k, status) {
+            ("x", Some(_)) => (k, "discard task"),
+            ("r", Some(Status::Review)) => (k, "reply to worker"),
+            ("r", _) => (k, "reply to lead"),
+            _ => (k, label),
+        })
+        .collect()
+}
+
+/// The command palette: the query, then the matching rows with their key chips and context.
+fn palette(f: &mut Frame, app: &App, theme: &Theme) {
+    let Some((query, row)) = &app.palette else {
+        return;
+    };
+    let rows = app.commands();
+    let all = f.area();
+    let n = rows
+        .len()
+        .clamp(1, all.height.saturating_sub(9).max(1) as usize);
+    let area = centered(all, 68.min(all.width.saturating_sub(4)), n as u16 + 4);
+    let block = pane("Commands", true, theme);
+    let [input, rule, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(block.inner(area));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let prompt = Line::from(vec![
+        Span::styled("› ", theme.accent).bold(),
+        Span::raw(query.clone()).bold(),
+        Span::styled("▏", theme.accent),
+    ]);
+    f.render_widget(prompt, input);
+    f.render_widget(
+        Line::raw("type to filter · ↑↓ · enter")
+            .dim()
+            .right_aligned(),
+        input,
+    );
+    f.render_widget(
+        Line::raw(theme.rule.repeat(rule.width as usize)).dim(),
+        rule,
+    );
+    let mut hits = app.hits.borrow_mut();
+    hits.palette = area;
+    if rows.is_empty() {
+        f.render_widget(Line::raw("No command matches").dim(), list);
+    }
+    let sel = (*row).min(rows.len().saturating_sub(1));
+    let off = sel.saturating_sub(n - 1);
+    for (r, (key, label, context, _)) in rows.iter().enumerate().skip(off).take(n) {
+        let at = Rect::new(list.x, list.y + (r - off) as u16, list.width, 1);
+        let chip = match *key {
+            "" => Span::raw(""),
+            k => Span::styled(format!(" {k} "), theme.accent)
+                .bold()
+                .bg(theme.key),
+        };
+        let context = truncate(context, 22, theme.ellipsis);
+        let room = (list.width as usize).saturating_sub(8 + context.width());
+        let label = truncate(label, room, theme.ellipsis);
+        let pad = 6usize.saturating_sub(chip.width());
+        let gap = room.saturating_sub(label.width()) + 1;
+        let style = if r == sel {
+            Style::new().bold()
+        } else {
+            Style::new()
+        };
+        let line = Line::from(vec![
+            Span::styled(if r == sel { theme.bar } else { " " }, theme.accent),
+            chip,
+            Span::raw(" ".repeat(pad)),
+            Span::styled(label.clone(), style),
+            Span::raw(" ".repeat(gap)),
+            Span::raw(context).dim(),
+        ]);
+        f.render_widget(line, at);
+        let hint = match *key {
+            "" => label,
+            k => format!("{k} · {label}"),
+        };
+        hits.targets.push((at, Target::Command(r), hint));
+    }
 }
 
 /// The PR draft in place of both panes, with the `g` instruction input below when open.
@@ -2073,17 +2927,80 @@ fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme) {
     }
 }
 
-fn header_line(app: &App, theme: &Theme) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(" yogan", theme.accent).bold(),
-        Span::raw(format!(" · {}  ", app.name)).dim(),
-    ];
-    for (status, _) in GROUPS {
-        let n = app.tasks.iter().filter(|(t, _)| t.status == status).count();
-        if n > 0 {
-            spans.extend([theme.glyph(status, false, 0), Span::raw(format!(" {n}  "))]);
-        }
+/// ` yogan · repo  ● 2 need you  ⠋ 1 working  ○ 1 queued`, with the slot meter and spend flush
+/// right; `compact` keeps ` yogan  ● 2 `. The chip presses `]` and a slot selects its task.
+fn header_line(app: &App, theme: &Theme, area: Rect, compact: bool) -> Line<'static> {
+    let groups = app.groups();
+    let need = groups[0].len();
+    let mut spans = vec![Span::styled(" yogan", theme.accent).bold()];
+    if !compact {
+        spans.push(Span::raw(format!(" · {}", app.name)).dim());
     }
+    spans.push(Span::raw("  "));
+    let x = area.x + Line::from(spans.clone()).width() as u16;
+    let chip = match (need, compact) {
+        (0, _) => Span::styled(format!("{} nothing needs you", theme.pass), theme.green),
+        (n, true) => theme.chip(&format!("{} {n}", theme.need), theme.amber),
+        (n, false) => theme.chip(&format!("{} {n} need you", theme.need), theme.amber),
+    };
+    let rect = Rect::new(x, area.y, chip.width() as u16, 1).intersection(area);
+    let key = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE);
+    let hint = "] · next needing you".into();
+    let typing = app.compose.is_some() || app.settings.is_some() || app.instruction.is_some();
+    if !typing && !app.preview {
+        app.hits
+            .borrow_mut()
+            .targets
+            .push((rect, Target::Key(key), hint));
+    }
+    spans.push(chip);
+    if compact {
+        spans.push(Span::raw("  "));
+        return Line::from(spans);
+    }
+    let queued = app
+        .tasks
+        .iter()
+        .filter(|(t, _)| t.status == Status::Approved);
+    spans.extend([
+        Span::raw("  "),
+        theme.glyph(Status::Running, false, 0),
+        Span::raw(format!(" {} working  ", groups[1].len())),
+        Span::raw(format!("{} {} queued", theme.queued, queued.count())).dim(),
+    ]);
+    let spent = app.tasks.iter().fold(0.0, |n, (t, _)| n + t.spent());
+    let spend = format!("   ${spent:.2} ");
+    let meter = 6 + app.slots as usize + spend.width();
+    let left = Line::from(spans.clone()).width();
+    if left + meter > area.width as usize {
+        return Line::from(spans);
+    }
+    let pad = area.width as usize - left - meter;
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::raw("slots ").dim());
+    let mut x = area.x.saturating_add((left + pad + 6) as u16);
+    let n = app.requests.len();
+    for slot in 1..=app.slots {
+        let held = app.tasks.iter().position(|(t, _)| t.slot == Some(slot));
+        let rect = Rect::new(x, area.y, 1, 1).intersection(area);
+        let mut hits = app.hits.borrow_mut();
+        spans.push(match held {
+            Some(i) => {
+                let t = &app.tasks[i].0;
+                let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
+                let hint = format!("slot {slot} · {}", t.title);
+                hits.targets.push((rect, Target::Row(n + i), hint));
+                Span::styled(theme.slot.0, theme.glyph(t.status, gate_failed, 0).style)
+            }
+            None => {
+                hits.targets
+                    .push((rect, Target::Hint, format!("slot {slot} · free")));
+                Span::raw(theme.slot.1).dim()
+            }
+        });
+        x = x.saturating_add(1);
+    }
+    spans.push(Span::raw(spend));
     Line::from(spans)
 }
 
@@ -2114,103 +3031,205 @@ fn list(
     let width = inner.width as usize;
     // compact drops headings and the blank lines between groups; the glyphs carry the status
     let compact = f.area().height < COMPACT;
-    let (mut items, mut selected, mut i) = (Vec::new(), None, 0);
-    // the row index of each item, for the mouse; None for headings and blanks
+    let (mut items, mut selected) = (Vec::new(), None);
+    // what a click on each item does, for the mouse; None for blanks
     let mut rows = Vec::new();
-    let heading = |items: &mut Vec<ListItem>, rows: &mut Vec<_>, label| {
-        if compact {
-            return;
-        }
-        if !items.is_empty() {
-            items.push(ListItem::new(""));
-            rows.push(None);
-        }
-        items.push(ListItem::new(Line::raw(label).dim()));
-        rows.push(None);
-    };
-    let mut group = None;
-    for r in &app.requests {
-        let question = r.status == Phase::Done;
-        if group != Some(question) {
-            let label = if question { "Questions" } else { "Planning" };
-            heading(&mut items, &mut rows, label);
-            group = Some(question);
-        }
-        let sel = i == app.selected;
-        if sel {
-            selected = Some(items.len());
-        }
-        rows.push(Some(i));
-        let (glyph, right) = match r.status {
-            Phase::Failed => (Span::styled(theme.fail, theme.red), "failed"),
-            Phase::Done => (Span::styled(theme.pass, theme.green), "answered"),
-            _ => {
-                let spin = theme.spinner[tick % theme.spinner.len()];
-                let doing = if r.mode == Mode::Ask {
-                    "answering"
-                } else {
-                    "planning"
-                };
-                (Span::styled(spin, theme.accent), doing)
-            }
-        };
-        let title = r.text.lines().next().unwrap_or_default();
-        items.push(ListItem::new(row_line(
-            glyph, title, right, sel, width, theme,
-        )));
-        i += 1;
-    }
-    for (status, label) in GROUPS {
-        let group: Vec<_> = app
-            .tasks
-            .iter()
-            .filter(|(t, _)| t.status == status)
-            .collect();
+    for (g, group) in app.groups().into_iter().enumerate() {
         if group.is_empty() {
             continue;
         }
-        heading(&mut items, &mut rows, label);
-        for (t, since) in group {
+        if !compact {
+            if !items.is_empty() {
+                items.push(ListItem::new(""));
+                rows.push(None);
+            }
+            let fold = if app.folded[g] {
+                theme.fold.1
+            } else {
+                theme.fold.0
+            };
+            let name = format!("{fold} {} ", GROUPS[g].0.to_uppercase());
+            let count = format!("{} ", group.len());
+            let rule = theme
+                .rule
+                .repeat(width.saturating_sub(name.width() + count.width()));
+            let name = match g {
+                0 => Span::styled(name, theme.amber).bold(),
+                _ => Span::raw(name).dim().bold(),
+            };
+            let line = Line::from(vec![name, Span::raw(count).dim(), Span::raw(rule).dim()]);
+            items.push(ListItem::new(line));
+            rows.push(Some(Target::Fold(g)));
+        }
+        if app.folded[g] {
+            continue;
+        }
+        for i in group {
             let sel = i == app.selected;
             if sel {
                 selected = Some(items.len());
             }
-            rows.push(Some(i));
+            rows.push(Some(Target::Row(i)));
+            let Some((t, since)) = i.checked_sub(app.requests.len()).map(|i| &app.tasks[i]) else {
+                let r = &app.requests[i];
+                let (glyph, right) = match r.status {
+                    Phase::Failed => (
+                        Span::styled(theme.fail, theme.red),
+                        vec![theme.chip("failed", theme.red)],
+                    ),
+                    Phase::Done => (
+                        Span::styled(theme.pass, theme.green),
+                        vec![theme.chip("answered", theme.amber)],
+                    ),
+                    _ => {
+                        let spin = theme.spinner[tick % theme.spinner.len()];
+                        let doing = match r.mode {
+                            Mode::Ask => "answering",
+                            _ => "planning",
+                        };
+                        (
+                            Span::styled(spin, theme.accent),
+                            vec![Span::raw(doing).dim()],
+                        )
+                    }
+                };
+                let title = r.text.lines().next().unwrap_or_default();
+                items.push(ListItem::new(row_line(
+                    glyph, title, right, sel, width, theme,
+                )));
+                continue;
+            };
             let age = since.and_then(|s| now.duration_since(s).ok());
             let age = age.map(short).unwrap_or_default();
-            // ponytail: the step is the status; T16's Activity knows the real one (testing, editing)
-            let right = match t.status {
+            let serving = app.serving.contains(&t.id).then_some("serving · ");
+            let path = lineage(t, &app.tasks);
+            let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
+            let reason = match t.status {
+                Status::Review if app.disputed.contains(&t.id) => {
+                    Some(("disputed".into(), theme.amber))
+                }
+                Status::Review | Status::Failed if gate_failed => {
+                    Some(("gate failed".into(), theme.red))
+                }
+                Status::Review => Some(("ready".into(), theme.green)),
+                Status::Failed => Some(("failed".into(), theme.red)),
+                // a tree's root counts its proposals; its children read as the tree
+                Status::Proposed if path.len() == 1 => {
+                    let tree = app.tasks.iter().filter(|(o, _)| {
+                        o.status == Status::Proposed && lineage(o, &app.tasks)[0] == t.id
+                    });
+                    Some((format!("{} to approve", tree.count()), theme.amber))
+                }
+                _ => None,
+            };
+            let dim = match t.status {
                 Status::Running => format!("working · {age}"),
                 Status::Checking => format!("gate · {age}"),
-                _ => {
-                    let tags = [("disputed", &app.disputed), ("serving", &app.serving)];
-                    let tags = tags.iter().filter(|(_, ids)| ids.contains(&t.id));
-                    tags.map(|(tag, _)| format!("{tag} · ")).collect::<String>() + &age
-                }
+                Status::Approved => "needs a slot".into(),
+                Status::PrOpen => match t.pr_url.as_deref().and_then(|u| u.rsplit('/').next()) {
+                    Some(n) => format!("PR #{n}"),
+                    None => "PR open".into(),
+                },
+                _ => format!("{}{age}", serving.unwrap_or_default()),
             };
-            let depth = lineage(t, &app.tasks).len() - 1;
+            let mut right: Vec<_> = reason.map(|(r, c)| theme.chip(&r, c)).into_iter().collect();
+            let gap = if right.is_empty() || dim.is_empty() {
+                ""
+            } else {
+                " "
+            };
+            right.push(Span::raw(format!("{gap}{dim}")).dim());
             items.push(ListItem::new(row(
-                t, depth, &right, sel, width, theme, tick,
+                t,
+                path.len() - 1,
+                right,
+                sel,
+                width,
+                theme,
+                tick,
             )));
-            i += 1;
+            if let Some((_, (tool, target), at)) = app.steps.iter().find(|s| s.0 == t.id) {
+                let quiet = now.duration_since(*at).unwrap_or_default();
+                let late = quiet > app.stall_after / 2;
+                items.push(ListItem::new(step(tool, target, quiet, late, width, theme)));
+                rows.push(Some(Target::Row(i)));
+            }
         }
     }
+    let len = items.len();
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(List::new(items).block(block), area, &mut state);
+    // a click on the scrollbar selects the first row at that point of the list
+    let max = len.saturating_sub(inner.height as usize);
+    let bar = match max {
+        0 => Vec::new(),
+        _ => {
+            let track = Rect::new(area.right() - 1, inner.y, 1, inner.height);
+            scrollbar(f, track, max, state.offset())
+        }
+    };
+    let bar: Vec<_> = (bar.into_iter())
+        .filter_map(|(r, top)| {
+            let mut below = rows[top..].iter().flatten();
+            let row = *below.find(|t| matches!(t, Target::Row(_)))?;
+            Some((r, row, "click · scroll".into()))
+        })
+        .collect();
     let mut hits = app.hits.borrow_mut();
     hits.list = area;
     let shown = rows
         .into_iter()
         .skip(state.offset())
         .zip(inner.y..inner.bottom());
-    hits.rows = shown.filter_map(|(i, y)| Some((y, i?))).collect();
+    let rows = shown.filter_map(|(target, y)| {
+        let target = target?;
+        let hint = match target {
+            Target::Fold(_) => "click · fold",
+            _ => "click select · double-click zoom",
+        };
+        let rect = Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+        Some((rect, target, hint.into()))
+    });
+    hits.targets.extend(rows);
+    hits.targets.extend(bar);
+}
+
+/// `      edit src/retry.rs…  quiet 2m`, dim under a Running row; `quiet` is amber when `late`.
+fn step(
+    tool: &str,
+    target: &str,
+    quiet: Duration,
+    late: bool,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let quiet = format!("quiet {}", short(quiet));
+    let left = format!("{} {target}", verb(tool, theme).0);
+    let left = truncate(
+        &left,
+        width.saturating_sub(7 + quiet.width()),
+        theme.ellipsis,
+    );
+    let pad = width.saturating_sub(6 + left.width() + quiet.width());
+    let quiet = match late {
+        true => Span::styled(quiet, theme.amber),
+        false => Span::raw(quiet).dim(),
+    };
+    Line::from(vec![
+        Span::raw(format!("      {left}{}", " ".repeat(pad))).dim(),
+        quiet,
+    ])
 }
 
 /// `▌ ⠋ title…          working · 4m`: never wraps, the title gives way.
 fn row(
     t: &Task,
     depth: usize,
-    right: &str,
+    right: Vec<Span<'static>>,
     sel: bool,
     width: usize,
     theme: &Theme,
@@ -2226,23 +3245,20 @@ fn row(
     row_line(glyph, &title, right, sel, width, theme)
 }
 
-/// A list row from its parts: selection bar, glyph, title and dim right-hand text.
+/// A list row from its parts: selection bar, glyph, title and right-hand spans.
 fn row_line(
     glyph: Span<'static>,
     title: &str,
-    right: &str,
+    right: Vec<Span<'static>>,
     sel: bool,
     width: usize,
     theme: &Theme,
 ) -> Line<'static> {
-    let title = truncate(
-        title,
-        width.saturating_sub(5 + right.width()),
-        theme.ellipsis,
-    );
-    let pad = width.saturating_sub(4 + title.width() + right.width());
+    let right_width = right.iter().map(Span::width).sum::<usize>();
+    let title = truncate(title, width.saturating_sub(5 + right_width), theme.ellipsis);
+    let pad = width.saturating_sub(4 + title.width() + right_width);
     let bar = if sel { theme.bar } else { " " };
-    Line::from(vec![
+    let mut line = Line::from(vec![
         Span::styled(bar, theme.accent),
         Span::raw(" "),
         glyph,
@@ -2256,16 +3272,65 @@ fn row_line(
             },
         ),
         Span::raw(" ".repeat(pad)),
-        Span::raw(right.to_string()).dim(),
-    ])
+    ]);
+    line.spans.extend(right);
+    line
 }
 
-fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
+fn detail(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    focused: bool,
+    tick: usize,
+    now: SystemTime,
+) {
     app.hits.borrow_mut().detail = area;
     let compact = f.area().height < COMPACT;
-    let block = pane("Task", focused, theme);
+    let (label, key, hint) = match app.zoom {
+        true => (" esc unzoom ", KeyCode::Esc, "esc · unzoom"),
+        false => (" z zoom ", KeyCode::Char('z'), "z · zoom"),
+    };
+    let block = pane("Task", focused, theme).title(Line::raw(label).dim().right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let w = label.width() as u16;
+    let rect = Rect::new(area.right().saturating_sub(w + 1), area.y, w, 1).intersection(area);
+    let target = Target::Key(KeyEvent::new(key, KeyModifiers::NONE));
+    app.hits
+        .borrow_mut()
+        .targets
+        .push((rect, target, hint.into()));
+    app.scroll.bar.set(None);
+    detail_body(f, inner, app, theme, compact, tick, now);
+    // the tab's scrollbar sits on the pane's right border; a click there jumps to that offset
+    if let Some((rect, max, tail)) = app.scroll.bar.take() {
+        let track = Rect::new(area.right() - 1, rect.y, 1, rect.height);
+        let top = if tail {
+            max - app.scroll.get()
+        } else {
+            app.scroll.get()
+        };
+        let rows = scrollbar(f, track, max as usize, top as usize);
+        let rows = rows.into_iter().map(|(r, top)| {
+            let offset = if tail { max - top as u16 } else { top as u16 };
+            (r, Target::Scroll(offset), "click · scroll".into())
+        });
+        app.hits.borrow_mut().targets.extend(rows);
+    }
+}
+
+/// The detail pane's tabs and the active tab, or the selected request.
+fn detail_body(
+    f: &mut Frame,
+    inner: Rect,
+    app: &App,
+    theme: &Theme,
+    compact: bool,
+    tick: usize,
+    now: SystemTime,
+) {
     let Some((t, _)) = app.task() else {
         match app.request() {
             Some(r) => request(f, inner, r, app.answer.as_ref(), theme, &app.scroll),
@@ -2273,25 +3338,129 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
         }
         return;
     };
-    let [tabs, _, body] = Layout::vertical([
+    let spinner = theme.spinner[tick % theme.spinner.len()];
+    // the spend cell gets a row of its own, so its gauge fits
+    let mut cells = verdict(app, t, theme, now);
+    let spend = cells.pop().unwrap_or_default();
+    let mut rows: Vec<_> = cells.chunks(2).map(<[_]>::to_vec).collect();
+    rows.push(vec![spend]);
+    let gap = Constraint::Length(if compact { 0 } else { 1 });
+    let shown = if compact { 1 } else { rows.len() as u16 };
+    let [strip, _, verdict_area, _, next, _, tabs, _, body] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(if compact { 0 } else { 1 }),
+        gap,
+        Constraint::Length(shown),
+        gap,
+        Constraint::Length(1),
+        gap,
+        Constraint::Length(1),
+        gap,
         Constraint::Fill(1),
     ])
     .areas(inner);
-    let tabs_line = TABS.iter().enumerate().flat_map(|(i, name)| {
-        let name = if i == app.tab {
-            Span::raw(*name).bold().underlined()
-        } else {
-            Span::raw(*name).dim()
+    f.render_widget(pipeline(t, theme, spinner), strip);
+    let cell = |(label, value): &(&str, Vec<Span<'static>>), pad: usize| {
+        let label = match label.is_empty() {
+            true => String::new(),
+            false => format!("{label:<pad$}"),
         };
-        [name, Span::raw("  ")]
-    });
-    let tabs_line = match compact {
-        true => Line::from(vec![Span::raw(TABS[app.tab]).bold(), Span::raw(" ▾").dim()]),
-        false => Line::from(tabs_line.collect::<Vec<_>>()),
+        [vec![Span::raw(label).dim()], value.clone()].concat()
     };
-    f.render_widget(tabs_line, tabs);
+    if compact {
+        let sep = Span::raw("  ·  ").dim();
+        let spans = rows.concat().into_iter().enumerate().flat_map(|(i, c)| {
+            let lead = (i > 0).then(|| sep.clone());
+            lead.into_iter().chain(cell(&c, c.0.len() + 1))
+        });
+        f.render_widget(Line::from(spans.collect::<Vec<_>>()), verdict_area);
+    } else {
+        let half = verdict_area.width / 2;
+        for (row, y) in rows.iter().zip(verdict_area.y..) {
+            for (c, x) in row.iter().zip([0, half]) {
+                let w = if row.len() > 1 {
+                    half - 1
+                } else {
+                    verdict_area.width
+                };
+                let rect = Rect::new(verdict_area.x + x, y, w, 1).intersection(verdict_area);
+                f.render_widget(Line::from(cell(c, 8)), rect);
+            }
+        }
+    }
+    // NEXT: the keys that move the task on, the first green, each a hit target for its key
+    let mut line = vec![Span::raw("NEXT  ").dim().bold()];
+    let mut x = next.x + 6;
+    let buttons = next_keys(t);
+    if buttons.is_empty() {
+        line.push(Span::raw("Nothing needed yet.").dim());
+    }
+    for (i, (key, label)) in buttons.iter().enumerate() {
+        let (chip, text) = match i {
+            0 => {
+                let s = Style::new().fg(theme.key).bg(theme.green);
+                (s.bold(), s)
+            }
+            _ => {
+                let s = Style::new().bg(theme.key);
+                (s.fg(theme.accent).bold(), s)
+            }
+        };
+        let button = [
+            Span::styled(format!(" {key} "), chip),
+            Span::styled(format!(" {label} "), text),
+        ];
+        let w = Line::from(button.to_vec()).width() as u16;
+        let rect = Rect::new(x, next.y, w, 1).intersection(next);
+        let target = key_of(key).map(|k| (rect, Target::Key(k), format!("{key} · {label}")));
+        app.hits.borrow_mut().targets.extend(target);
+        x = x.saturating_add(w + 2);
+        line.extend(button);
+        line.push(Span::raw("  "));
+    }
+    f.render_widget(Line::from(line), next);
+    // tabs as pills, with badges; each presses its digit, compact's one the next tab's
+    let badge = |i: usize| match i {
+        1 if t.status == Status::Running => Some(Span::styled(spinner, theme.accent)),
+        2 => t.gate.as_ref().map(|_| match gate_passed(t) {
+            true => Span::styled(theme.pass, theme.green),
+            false => Span::styled(theme.fail, theme.red),
+        }),
+        FINDINGS => {
+            let n = app.findings.actionable().count();
+            (n > 0).then(|| Span::styled(n.to_string(), theme.amber))
+        }
+        _ => None,
+    };
+    let pill = |i: usize| {
+        let mut spans = vec![Span::raw(format!(" {}", TABS[i])).dim()];
+        spans.extend(badge(i).map(|b| Span::styled(format!(" {}", b.content), b.style)));
+        spans.push(Span::raw(if compact { " ▾ " } else { " " }));
+        if i == app.tab {
+            let on = Style::new().fg(theme.key).bg(theme.accent).bold();
+            spans = spans.into_iter().map(|s| s.style(on)).collect();
+        }
+        spans
+    };
+    let shown: Vec<usize> = match compact {
+        true => vec![app.tab],
+        false => (0..TABS.len()).collect(),
+    };
+    let mut line = Vec::new();
+    let mut x = tabs.x;
+    let mut hits = app.hits.borrow_mut();
+    hits.tabs = tabs;
+    for i in shown {
+        let spans = pill(i);
+        let w = Line::from(spans.clone()).width() as u16;
+        let key = if compact { (i + 1) % TABS.len() } else { i };
+        let rect = Rect::new(x, tabs.y, w, 1).intersection(tabs);
+        let hint = format!("{} · {}", key + 1, TABS[key]);
+        hits.targets.push((rect, Target::Key(digit(key)), hint));
+        x = x.saturating_add(w);
+        line.extend(spans);
+    }
+    drop(hits);
+    f.render_widget(Line::from(line), tabs);
     match app.tab {
         0 => {
             let parent = t.parent.as_ref().map(|p| {
@@ -2304,18 +3473,163 @@ fn detail(f: &mut Frame, area: Rect, app: &App, theme: &Theme, focused: bool) {
         2 => gate_tab(f, body, t, &app.gate_log, theme, &app.scroll),
         FINDINGS => {
             let cursor = app.on_findings().then_some(app.finding);
-            findings_tab(f, body, &app.findings, cursor, theme, &app.scroll)
+            findings_tab(f, body, app, cursor, theme)
         }
         RUN => run_tab(f, body, t, &app.run, theme, &app.scroll),
-        _ => {
-            let cursor = app.on_diff().then_some(app.diff_file);
-            diff_tab(f, body, &app.diff, cursor, theme, &app.scroll)
+        _ => diff_tab(f, body, app, theme),
+    }
+}
+
+/// `plan ━ queue ━ run ━ check ━ ◉ review ┄ pr`: done stages green, the current one bold in
+/// the accent, `✗` in red on a failure and `spinner` while running, later ones dim.
+fn pipeline(t: &Task, theme: &Theme, spinner: &'static str) -> Line<'static> {
+    let gate_failed = t.gate.iter().flatten().any(|c| !c.passed);
+    let at = match t.status {
+        Status::Proposed => 0,
+        Status::Approved => 1,
+        Status::Running => 2,
+        Status::Failed if !gate_failed => 2,
+        Status::Checking | Status::Failed => 3,
+        Status::Review => 4,
+        Status::PrOpen | Status::Discarded => 5,
+    };
+    let stages = ["plan", "queue", "run", "check", "review", "pr"];
+    let mut spans = Vec::new();
+    for (i, stage) in stages.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(match i <= at {
+                true => Span::styled(format!(" {} ", theme.done), theme.green),
+                false => Span::raw(format!(" {} ", theme.todo)).dim(),
+            });
         }
+        let (mark, color) = match t.status {
+            Status::Failed => (theme.fail, theme.red),
+            Status::Running | Status::Checking => (spinner, theme.accent),
+            _ => (theme.current, theme.accent),
+        };
+        spans.push(match i.cmp(&at) {
+            std::cmp::Ordering::Less => Span::styled(stage, theme.green),
+            std::cmp::Ordering::Greater => Span::raw(stage).dim(),
+            std::cmp::Ordering::Equal => {
+                Span::styled(format!("{mark} {stage}"), Style::new().fg(color).bold())
+            }
+        });
+    }
+    Line::from(spans)
+}
+
+/// The verdict as (label, value) cells, spend last: gate dots, critic, diffstat, slot and model;
+/// a Running task's context gauge and quiet time in place of the first three.
+fn verdict(
+    app: &App,
+    t: &Task,
+    theme: &Theme,
+    now: SystemTime,
+) -> Vec<(&'static str, Vec<Span<'static>>)> {
+    let gauge = |ratio: f64, color: Color| {
+        let n = (ratio.clamp(0.0, 1.0) * 8.0).round() as usize;
+        vec![
+            Span::styled(theme.done.repeat(n), color),
+            Span::raw(theme.rest.repeat(8 - n)).dim(),
+        ]
+    };
+    let mut cells = Vec::new();
+    if t.status == Status::Running {
+        let (window, handoff_at) = app.window;
+        if let Some(used) = app.context.filter(|_| window > 0) {
+            let ratio = used as f64 / window as f64;
+            let color = if ratio > handoff_at {
+                theme.amber
+            } else {
+                theme.accent
+            };
+            let pct = Span::styled(format!(" {:.0}%", ratio * 100.0), color);
+            cells.push(("context", [gauge(ratio, color), vec![pct]].concat()));
+        }
+        if let Some((_, _, at)) = app.steps.iter().find(|s| s.0 == t.id) {
+            let quiet = now.duration_since(*at).unwrap_or_default();
+            let late = quiet > app.stall_after / 2;
+            let quiet = Span::raw(short(quiet));
+            cells.push((
+                "quiet",
+                vec![if late { quiet.fg(theme.amber) } else { quiet }],
+            ));
+        }
+    } else {
+        if let Some(checks) = &t.gate {
+            let mut dots: Vec<_> = (checks.iter())
+                .map(|c| match c.passed {
+                    true => Span::styled(theme.dot, theme.green),
+                    false => Span::styled(theme.fail, theme.red),
+                })
+                .collect();
+            let passed = checks.iter().filter(|c| c.passed).count();
+            let color = if gate_passed(t) {
+                theme.green
+            } else {
+                theme.red
+            };
+            dots.push(Span::styled(format!(" {passed}/{}", checks.len()), color));
+            cells.push(("gate", dots));
+        }
+        let fs = &app.findings;
+        if *fs != Findings::default() {
+            let open = fs.actionable().count();
+            let color = if open == 0 { theme.green } else { theme.amber };
+            cells.push((
+                "critic",
+                vec![
+                    Span::styled(format!("{open} open"), color),
+                    Span::raw(format!(" · {} fixed", fs.fixed.len())).dim(),
+                ],
+            ));
+        }
+        if !app.diff.is_empty() {
+            let (a, d) = (app.diff.iter()).fold((0, 0), |(a, d), f| (a + f.1, d + f.2));
+            cells.push((
+                "change",
+                vec![
+                    Span::styled(format!("+{a}"), theme.green),
+                    Span::styled(format!(" -{d}"), theme.red),
+                    Span::raw(format!(" · {} files", app.diff.len())).dim(),
+                ],
+            ));
+        }
+    }
+    let mut at: Vec<_> = t.slot.map(|n| format!("slot {n}")).into_iter().collect();
+    at.extend(t.model.as_ref().map(|m| match &t.effort {
+        Some(e) => format!("{m}/{e}"),
+        None => m.clone(),
+    }));
+    if !at.is_empty() {
+        cells.push(("", vec![Span::raw(at.join(" · ")).dim()]));
+    }
+    let (spent, budget) = (t.spent(), t.budget_usd.unwrap_or(app.budget));
+    let mut spend = match budget > 0.0 {
+        true => gauge(spent / budget, theme.accent),
+        false => Vec::new(),
+    };
+    spend.push(Span::raw(match budget > 0.0 {
+        true => format!(" ${spent:.2}/${budget:.2}"),
+        false => format!("${spent:.2}"),
+    }));
+    cells.push(("spend", spend));
+    cells
+}
+
+/// The keys that move `t` on, as (key, label), the first the one to press.
+fn next_keys(t: &Task) -> &'static [(&'static str, &'static str)] {
+    match t.status {
+        Status::Review if gate_passed(t) => &[("m", "open the PR"), ("r", "ask for changes")],
+        Status::Review => &[("r", "ask for changes"), ("c", "continue")],
+        Status::Failed => &[("t", "retry"), ("c", "continue")],
+        Status::Proposed => &[("a", "approve"), ("e", "edit")],
+        _ => &[],
     }
 }
 
 /// The slot and its ports, each `[scripts]` entry's status, then the run script's output tail.
-fn run_tab(f: &mut Frame, area: Rect, t: &Task, run: &RunTab, theme: &Theme, scroll: &Cell<u16>) {
+fn run_tab(f: &mut Frame, area: Rect, t: &Task, run: &RunTab, theme: &Theme, scroll: &Scroll) {
     let mut head = t.slot.map_or(Vec::new(), |n| vec![format!("slot {n}")]);
     head.extend(run.ports.map(|(p, n)| format!("ports {p}-{}", p + n - 1)));
     let scripts = run.scripts.iter().flat_map(|&name| {
@@ -2359,7 +3673,7 @@ fn run_tab(f: &mut Frame, area: Rect, t: &Task, run: &RunTab, theme: &Theme, scr
         return;
     }
     let mut lines: Vec<Line> = run.log.lines().map(|l| Line::raw(l.to_string())).collect();
-    lines.truncate(lines.len() - from_tail(lines.len(), output.height, scroll));
+    lines.truncate(lines.len() - from_tail(lines.len(), output, scroll));
     let skip = lines.len().saturating_sub(output.height as usize);
     f.render_widget(Paragraph::new(lines.split_off(skip)), output);
 }
@@ -2371,12 +3685,9 @@ fn summary(
     t: &Task,
     parent: Option<String>,
     sessions: u32,
-    scroll: &Cell<u16>,
+    scroll: &Scroll,
 ) {
-    let label = GROUPS
-        .iter()
-        .find(|(s, _)| *s == t.status)
-        .map_or("", |g| g.1);
+    let label = status_rank(t.status).map_or("", |r| r.1);
     let mut meta = vec![label.to_string()];
     meta.extend((!t.branch.is_empty()).then(|| t.branch.clone()));
     meta.extend(t.slot.map(|n| format!("slot {n}")));
@@ -2421,7 +3732,7 @@ fn request(
     r: &Request,
     answer: Option<&(String, String, Vec<String>)>,
     theme: &Theme,
-    scroll: &Cell<u16>,
+    scroll: &Scroll,
 ) {
     let failed = r.status == Phase::Failed;
     let status = match r.status {
@@ -2458,22 +3769,172 @@ fn request(
     );
 }
 
-/// Markdown, lightly: headings bold, fenced code in the shell hue, the rest as written.
+/// Markdown, lightly: headings bold, fenced code in the shell hue, lists, quotes, rules, tables
+/// and inline styles; nothing inside a fence is parsed.
 fn markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut code = false;
     let mut lines = Vec::new();
+    let mut table = Vec::new();
     for l in text.lines() {
-        if l.trim_start().starts_with("```") {
+        let t = l.trim();
+        if !code && t.starts_with('|') {
+            table.push(t);
+            continue;
+        }
+        lines.extend(md_table(&std::mem::take(&mut table), theme));
+        let (indent, rest) = l.split_at(l.len() - l.trim_start().len());
+        let item = ["- ", "* ", "+ "].iter().find_map(|b| rest.strip_prefix(b));
+        let quote = rest.strip_prefix("> ").or((t == ">").then_some(""));
+        let prefixed = |prefix: String, rest: &str| {
+            let mut spans = vec![Span::raw(prefix)];
+            spans.extend(inline(rest, Style::new(), theme));
+            Line::from(spans)
+        };
+        if t.starts_with("```") {
             code = !code;
         } else if code {
             lines.push(Line::styled(format!("  {l}"), theme.shell));
         } else if l.starts_with('#') {
             lines.push(Line::raw(l.trim_start_matches('#').trim().to_string()).bold());
+        } else if t.len() >= 3 && ['-', '*', '_'].iter().any(|&c| t.chars().all(|x| x == c)) {
+            lines.push(Line::raw(theme.rule.repeat(8)).dim());
+        } else if let Some(rest) = item {
+            lines.push(prefixed(format!("{indent}{} ", theme.bullet), rest));
+        } else if let Some(rest) = quote {
+            lines.push(prefixed(format!("{indent}{} ", theme.gutter), rest).dim());
         } else {
-            lines.push(Line::raw(l.to_string()));
+            lines.push(Line::from(inline(l, Style::new(), theme)));
         }
     }
+    lines.extend(md_table(&table, theme));
     lines
+}
+
+/// A run of `|` rows with each column padded to its widest cell, the header bold and the
+/// delimiter row a rule.
+fn md_table(rows: &[&str], theme: &Theme) -> Vec<Line<'static>> {
+    let cells = |r: &str| -> Vec<String> {
+        let r = r.strip_prefix('|').unwrap_or(r);
+        let r = r.strip_suffix('|').unwrap_or(r);
+        r.split('|').map(|c| c.trim().to_string()).collect()
+    };
+    let delimiter = |r: &str| {
+        (cells(r).iter()).all(|c| !c.is_empty() && c.chars().all(|x| matches!(x, '-' | ':')))
+    };
+    let header = rows.get(1).is_some_and(|r| delimiter(r));
+    let rows: Vec<Option<Vec<Vec<Span<'static>>>>> = (rows.iter())
+        .map(|r| {
+            let row = || {
+                cells(r)
+                    .iter()
+                    .map(|c| inline(c, Style::new(), theme))
+                    .collect()
+            };
+            (!delimiter(r)).then(row)
+        })
+        .collect();
+    let width = |cell: &[Span]| cell.iter().map(|s| s.content.width()).sum::<usize>();
+    let mut widths: Vec<usize> = Vec::new();
+    for (i, cell) in rows.iter().flatten().flat_map(|r| r.iter().enumerate()) {
+        if widths.len() <= i {
+            widths.push(0);
+        }
+        widths[i] = widths[i].max(width(cell));
+    }
+    let total = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+    (rows.into_iter().enumerate())
+        .map(|(n, row)| {
+            let Some(row) = row else {
+                return Line::raw(theme.rule.repeat(total)).dim();
+            };
+            let mut spans = Vec::new();
+            let mut pad = 0;
+            for (i, cell) in row.into_iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw(" ".repeat(pad + 2)));
+                }
+                pad = widths[i] - width(&cell);
+                spans.extend(cell);
+            }
+            match n == 0 && header {
+                true => Line::from(spans).bold(),
+                false => Line::from(spans),
+            }
+        })
+        .collect()
+}
+
+/// `l` with **bold**, *italic*, `code` and [links](url) styled over `base`; `_` inside a word
+/// stays literal.
+fn inline(l: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
+    fn flush(spans: &mut Vec<Span<'static>>, text: &mut String, style: Style) {
+        if !text.is_empty() {
+            spans.push(Span::styled(std::mem::take(text), style));
+        }
+    }
+    let c: Vec<char> = l.chars().collect();
+    let find = |from: usize, pat: &[char]| (from..c.len()).find(|&j| c[j..].starts_with(pat));
+    let word = |j: usize| c.get(j).is_some_and(|x| x.is_alphanumeric());
+    let (mut spans, mut text) = (Vec::new(), String::new());
+    let (mut bold, mut italic) = (None, None);
+    let mut i = 0;
+    while i < c.len() {
+        let mut style = base;
+        if bold.is_some() {
+            style = style.bold();
+        }
+        if italic.is_some() {
+            style = style.italic();
+        }
+        let ch = c[i];
+        if ch == '`'
+            && let Some(j) = find(i + 1, &['`'])
+        {
+            flush(&mut spans, &mut text, style);
+            let code: String = c[i + 1..j].iter().collect();
+            spans.push(Span::styled(code, style.fg(theme.shell)));
+            i = j + 1;
+        } else if ch == '['
+            && let Some(j) = find(i + 1, &[']'])
+            && c.get(j + 1) == Some(&'(')
+            && let Some(k) = find(j + 2, &[')'])
+        {
+            flush(&mut spans, &mut text, style);
+            let label: String = c[i + 1..j].iter().collect();
+            let url: String = c[j + 2..k].iter().collect();
+            spans.push(Span::styled(label, style.underlined()));
+            spans.push(Span::styled(format!(" {url}"), base.dim()));
+            i = k + 1;
+        } else if ch == '*' || ch == '_' {
+            let n = if c.get(i + 1) == Some(&ch) { 2 } else { 1 };
+            let delim = &[ch, ch][..n];
+            let open = if n == 2 { bold } else { italic };
+            // A closer follows text, and a single one isn't half of a double.
+            let closer = |j: usize| {
+                !c[j - 1].is_whitespace()
+                    && (ch == '*' || !word(j + n))
+                    && (n == 2 || (c[j - 1] != ch && c.get(j + 1) != Some(&ch)))
+            };
+            let closes = open == Some(ch) && i > 0 && closer(i);
+            let opens = open.is_none()
+                && c.get(i + n).is_some_and(|x| !x.is_whitespace())
+                && (ch == '*' || i == 0 || !word(i - 1))
+                && (i + n..c.len()).any(|j| c[j..].starts_with(delim) && closer(j));
+            if closes || opens {
+                flush(&mut spans, &mut text, style);
+                let now = opens.then_some(ch);
+                if n == 2 { bold = now } else { italic = now }
+            } else {
+                text.extend(delim);
+            }
+            i += n;
+        } else {
+            text.push(ch);
+            i += 1;
+        }
+    }
+    flush(&mut spans, &mut text, base);
+    spans
 }
 
 /// The repo files `text` cites as `path` or `path:line`, once each, in order.
@@ -2537,15 +3998,12 @@ fn base64(bytes: &[u8]) -> String {
 
 /// The critic's findings by what became of them, each with its evidence and the worker's or the
 /// human's reply; `cursor` marks the selected one of the actionable (open, disputed, optional).
-fn findings_tab(
-    f: &mut Frame,
-    area: Rect,
-    fs: &Findings,
-    cursor: Option<usize>,
-    theme: &Theme,
-    scroll: &Cell<u16>,
-) {
+/// A location in the diff is a click target that opens it there.
+fn findings_tab(f: &mut Frame, area: Rect, app: &App, cursor: Option<usize>, theme: &Theme) {
+    let fs = &app.findings;
     let mut lines = Vec::new();
+    // (line, column, width, diff file) of each location in the diff
+    let mut locs = Vec::new();
     if let Some(e) = &fs.error {
         lines.push(Line::styled(
             format!("The critic didn't finish: {e}"),
@@ -2577,11 +4035,22 @@ fn findings_tab(
                 Severity::Minor => Span::raw(theme.queued).dim(),
             };
             let claim = Span::raw(x.claim.clone());
+            let path = path_line(&x.location).0;
+            let file = app.diff.iter().position(|d| d.0 == path);
+            let at = Span::raw(x.location.clone());
+            if let Some(file) = file {
+                locs.push((lines.len(), 3 + glyph.width(), at.width(), file));
+            }
             lines.push(Line::from(vec![
                 Span::styled(if sel { theme.bar } else { " " }, theme.accent),
                 Span::raw(" "),
                 glyph,
-                Span::raw(format!(" {} ", x.location)).dim(),
+                Span::raw(" "),
+                match file {
+                    Some(_) => at.fg(theme.accent).underlined(),
+                    None => at.dim(),
+                },
+                Span::raw(" "),
                 if sel { claim.bold() } else { claim },
             ]));
             if !x.evidence.is_empty() {
@@ -2595,57 +4064,107 @@ fn findings_tab(
     if lines.is_empty() {
         lines.push(Line::raw("No findings yet.").dim());
     }
-    scrolled(
-        f,
-        area,
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
-        scroll,
-    );
+    let wrapped =
+        |lines: &[Line<'static>]| Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    scrolled(f, area, wrapped(&lines), &app.scroll);
+    let top = app.scroll.get() as usize;
+    let targets = locs.into_iter().filter_map(|(line, x, w, file)| {
+        let row = wrapped(&lines[..line]).line_count(area.width);
+        let y = row.checked_sub(top).filter(|y| *y < area.height as usize)?;
+        let rect = Rect::new(area.x + x as u16, area.y + y as u16, w as u16, 1);
+        let hint = "click · show it in the diff".into();
+        Some((rect.intersection(area), Target::Location(file), hint))
+    });
+    app.hits.borrow_mut().targets.extend(targets);
 }
 
 /// One line per tool call, following the tail: edits in the accent, shell commands in a
-/// second hue, reads dim, nudges amber.
-fn activity_tab(
-    f: &mut Frame,
-    area: Rect,
-    calls: &[(String, String)],
-    theme: &Theme,
-    scroll: &Cell<u16>,
-) {
-    if calls.is_empty() {
+/// second hue, reads dim, nudges amber; edit counts and the result on the right, and the
+/// agent's text wrapped under a dim gutter.
+fn activity_tab(f: &mut Frame, area: Rect, acts: &[Act], theme: &Theme, scroll: &Scroll) {
+    if acts.is_empty() {
         f.render_widget(Line::raw("No tool calls yet.").dim(), area);
         return;
     }
     let width = area.width as usize;
-    let end = calls.len() - from_tail(calls.len(), area.height, scroll);
-    let shown = &calls[end.saturating_sub(area.height as usize)..end];
-    let lines = shown.iter().map(|(tool, target)| {
-        let (verb, style) = match tool.as_str() {
-            "Edit" | "NotebookEdit" => ("edit", Style::new().fg(theme.accent)),
-            "Write" => ("write", Style::new().fg(theme.accent)),
-            "Bash" => ("run", Style::new().fg(theme.shell)),
-            "Read" => ("read", Style::new().dim()),
-            "Grep" | "Glob" => ("search", Style::new().dim()),
-            NUDGE => ("↻ nudged", Style::new().fg(theme.amber)),
-            HANDOFF => ("⇢ handoff", Style::new()),
-            other => (other, Style::new()),
-        };
-        let target = truncate(
-            target,
-            width.saturating_sub(verb.width().max(7) + 1),
-            theme.ellipsis,
-        );
-        let target = match tool.as_str() {
+    let mut lines = Vec::new();
+    for a in acts {
+        if a.tool == TEXT {
+            let gutter = format!("  {} ", theme.gutter);
+            for l in a
+                .target
+                .lines()
+                .flat_map(|l| wrap(l, width.saturating_sub(4)))
+            {
+                let l = truncate(&l, width.saturating_sub(4), theme.ellipsis);
+                lines.push(Line::from(vec![Span::raw(gutter.clone()), Span::raw(l)]).dim());
+            }
+            continue;
+        }
+        let mut right = Vec::new();
+        if let Some((add, del)) = a.edit {
+            right.push(Span::styled(format!(" +{add}"), theme.green));
+            right.push(Span::styled(format!(" -{del}"), theme.red));
+        }
+        match (a.ok, a.exit) {
+            (Some(true), _) => right.push(Span::styled(format!("  {}", theme.pass), theme.green)),
+            (Some(false), Some(n)) => right.push(Span::styled(
+                format!("  {} exit {n}", theme.fail),
+                theme.red,
+            )),
+            (Some(false), None) => right.push(Span::styled(format!("  {}", theme.fail), theme.red)),
+            (None, _) => {}
+        }
+        let right_w: usize = right.iter().map(|s| s.width()).sum();
+        let (verb, style) = verb(&a.tool, theme);
+        let room = width.saturating_sub(verb.width().max(7) + 1 + right_w);
+        let target = truncate(&a.target, room, theme.ellipsis);
+        let pad = " ".repeat(room.saturating_sub(target.width()));
+        let target = match a.tool.as_str() {
             NUDGE => Span::styled(target, style),
             _ => Span::raw(target).dim(),
         };
-        Line::from(vec![Span::styled(format!("{verb:<7} "), style), target])
-    });
-    f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), area);
+        let left = [Span::styled(format!("{verb:<7} "), style), target];
+        lines.push(Line::from([&left[..], &[Span::raw(pad)], &right].concat()));
+    }
+    let end = lines.len() - from_tail(lines.len(), area, scroll);
+    let start = end.saturating_sub(area.height as usize);
+    f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
+}
+
+/// `s` split at spaces into lines of at most `width` columns, where its words fit.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for word in s.split_whitespace() {
+        let last = out.last_mut().expect("starts non-empty");
+        if last.is_empty() {
+            last.push_str(word);
+        } else if last.width() + 1 + word.width() > width {
+            out.push(word.into());
+        } else {
+            last.push(' ');
+            last.push_str(word);
+        }
+    }
+    out
+}
+
+/// The Activity verb and style for a tool call's tool.
+fn verb<'a>(tool: &'a str, theme: &Theme) -> (&'a str, Style) {
+    match tool {
+        "Edit" | "NotebookEdit" => ("edit", Style::new().fg(theme.accent)),
+        "Write" => ("write", Style::new().fg(theme.accent)),
+        "Bash" => ("run", Style::new().fg(theme.shell)),
+        "Read" => ("read", Style::new().dim()),
+        "Grep" | "Glob" => ("search", Style::new().dim()),
+        NUDGE => ("↻ nudged", Style::new().fg(theme.amber)),
+        HANDOFF => ("⇢ handoff", Style::new()),
+        other => (other, Style::new()),
+    }
 }
 
 /// The checks as a table, then the tail of each failing step's output from the gate log.
-fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scroll: &Cell<u16>) {
+fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scroll: &Scroll) {
     let Some(checks) = &t.gate else {
         f.render_widget(Line::raw("The gate hasn't run yet.").dim(), area);
         return;
@@ -2676,73 +4195,122 @@ fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scrol
             lines.extend(body.lines().map(|l| Line::raw(l.to_string())));
         }
     }
-    lines.truncate(lines.len() - from_tail(lines.len(), output.height, scroll));
+    lines.truncate(lines.len() - from_tail(lines.len(), output, scroll));
     let skip = lines.len().saturating_sub(output.height as usize);
     f.render_widget(Paragraph::new(lines.split_off(skip)), output);
 }
 
-/// git-style `+`/`-` counts with bars scaled to the largest change; `cursor` marks the file
-/// `enter` opens, and stays in view.
-fn diff_tab(
-    f: &mut Frame,
-    area: Rect,
-    files: &[(String, u64, u64)],
-    cursor: Option<usize>,
-    theme: &Theme,
-    scroll: &Cell<u16>,
-) {
+/// git-style `+`/`-` counts with bars scaled to the largest change, and the unfolded files'
+/// hunks with each finding under its line; `cursor` marks the file `enter` folds, and stays in
+/// view.
+fn diff_tab(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let files = &app.diff;
     if files.is_empty() {
         f.render_widget(Line::raw("No changes yet.").dim(), area);
         return;
     }
+    let cursor = app.on_diff().then_some(app.diff_file);
     let (added, deleted) = files.iter().fold((0, 0), |(a, d), f| (a + f.1, d + f.2));
     let max = files.iter().map(|f| f.1 + f.2).max().unwrap_or(1).max(1);
     let bar_width = 20u64.min(max);
     let bar = if cursor.is_some() { 2 } else { 0 };
-    let path_width = (area.width as usize).saturating_sub(13 + bar + bar_width as usize);
+    let path_width = (area.width as usize).saturating_sub(15 + bar + bar_width as usize);
     let scale = |n: u64| ((n * bar_width).div_ceil(max)) as usize;
-    if let Some(c) = cursor.map(|c| c as u16) {
-        let top = scroll.get().max((c + 1).saturating_sub(area.height));
-        scroll.set(top.min(c));
-    }
-    let mut lines: Vec<Line> = files
-        .iter()
-        .enumerate()
-        .map(|(i, (path, a, d))| {
-            let path = truncate(path, path_width, theme.ellipsis);
-            let sel = cursor == Some(i);
-            let mark = match cursor {
-                Some(_) => format!("{} ", if sel { theme.bar } else { " " }),
-                None => String::new(),
-            };
-            let path = Span::raw(format!("{path:<path_width$} "));
-            Line::from(vec![
-                Span::styled(mark, theme.accent),
-                if sel { path.bold() } else { path },
-                Span::styled(format!("{:>5}", format!("+{a}")), theme.green),
-                Span::styled(format!("{:>6} ", format!("-{d}")), theme.red),
-                Span::styled("+".repeat(scale(*a)), theme.green),
-                Span::styled("-".repeat(scale(*d)), theme.red),
-            ])
-        })
+    let fs = &app.findings;
+    let lists = [
+        ("open", &fs.findings),
+        ("disputed", &fs.disputed),
+        ("optional", &fs.optional),
+        ("fixed", &fs.fixed),
+        ("waived", &fs.waived),
+    ];
+    let found: Vec<_> = (lists.into_iter())
+        .flat_map(|(state, list)| list.iter().map(move |x| (state, path_line(&x.location), x)))
         .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    // each file's line, and the cursor file's first and last line
+    let (mut rows, mut section) = (Vec::new(), (0, 0));
+    for (i, (path, a, d)) in files.iter().enumerate() {
+        let open = app.unfolded.contains(&i);
+        rows.push(lines.len());
+        let sel = cursor == Some(i);
+        let mark = match cursor {
+            Some(_) => format!("{} ", if sel { theme.bar } else { " " }),
+            None => String::new(),
+        };
+        let fold = if open { theme.fold.0 } else { theme.fold.1 };
+        let name = truncate(path, path_width, theme.ellipsis);
+        let name = Span::raw(format!("{name:<path_width$} "));
+        lines.push(Line::from(vec![
+            Span::styled(mark, theme.accent),
+            Span::raw(format!("{fold} ")).dim(),
+            if sel { name.bold() } else { name },
+            Span::styled(format!("{:>5}", format!("+{a}")), theme.green),
+            Span::styled(format!("{:>6} ", format!("-{d}")), theme.red),
+            Span::styled("+".repeat(scale(*a)), theme.green),
+            Span::styled("-".repeat(scale(*d)), theme.red),
+        ]));
+        let mut new = 0;
+        for l in app.hunks.get(i).filter(|_| open).into_iter().flatten() {
+            if l.starts_with("@@") {
+                // `@@ -a,b +c,d @@`: the new file's lines count from c
+                let c = l
+                    .split(" +")
+                    .nth(1)
+                    .and_then(|r| r.split([',', ' ']).next());
+                new = c.and_then(|c| c.parse().ok()).unwrap_or(0);
+                lines.push(Line::styled(format!("    {l}"), theme.shell));
+                continue;
+            }
+            let (n, style) = match l.chars().next() {
+                Some('+') => (Some(new), Style::new().fg(theme.green)),
+                Some('-') => (None, Style::new().fg(theme.red)),
+                Some(' ') => (Some(new), Style::new()),
+                _ => (None, Style::new().dim()),
+            };
+            let num = n.map_or(String::new(), |n| n.to_string());
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {num:>4} ")).dim(),
+                Span::styled(l.clone(), style),
+            ]));
+            let Some(n) = n else { continue };
+            new += 1;
+            let here = found
+                .iter()
+                .filter(|(_, at, _)| at.0 == *path && at.1 == Some(n));
+            for (state, _, x) in here {
+                let head = format!("       {} critic, {state}  ", theme.checking);
+                lines.push(Line::from(vec![
+                    Span::styled(head, theme.amber),
+                    Span::raw(format!("{}  {}", x.location, x.claim)).dim(),
+                ]));
+            }
+        }
+        if sel {
+            section = (rows[i], lines.len() - 1);
+        }
+    }
     lines.push(Line::raw(""));
     let total = format!("{} files changed, +{added} -{deleted}", files.len());
     lines.push(Line::raw(total).dim());
-    scrolled(f, area, Paragraph::new(lines), scroll);
-}
-
-fn help(f: &mut Frame, theme: &Theme) {
-    let area = centered(f.area(), 34, KEYS.len() as u16 + 2);
-    let lines = KEYS.iter().map(|(key, label)| {
-        Line::from(vec![
-            Span::styled(format!("{key:<8}"), theme.accent),
-            Span::raw(*label),
-        ])
+    if cursor.is_some() && app.follow.take() {
+        let (first, last) = section;
+        let lo = (first + 1).saturating_sub(area.height as usize);
+        let top = (app.scroll.get() as usize).max(lo).min(last);
+        app.scroll.set(top as u16);
+    }
+    scrolled(f, area, Paragraph::new(lines), &app.scroll);
+    let top = app.scroll.get() as usize;
+    let targets = rows.into_iter().enumerate().filter_map(|(i, row)| {
+        let y = row.checked_sub(top).filter(|y| *y < area.height as usize)?;
+        let rect = Rect::new(area.x, area.y + y as u16, area.width, 1);
+        Some((
+            rect,
+            Target::File(i),
+            "click · show or hide its hunks".into(),
+        ))
     });
-    f.render_widget(Clear, area);
-    let block = pane("Keys", true, theme);
-    f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()).block(block), area);
+    app.hits.borrow_mut().targets.extend(targets);
 }
 
 fn short(d: Duration) -> String {
@@ -2777,6 +4345,14 @@ mod tests {
     use crate::gate::Check;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn act(tool: &str, target: &str) -> Act {
+        Act {
+            tool: tool.into(),
+            target: target.into(),
+            ..Default::default()
+        }
+    }
 
     fn app() -> (App, SystemTime) {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -2818,15 +4394,18 @@ mod tests {
             tasks,
             selected: 0,
             detail: false,
-            help: false,
+            palette: None,
             compose: None,
             notice: None,
             info: None,
+            info_since: None,
             opening: false,
             tab: 0,
             activity: Vec::new(),
             gate_log: String::new(),
             diff: Vec::new(),
+            hunks: Vec::new(),
+            unfolded: BTreeSet::new(),
             loaded: None,
             confirm: false,
             pager: None,
@@ -2840,19 +4419,33 @@ mod tests {
             commits: Vec::new(),
             commit: 0,
             interactive: None,
-            scroll: Cell::new(0),
+            scroll: Scroll::default(),
             findings: Findings::default(),
             finding: 0,
             disputed: Vec::new(),
             sessions: 3,
             run: RunTab::default(),
             serving: Vec::new(),
+            steps: Vec::new(),
+            stall_after: Duration::from_secs(15 * 60),
             settings: None,
             vscode: false,
             editing: None,
             open_at: None,
             diff_file: 0,
+            follow: Cell::new(false),
+            zoom: false,
+            last_click: None,
+            split: 45,
+            dragging: false,
+            context: None,
+            budget: 5.0,
+            window: (200_000, 0.8),
+            folded: [false; 3],
+            slots: 3,
             hits: RefCell::default(),
+            hover: None,
+            menu: None,
         };
         (app, now)
     }
@@ -2869,7 +4462,7 @@ mod tests {
     fn tab_screen(mut app: App, tab: usize) -> Vec<String> {
         app.detail = true;
         app.tab = tab;
-        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 17)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
@@ -2885,8 +4478,11 @@ mod tests {
         assert_eq!(
             tab_screen(app, 0),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Summary ▾                                                │",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ──────── $0. │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Summary ▾                                               │",
                 "│ Reject negative max_delay                                │",
                 "│ Review · u/reject-negative · slot 1 · session 2/3 ·      │",
                 "│ opus/high · CC-687                                       │",
@@ -2898,7 +4494,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
+                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
     }
@@ -2940,9 +4536,7 @@ mod tests {
         // Activity counts from its tail: scrolling up shows older calls
         press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
         assert_eq!(app.scroll.get(), 0, "a new tab starts at the top");
-        app.activity = (1..=30)
-            .map(|i| ("Read".into(), format!("f{i}.rs")))
-            .collect();
+        app.activity = (1..=30).map(|i| act("Read", &format!("f{i}.rs"))).collect();
         let newest = |rows: &[String]| rows.iter().any(|r| r.contains("f30.rs"));
         assert!(newest(&draw_rows(&app)));
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
@@ -2956,7 +4550,7 @@ mod tests {
     #[test]
     fn activity_tab_follows_tail() {
         let (mut app, _) = app();
-        let call = |tool: &str, target: &str| (tool.to_string(), target.to_string());
+        let call = act;
         app.activity = vec![
             call("Read", "src/old.rs"),
             call("Read", "src/config.rs"),
@@ -2972,8 +4566,11 @@ mod tests {
         assert_eq!(
             tab_screen(app, 1),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Activity ▾                                               │",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ──────── $0. │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Activity ▾                                              │",
                 "│ read    src/old.rs                                       │",
                 "│ read    src/config.rs                                    │",
                 "│ search  max_delay                                        │",
@@ -2985,7 +4582,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
+                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
     }
@@ -3010,8 +4607,11 @@ mod tests {
         assert_eq!(
             tab_screen(app, 2),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Gate ▾                                                   │",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ●●✗ 2/3  ·  slot 1 · opus/high  ·  spend ──────── $ │",
+                "│ NEXT   r  ask for changes    c  continue                 │",
+                "│  Gate ✗ ▾                                                │",
                 "│ ✓  clean tree                                            │",
                 "│ ✓  fmt                                                   │",
                 "│ ✗  test                                                  │",
@@ -3023,7 +4623,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
+                " yogan   ● 2    r  reply to worker  d  diff  ?  more        ",
             ]
         );
     }
@@ -3042,8 +4642,11 @@ mod tests {
         assert_eq!(
             tab_screen(app, RUN),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Run ▾                                                    │",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ──────── $0. │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Run ▾                                                   │",
                 "│ slot 1 · ports 1160-1239                                 │",
                 "│ ✓ setup  ◆ run running  ○ teardown when freed            │",
                 "│                                                          │",
@@ -3055,7 +4658,7 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move ",
+                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
             ]
         );
     }
@@ -3087,7 +4690,7 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                        ",
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued   ",
                 "╭ Settings · project file ─────────────────────────────────╮",
                 "│ ~/.config/yogan/projects/trader.toml                     │",
                 "│                                                          │",
@@ -3112,7 +4715,7 @@ mod tests {
                 "│   max handoffs       2                                   │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " j/k field  ←→ change  g global file  ctrl-s save  esc close",
+                " j/k  field  ←→  change  g  global file  ctrl-s  save  esc  ",
             ]
         );
 
@@ -3151,11 +4754,14 @@ mod tests {
         assert_eq!(
             tab_screen(app, 4),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Diff ▾                                                   │",
-                "│ ▌ src/config.rs           +12    -3 ++++++--             │",
-                "│   crates/ledger/src/li…   +40    -0 ++++++++++++++++++++ │",
-                "│   assets/logo.png          +0    -0                      │",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  change +52 -3 · 3 files  ·  slot 1 · opus │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Diff ▾                                                  │",
+                "│ ▌ ▸ src/config.rs         +12    -3 ++++++--             │",
+                "│   ▸ crates/ledger/src/…   +40    -0 ++++++++++++++++++++ │",
+                "│   ▸ assets/logo.png        +0    -0                      │",
                 "│                                                          │",
                 "│ 3 files changed, +52 -3                                  │",
                 "│                                                          │",
@@ -3164,9 +4770,81 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k file  enter file ",
+                " yogan   ● 2    j/k  file  enter  fold  ?  more             ",
             ]
         );
+    }
+
+    #[test]
+    fn diff_tab_unfolded_file_with_a_finding() {
+        let (mut app, _) = app();
+        app.diff = vec![("src/config.rs".into(), 2, 1), ("README.md".into(), 1, 0)];
+        app.hunks = vec![
+            [
+                "@@ -40,3 +40,4 @@ impl Retry",
+                " fn parse(raw: &Raw) {",
+                "-    let d = raw.max as u64;",
+                "+    ensure!(raw.max >= 0);",
+                "+    let d = u64::try_from(raw.max)?;",
+                " }",
+            ]
+            .map(String::from)
+            .into(),
+            vec!["@@ -1 +1,2 @@".into()],
+        ];
+        app.unfolded.insert(0);
+        app.findings.fixed = vec![crate::critic::Finding {
+            severity: Severity::Minor,
+            location: "src/config.rs:42".into(),
+            claim: "as u64 wraps".into(),
+            evidence: String::new(),
+            reply: None,
+        }];
+        assert_eq!(
+            tab_screen(app, 4)[5..15],
+            [
+                "│ ▌ ▾ src/config.rs                           +2    -1 ++- ┃",
+                "│     @@ -40,3 +40,4 @@ impl Retry                         ┃",
+                "│     40  fn parse(raw: &Raw) {                            ┃",
+                "│        -    let d = raw.max as u64;                      ┃",
+                "│     41 +    ensure!(raw.max >= 0);                       ┃",
+                "│     42 +    let d = u64::try_from(raw.max)?;             ┃",
+                "│        ◆ critic, fixed  src/config.rs:42  as u64 wraps   ┃",
+                "│     43  }                                                ┃",
+                "│   ▸ README.md                               +1    -0 +   ┃",
+                "│                                                          │",
+            ]
+        );
+    }
+
+    #[test]
+    fn clicking_a_finding_location_opens_it_in_diff() {
+        let (mut app, _) = app();
+        app.findings = sample_findings();
+        app.diff = vec![("src/lib.rs".into(), 1, 0), ("src/retry.rs".into(), 3, 1)];
+        (app.detail, app.tab) = (false, FINDINGS);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        let rows = screen(&term);
+        let row = rows
+            .iter()
+            .position(|r| r.contains("src/retry.rs:9"))
+            .unwrap();
+        let column = rows[row][..rows[row].find("src/retry.rs:9").unwrap()]
+            .chars()
+            .count();
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column as u16 + 2,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.tab, DIFF);
+        assert!(app.on_diff());
+        assert_eq!(app.diff_file, 1);
+        assert_eq!(app.unfolded, BTreeSet::from([1]));
     }
 
     #[test]
@@ -3325,22 +5003,22 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│   ✓ Reject negative max_delay             ││ Summary ▾                                           │",
-                "│   ○ Validate max_delay at parse time      ││ Reject negative max_delay in the CLI                │",
-                "│ ▌ ○ └ Reject negative max_delay in the …  ││ Proposed · CC-687 · cli, config · after “Validate   │",
-                "│   ○ Bump sqlx to 0.9                      ││ max_delay at parse time”                            │",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│   ✓ Reject negative max_delay      ready  ││ ◉ plan ┄ queue ┄ run ┄ check ┄ review ┄ pr          │",
+                "│   ○ Validate max_delay at…  2 to approve  ││ spend ──────── $0.00/$5.00                          │",
+                "│ ▌ ○ └ Reject negative max_delay in the …  ││ NEXT   a  approve    e  edit                        │",
+                "│   ○ Bump sqlx to 0.9        1 to approve  ││  Summary ▾                                          │",
+                "│                                           ││ Reject negative max_delay in the CLI                │",
+                "│                                           ││ Proposed · CC-687 · cli, config · after “Validate   │",
+                "│                                           ││ max_delay at parse time”                            │",
                 "│                                           ││                                                     │",
                 "│                                           ││ Reuse the config check in the CLI.                  │",
                 "│                                           ││                                                     │",
                 "│                                           ││ Done when                                           │",
                 "│                                           ││ - `yogan --max-delay -1` exits 2                    │",
                 "│                                           ││ - the error names the flag                          │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ○ 3   n new task  j/k move  tab pane  1-6 tabs  a approve  A approve all  e e",
+                " yogan   ● 4    a  approve  A  approve all  e  edit  r  reply to lead  x  discard task  ?  more     ",
             ]
         );
     }
@@ -3370,23 +5048,62 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│   ⠋ Split the ledger job into p… planning ││ Reject a negative max_delay                         │",
-                "│ ▌ ✗ Reject a negative max_delay    failed ││ Failed · CC-687                                     │",
-                "│   ✓ Reject negative max_delay          4m ││                                                     │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││ claude exited with exit status: 1                   │",
-                "│   ⠋ Retry webhook sends     working · 12m ││                                                     │",
-                "│   ○ Split the ledger reconciliation j… 2m ││ Reject a negative max_delay                         │",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│   ✓ Reject negative max_delay   ready  4m ││ Reject a negative max_delay                         │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ Failed · CC-687                                     │",
+                "│ ▌ ✗ Reject a negative max_delay   failed  ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ claude exited with exit status: 1                   │",
+                "│   ⠋ Split the ledger job into p… planning ││                                                     │",
+                "│   ○ Split the ledger reconc… needs a slot ││ Reject a negative max_delay                         │",
                 "│                                           ││ It panics in the retry loop.                        │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  t retry  x discard  ? help  q",
+                " yogan   ● 3    t  retry  x  discard  n  new task  j/k  move  tab  pane  q  quit  ?  more           ",
             ]
         );
         assert!(app.task().is_none());
         app.selected = 2;
         assert_eq!(app.task().unwrap().0.id, "t1");
+    }
+
+    #[test]
+    fn running_rows_show_the_step() {
+        let (mut app, now) = app();
+        let mut stuck = app.tasks[2].clone();
+        stuck.0.id = "t5".into();
+        stuck.0.title = "Cache the rate table".into();
+        app.tasks.insert(3, stuck);
+        let ago = |m: u64| now - Duration::from_secs(m * 60);
+        let call = |tool: &str, target: &str| (tool.to_string(), target.to_string());
+        app.steps = vec![
+            ("t3".into(), call("Edit", "src/retry.rs"), ago(2)),
+            ("t5".into(), call("Bash", "cargo test -p rates"), ago(9)),
+        ];
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ ▌ ✓ Reject negative max_delay   ready  4m ││ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr          │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ─────── │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ NEXT   m  open the PR    r  ask for changes         │",
+                "│       edit src/retry.rs          quiet 2m ││  Summary ▾                                          │",
+                "│   ⠋ Cache the rate table    working · 12m ││ Reject negative max_delay                           │",
+                "│       run cargo test -p rates    quiet 9m ││ Review · u/reject-negative · slot 1 · opus/high     │",
+                "│   ○ Split the ledger reconc… needs a slot ││                                                     │",
+                "│                                           ││ max_delay below zero now fails at parse time.       │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " yogan   ● 2    m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more      ",
+            ]
+        );
+        // past half of the 15m stall_after, the quiet time turns amber
+        let buf = term.backend().buffer();
+        assert_ne!(buf[(36, 4)].fg, theme.amber);
+        assert_eq!(buf[(36, 6)].fg, theme.amber);
     }
 
     #[test]
@@ -3431,12 +5148,12 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ ▌ ✓ How are tasks saved?         answered ││ How are tasks saved?                                │",
-                "│   ✓ Reject negative max_delay          4m ││ Question                                            │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││                                                     │",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│   ✓ Reject negative max_delay   ready  4m ││ How are tasks saved?                                │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ Question                                            │",
+                "│ ▌ ✓ How are tasks saved?        answered  ││                                                     │",
                 "│   ⠋ Retry webhook sends     working · 12m ││ Atomically                                          │",
-                "│   ○ Split the ledger reconciliation j… 2m ││ A tmp file, then a rename:                          │",
+                "│   ○ Split the ledger reconc… needs a slot ││ A tmp file, then a rename:                          │",
                 "│                                           ││   fs::rename(&tmp, &path)                           │",
                 "│                                           ││                                                     │",
                 "│                                           ││ Cites                                               │",
@@ -3444,7 +5161,7 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  r reply  p plan it  y copy  x",
+                " yogan   ● 3    p  plan it  r  reply to lead  y  copy  x  discard  n  new task  j/k  move  ?  more  ",
             ]
         );
 
@@ -3553,15 +5270,25 @@ mod tests {
         let (mut app, _) = app();
         app.findings = sample_findings();
         (app.finding, app.detail, app.tab) = (1, true, FINDINGS);
-        let mut term = Terminal::new(TestBackend::new(60, 22)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 32)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
         assert_eq!(
             screen(&term),
             [
-                "╭ Task ────────────────────────────────────────────────────╮",
-                "│ Findings ▾                                               │",
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued   ",
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│                                                          │",
+                "│ gate    ● 1/1               critic  3 open · 0 fixed     │",
+                "│ slot 1 · opus/high                                       │",
+                "│ spend   ──────── $0.00/$5.00                             │",
+                "│                                                          │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│                                                          │",
+                "│  Summary  Activity  Gate ✓  Findings 3  Diff  Run        │",
+                "│                                                          │",
                 "│ Open                                                     │",
                 "│   ✗ src/config.rs:41 -1 still parses                     │",
                 "│     cargo test negative fails                            │",
@@ -3581,9 +5308,121 @@ mod tests {
                 "│                                                          │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   j/k finding  r uphold",
+                " j/k  finding  r  reply to worker  ?  more                  ",
             ]
         );
+    }
+
+    #[test]
+    fn findings_keys_ignore_focus() {
+        let (mut app, _) = app();
+        app.findings = sample_findings();
+        (app.finding, app.detail, app.tab) = (1, false, FINDINGS);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term)[29],
+            " j/k  finding  r  reply to worker  x  waive finding  o  open  tab  pane  1-6  tabs  ?  more         "
+        );
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.reply_for, Some('x'));
+        assert!(!app.confirm);
+    }
+
+    #[test]
+    fn menu_and_preview_clicks_do_what_they_say() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut send = |app: &mut App, kind, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows.iter().enumerate().find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let x = row[..row.find(text).unwrap()].chars().count();
+            let m = MouseEvent {
+                kind,
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.mouse(m);
+            rows
+        };
+        let left = MouseEventKind::Down(MouseButton::Left);
+
+        // on Findings, the menu's discard opens the confirm, and a double-click doesn't answer it
+        (app.findings, app.tab) = (sample_findings(), FINDINGS);
+        send(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Right),
+            "Reject negative",
+        );
+        send(&mut app, left, "x   discard task");
+        assert!(app.confirm && app.reply_for.is_none());
+        let m = app.last_click.unwrap().0;
+        app.mouse(MouseEvent {
+            kind: left,
+            column: m.x,
+            row: m.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.confirm);
+
+        // the preview's footer is the preview's, even on the Diff tab
+        app.confirm = false;
+        app.tasks[0].0.pr_draft = Some(pr::Draft {
+            title: "feat(config): reject negative max_delay".into(),
+            body: "max_delay below zero now fails at parse time.".into(),
+            head: "abc".into(),
+            problem: None,
+        });
+        (app.preview, app.detail, app.tab) = (true, true, DIFF);
+        let rows = send(&mut app, left, "PR preview");
+        assert!(rows[29].contains("enter  push and open PR"), "{}", rows[29]);
+    }
+
+    #[test]
+    fn diff_hunks_line_up_with_numstat() {
+        let repo = std::env::temp_dir().join(format!("yogan-hunks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        fs::write(repo.join("r.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        fs::write(repo.join("z.txt"), "z\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        // a rename with an edit, a file turned symlink, and an edit after both
+        git(&["mv", "r.txt", "s.txt"]);
+        fs::write(repo.join("s.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        fs::remove_file(repo.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink("z.txt", repo.join("a.txt")).unwrap();
+        fs::write(repo.join("z.txt"), "zz\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "change"]);
+
+        let stat = diffstat(&repo, "HEAD~1");
+        let hunks = hunks(&repo, "HEAD~1");
+        assert_eq!(stat.len(), hunks.len(), "{stat:?}");
+        assert!(stat.iter().all(|(p, ..)| !p.contains("=>")), "{stat:?}");
+        let z = stat.iter().position(|(p, ..)| p == "z.txt").unwrap();
+        assert!(hunks[z].iter().any(|l| l == "+zz"), "{:?}", hunks[z]);
+        fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
@@ -3797,20 +5636,86 @@ mod tests {
                 "│ - adds a check                                           │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   enter push and open P",
+                " yogan   ● 2    enter  push and open PR  g  regenerate  e  e",
             ]
         );
+    }
+
+    #[test]
+    fn markdown_lines() {
+        let theme = Theme::new(false, false);
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let md = markdown("use **fast** mode", &theme);
+        assert_eq!(md.len(), 1);
+        assert_eq!(text(&md[0]), "use fast mode");
+        assert_eq!(md[0].spans[1], Span::raw("fast").bold());
+
+        let md = markdown("run `cargo test` now", &theme);
+        assert_eq!(text(&md[0]), "run cargo test now");
+        assert_eq!(md[0].spans[1], Span::styled("cargo test", theme.shell));
+        assert_eq!(
+            markdown("snake_case_name", &theme),
+            [Line::raw("snake_case_name")]
+        );
+        assert_eq!(
+            markdown("```\n**x** `y` _z_\n```", &theme),
+            [Line::styled("  **x** `y` _z_", theme.shell)]
+        );
+
+        let md = markdown("*it* and __b__ [docs](http://x)", &theme);
+        assert_eq!(text(&md[0]), "it and b docs http://x");
+        assert_eq!(md[0].spans[0], Span::raw("it").italic());
+        assert_eq!(md[0].spans[2], Span::raw("b").bold());
+        assert_eq!(md[0].spans[4], Span::raw("docs").underlined());
+        assert_eq!(md[0].spans[5], Span::raw(" http://x").dim());
+        let md = markdown("see [1] or [docs](u)", &theme);
+        assert_eq!(text(&md[0]), "see [1] or docs u");
+        assert_eq!(md[0].spans[1], Span::raw("docs").underlined());
+
+        let md = markdown("- item\n  - sub\n1. **one**", &theme);
+        let texts: Vec<String> = md.iter().map(text).collect();
+        assert_eq!(texts, ["• item", "  • sub", "1. one"]);
+        let ascii = markdown("- item", &Theme::new(false, true));
+        assert_eq!(text(&ascii[0]), "- item");
+
+        let md = markdown("> quoted\n---", &theme);
+        assert_eq!(text(&md[0]), "│ quoted");
+        assert_eq!(md[0].style, Style::new().dim());
+        assert_eq!(md[1], Line::raw("─".repeat(8)).dim());
+
+        let md = markdown("| a | bb |\n|---|---|\n| ccc | d |", &theme);
+        let texts: Vec<String> = md.iter().map(text).collect();
+        assert_eq!(texts, ["a    bb", "───────", "ccc  d"]);
+        assert_eq!(md[0].style, Style::new().bold());
+        assert_eq!(md[2].style, Style::new());
+
+        assert_eq!(markdown("# Title", &theme), [Line::raw("Title").bold()]);
     }
 
     #[test]
     fn activity_from_stream() {
         let log = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stream.jsonl");
         let calls = activity(&log, Path::new("/tmp/fixture"));
+        let text = "I read `note.txt` (it says \"hello from the fixture\"), but I couldn't create \
+            `out.txt`: the Write tool was denied permission for that path, so you'll need to grant \
+            write access or create the file yourself.";
         assert_eq!(
             calls,
             [
-                ("Read".into(), "note.txt".into()),
-                ("Write".into(), "out.txt".into())
+                Act {
+                    ok: Some(true),
+                    ..act("Read", "note.txt")
+                },
+                Act {
+                    ok: Some(false),
+                    ..act("Write", "out.txt")
+                },
+                act(TEXT, text),
             ]
         );
         let log = std::env::temp_dir().join(format!("yogan-nudge-{}.jsonl", std::process::id()));
@@ -3824,37 +5729,104 @@ mod tests {
         assert_eq!(
             calls,
             [
-                (NUDGE.into(), "stalled for 15m".into()),
-                (HANDOFF.into(), "context at 160000 of 200000 tokens".into())
+                act(NUDGE, "stalled for 15m"),
+                act(HANDOFF, "context at 160000 of 200000 tokens")
             ]
         );
         fs::remove_file(&log).unwrap();
     }
 
     #[test]
+    fn activity_timeline() {
+        let (mut app, now) = verdict_app("running");
+        app.tab = 1;
+        let call = |id: &str, name: &str, input: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{id}","usage":{{}},"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+            )
+        };
+        let result = |id: &str, error: bool, content: &str| {
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":{error},"content":"{content}"}}]}}}}"#
+            )
+        };
+        let text = |t: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"t","usage":{{}},"content":[{{"type":"text","text":"{t}"}}]}}}}"#
+            )
+        };
+        let log = std::env::temp_dir().join(format!("yogan-timeline-{}.jsonl", std::process::id()));
+        let lines = [
+            call(
+                "a",
+                "Edit",
+                r#"{"file_path":"/s/src/retry.rs","old_string":"a\nb","new_string":"a\nb\nc"}"#,
+            ),
+            result("a", false, "ok"),
+            call("b", "Bash", r#"{"command":"cargo test -p webhook"}"#),
+            result("b", true, r"Exit code 101\npanicked"),
+            text(
+                "The backoff test expects 3 attempts and the new cap makes it 2. Updating the test.",
+            ),
+            call("c", "Bash", r#"{"command":"cargo test -p webhook"}"#),
+            result("c", false, "ok"),
+            call("d", "Read", r#"{"file_path":"/s/src/mod.rs"}"#),
+        ];
+        fs::write(&log, lines.join("\n")).unwrap();
+        app.activity = activity(&log, Path::new("/s"));
+        fs::remove_file(&log).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &Theme::new(false, false), 0, now))
+            .unwrap();
+        assert_eq!(
+            screen(&term)[1..18],
+            [
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ ⠋ run ┄ check ┄ review ┄ pr               │",
+                "│                                                          │",
+                "│ context ━━━━━━━─ 85%        quiet   8m                   │",
+                "│ slot 2 · opus                                            │",
+                "│ spend   ━━━───── $1.84/$5.00                             │",
+                "│                                                          │",
+                "│ NEXT  Nothing needed yet.                                │",
+                "│                                                          │",
+                "│  Summary  Activity ⠋  Gate  Findings  Diff  Run          │",
+                "│                                                          │",
+                "│ edit    src/retry.rs                            +3 -2  ✓ │",
+                "│ run     cargo test -p webhook                 ✗ exit 101 │",
+                "│   │ The backoff test expects 3 attempts and the new cap  │",
+                "│   │ makes it 2. Updating the test.                       │",
+                "│ run     cargo test -p webhook                          ✓ │",
+                "│ read    src/mod.rs                                       │",
+            ]
+        );
+    }
+
+    #[test]
     fn main_screen() {
-        let (app, now) = app();
+        let (mut app, now) = app();
+        app.tasks[2].0.slot = Some(2);
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
         assert_eq!(
             screen(&term),
             [
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1                                                                ",
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ Review                                    ││ Summary  Activity  Gate  Findings  Diff  Run        │",
-                "│ ▌ ✓ Reject negative max_delay          4m ││                                                     │",
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued                         slots ▰▰▱   $0.00 ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ ▾ NEEDS YOU 2 ─────────────────────────── ││ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr          │",
+                "│ ▌ ✓ Reject negative max_delay   ready  4m ││                                                     │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ gate    ● 1/1            slot 1 · opus/high         │",
+                "│                                           ││ spend   ──────── $0.00/$5.00                        │",
+                "│ ▾ WORKING 1 ───────────────────────────── ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ NEXT   m  open the PR    r  ask for changes         │",
+                "│                                           ││                                                     │",
+                "│ ▾ LATER 1 ─────────────────────────────── ││  Summary  Activity  Gate ✓  Findings  Diff  Run     │",
+                "│   ○ Split the ledger reconc… needs a slot ││                                                     │",
                 "│                                           ││ Reject negative max_delay                           │",
-                "│ Failed                                    ││ Review · u/reject-negative · slot 1 · opus/high     │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││                                                     │",
+                "│                                           ││ Review · u/reject-negative · slot 1 · opus/high     │",
+                "│                                           ││                                                     │",
                 "│                                           ││ max_delay below zero now fails at parse time.       │",
-                "│ Running                                   ││                                                     │",
-                "│   ⠋ Retry webhook sends     working · 12m ││                                                     │",
-                "│                                           ││                                                     │",
-                "│ Queued                                    ││                                                     │",
-                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
@@ -3863,7 +5835,117 @@ mod tests {
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR  r reply  x discard  ? help  q quit  c ",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_heading_folds_and_a_slot_selects() {
+        let (mut app, now) = app();
+        app.tasks[2].0.slot = Some(2);
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // draws, then clicks cell `nth` of `text`; returns the screen it clicked
+        let mut click = |app: &mut App, text: &str, nth: usize| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(text))
+                .unwrap();
+            let x = row[..row.find(text).unwrap()].chars().count() + nth;
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            });
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            screen(&term)
+        };
+        let rows = click(&mut app, "NEEDS YOU", 0);
+        assert!(rows.iter().any(|r| r.contains("▸ NEEDS YOU 2")));
+        assert!(!rows.iter().any(|r| r.contains("Bump sqlx")));
+        // folding the selection's group moves the selection to a shown row
+        assert!(!app.groups()[0].contains(&app.selected));
+        // k skips the folded group
+        app.selected = 2;
+        app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 2);
+        let rows = click(&mut app, "NEEDS YOU", 0);
+        assert!(rows.iter().any(|r| r.contains("Bump sqlx")));
+
+        // the second slot holds the running task
+        click(&mut app, "slots ▰▰▱", 7);
+        assert_eq!(app.task().unwrap().0.id, "t3");
+        click(&mut app, "slots ▰▰▱", 6);
+        assert_eq!(app.task().unwrap().0.id, "t1");
+    }
+
+    #[test]
+    fn next_for_you_wraps_within_needs_you() {
+        let (mut app, _) = app();
+        let next = |app: &mut App| {
+            app.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+            app.selected
+        };
+        // t1 and t2 need you; t3 is working and t4 is queued
+        app.selected = 2;
+        assert_eq!(next(&mut app), 0);
+        assert_eq!(next(&mut app), 1);
+        assert_eq!(next(&mut app), 0);
+    }
+
+    #[test]
+    fn footer_fits_at_80_and_100_columns() {
+        let footer = |app: &App, now, w| {
+            let mut term = Terminal::new(TestBackend::new(w, 24)).unwrap();
+            let theme = Theme::new(false, false);
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            screen(&term).pop().unwrap()
+        };
+        let (mut app, now) = app();
+        let mut states = Vec::new();
+        states.push(("review", footer(&app, now, 80), footer(&app, now, 100)));
+        app.selected = 1;
+        states.push(("failed", footer(&app, now, 80), footer(&app, now, 100)));
+        app.tasks[1].0.status = Status::Proposed;
+        states.push(("proposed", footer(&app, now, 80), footer(&app, now, 100)));
+        app.requests = vec![Request {
+            id: "r5".into(),
+            text: "How are tasks saved?".into(),
+            mode: Mode::Ask,
+            status: Phase::Done,
+            ..Default::default()
+        }];
+        app.selected = 0;
+        states.push(("question", footer(&app, now, 80), footer(&app, now, 100)));
+        // six keys at most, then ? more; at 80 columns the lowest-priority key gives way
+        assert_eq!(
+            states,
+            [
+                (
+                    "review",
+                    " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more ".into(),
+                    " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ".into(),
+                ),
+                (
+                    "failed",
+                    " t  retry  c  continue  x  discard task  n  new task  1-6  tabs  ?  more        ".into(),
+                    " t  retry  c  continue  x  discard task  n  new task  1-6  tabs  j/k  move  ?  more                 ".into(),
+                ),
+                (
+                    "proposed",
+                    " a  approve  A  approve all  e  edit  r  reply to lead  ?  more                 ".into(),
+                    " a  approve  A  approve all  e  edit  r  reply to lead  x  discard task  n  new task  ?  more       ".into(),
+                ),
+                (
+                    "question",
+                    " p  plan it  r  reply to lead  y  copy  x  discard  n  new task  ?  more        ".into(),
+                    " p  plan it  r  reply to lead  y  copy  x  discard  n  new task  j/k  move  ?  more                 ".into(),
+                ),
             ]
         );
     }
@@ -3873,8 +5955,8 @@ mod tests {
         let (mut app, now) = app();
         app.tab = 1;
         app.activity = vec![
-            ("Read".into(), "src/config.rs".into()),
-            ("Bash".into(), "cargo test -p ledger".into()),
+            act("Read", "src/config.rs"),
+            act("Bash", "cargo test -p ledger"),
         ];
         let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
         let theme = Theme::new(false, false);
@@ -3882,18 +5964,18 @@ mod tests {
         assert_eq!(
             screen(&term),
             [
-                "╭ Tasks ────────────────────────────────────╮╭ Task ───────────────────────────────────────────────╮",
-                "│ ▌ ✓ Reject negative max_delay          4m ││ Activity ▾                                          │",
-                "│   ✗ Bump sqlx to 0.9                   1h ││ read    src/config.rs                               │",
-                "│   ⠋ Retry webhook sends     working · 12m ││ run     cargo test -p ledger                        │",
-                "│   ○ Split the ledger reconciliation j… 2m ││                                                     │",
-                "│                                           ││                                                     │",
-                "│                                           ││                                                     │",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ ▌ ✓ Reject negative max_delay   ready  4m ││ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr          │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ─────── │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ NEXT   m  open the PR    r  ask for changes         │",
+                "│   ○ Split the ledger reconc… needs a slot ││  Activity ▾                                         │",
+                "│                                           ││ read    src/config.rs                               │",
+                "│                                           ││ run     cargo test -p ledger                        │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  ✓ 1  ✗ 1  ⠋ 1  ○ 1   n new task  j/k move  tab pane  1-6 tabs  d diff  m open PR  ",
+                " yogan   ● 2    m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  ?  more      ",
             ]
         );
 
@@ -3915,6 +5997,541 @@ mod tests {
     }
 
     #[test]
+    fn a_click_is_a_key() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // draws, then clicks the first cell of `text`
+        let mut click = |app: &mut App, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows.iter().enumerate().find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let x = row[..row.find(text).unwrap()].chars().count();
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert!(click(&mut app, "Gate ✓"));
+        assert_eq!(app.tab, 2);
+
+        // a footer key opens the confirm; its esc button keeps the task, its y button dismisses
+        let state = std::env::temp_dir().join(format!("yogan-click-{}", std::process::id()));
+        let failed = Request {
+            id: "r2".into(),
+            text: "Reject a negative max_delay".into(),
+            status: Phase::Failed,
+            ..Default::default()
+        };
+        failed.save(&state).unwrap();
+        app.state = state.clone();
+        app.reload(&state).unwrap();
+        app.selected = 0;
+        assert!(click(&mut app, " x  discard") && app.confirm);
+        assert!(click(&mut app, " esc  Keep it") && !app.confirm);
+        assert!(click(&mut app, " x  discard") && app.confirm);
+        assert!(click(&mut app, " y  Dismiss") && !app.confirm && app.notice.is_none());
+        assert_eq!(lead::load(&state, "r2").unwrap().status, Phase::Dismissed);
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    /// The selected task's states for the verdict: a ready Review, a failed gate, a Proposed
+    /// task and a Running one past `handoff_at`.
+    fn verdict_app(state: &str) -> (App, SystemTime) {
+        let (mut app, now) = app();
+        let check = |name: &str, passed| Check {
+            name: name.into(),
+            passed,
+        };
+        app.detail = true;
+        match state {
+            "review" => {
+                let t = &mut app.tasks[0].0;
+                let names = ["fmt", "clippy", "test", "doc", "sqlx", "deny"];
+                t.gate = Some(names.iter().map(|n| check(n, true)).collect());
+                t.usage = [("s1".into(), 1.2)].into();
+                app.findings = Findings {
+                    fixed: sample_findings().findings,
+                    ..Default::default()
+                };
+                app.diff = vec![
+                    ("src/config/retry.rs".into(), 31, 4),
+                    ("tests/config.rs".into(), 9, 2),
+                    ("CHANGELOG.md".into(), 2, 1),
+                ];
+            }
+            "failed" => {
+                app.selected = 1;
+                let t = &mut app.tasks[1].0;
+                t.gate = Some(vec![check("fmt", true), check("clippy", true), {
+                    check("test", false)
+                }]);
+                t.model = Some("sonnet".into());
+                t.usage = [("s1".into(), 2.1)].into();
+            }
+            "proposed" => {
+                app.selected = 1;
+                app.tasks[1].0.status = Status::Proposed;
+                app.tasks[1].0.model = Some("opus".into());
+            }
+            _ => {
+                app.selected = 2;
+                let t = &mut app.tasks[2].0;
+                (t.slot, t.model) = (Some(2), Some("opus".into()));
+                t.usage = [("s1".into(), 1.84)].into();
+                app.context = Some(170_000);
+                let call = ("Bash".into(), "cargo test".into());
+                app.steps = vec![("t3".into(), call, now - Duration::from_secs(8 * 60))];
+            }
+        }
+        (app, now)
+    }
+
+    /// The detail pane's top rows, without the header line the list's tickets change.
+    fn verdict_screen(app: &App, now: SystemTime, height: u16, theme: &Theme) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(60, height)).unwrap();
+        term.draw(|f| draw(f, app, theme, 0, now)).unwrap();
+        let skip = usize::from(height >= COMPACT);
+        screen(&term)[skip..skip + 11].to_vec()
+    }
+
+    #[test]
+    fn verdict_and_next() {
+        let theme = Theme::new(false, false);
+        let shots: Vec<_> = ["review", "failed", "proposed", "running"]
+            .into_iter()
+            .map(|s| {
+                let (app, now) = verdict_app(s);
+                (s, verdict_screen(&app, now, 24, &theme))
+            })
+            .collect();
+        let shots: Vec<(&str, Vec<&str>)> = (shots.iter())
+            .map(|(s, rows)| (*s, rows.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(
+            shots,
+            [
+                (
+                    "review",
+                    vec![
+                        "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                        "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                        "│                                                          │",
+                        "│ gate    ●●●●●● 6/6          critic  0 open · 1 fixed     │",
+                        "│ change  +42 -7 · 3 files    slot 1 · opus/high           │",
+                        "│ spend   ━━────── $1.20/$5.00                             │",
+                        "│                                                          │",
+                        "│ NEXT   m  open the PR    r  ask for changes              │",
+                        "│                                                          │",
+                        "│  Summary  Activity  Gate ✓  Findings  Diff  Run          │",
+                        "│                                                          │",
+                    ]
+                ),
+                (
+                    "failed",
+                    vec![
+                        "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                        "│ plan ━ queue ━ run ━ ✗ check ┄ review ┄ pr               │",
+                        "│                                                          │",
+                        "│ gate    ●●✗ 2/3             sonnet                       │",
+                        "│ spend   ━━━───── $2.10/$5.00                             │",
+                        "│                                                          │",
+                        "│ NEXT   t  retry    c  continue                           │",
+                        "│                                                          │",
+                        "│  Summary  Activity  Gate ✗  Findings  Diff  Run          │",
+                        "│                                                          │",
+                        "│ Bump sqlx to 0.9                                         │",
+                    ]
+                ),
+                (
+                    "proposed",
+                    vec![
+                        "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                        "│ ◉ plan ┄ queue ┄ run ┄ check ┄ review ┄ pr               │",
+                        "│                                                          │",
+                        "│ opus                                                     │",
+                        "│ spend   ──────── $0.00/$5.00                             │",
+                        "│                                                          │",
+                        "│ NEXT   a  approve    e  edit                             │",
+                        "│                                                          │",
+                        "│  Summary  Activity  Gate  Findings  Diff  Run            │",
+                        "│                                                          │",
+                        "│ Bump sqlx to 0.9                                         │",
+                    ]
+                ),
+                (
+                    "running",
+                    vec![
+                        "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                        "│ plan ━ queue ━ ⠋ run ┄ check ┄ review ┄ pr               │",
+                        "│                                                          │",
+                        "│ context ━━━━━━━─ 85%        quiet   8m                   │",
+                        "│ slot 2 · opus                                            │",
+                        "│ spend   ━━━───── $1.84/$5.00                             │",
+                        "│                                                          │",
+                        "│ NEXT  Nothing needed yet.                                │",
+                        "│                                                          │",
+                        "│  Summary  Activity ⠋  Gate  Findings  Diff  Run          │",
+                        "│                                                          │",
+                    ]
+                ),
+            ]
+        );
+        // compact and ASCII: one verdict line, only the active pill
+        let (app, now) = verdict_app("failed");
+        assert_eq!(
+            verdict_screen(&app, now, 12, &Theme::new(false, true))[..6],
+            [
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan = queue = run = x check - review - pr               │",
+                "│ gate **x 2/3  ·  sonnet  ·  spend ===----- $2.10/$5.00   │",
+                "│ NEXT   t  retry    c  continue                           │",
+                "│  Summary ▾                                               │",
+                "│ Bump sqlx to 0.9                                         │",
+            ]
+        );
+    }
+
+    #[test]
+    fn right_click_opens_the_actions_menu() {
+        let theme = Theme::new(false, false);
+        let failed = || {
+            let (mut app, now) = app();
+            app.tasks[1].0.slot = Some(2);
+            (app, now)
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // draws, then sends `kind` at the first cell of `text`
+        let mut send = |app: &mut App, now, kind, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows.iter().enumerate().find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let x = row[..row.find(text).unwrap()].chars().count();
+            let m = MouseEvent {
+                kind,
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            };
+            (app.mouse(m), rows)
+        };
+        let right = MouseEventKind::Down(MouseButton::Right);
+        let left = MouseEventKind::Down(MouseButton::Left);
+        let (mut app, now) = failed();
+        send(&mut app, now, right, "Bump sqlx");
+        assert_eq!((app.selected, app.menu.is_some()), (1, true));
+
+        // the menu over the Failed task, then a click on `t` does what pressing it does
+        let (_, rows) = send(&mut app, now, left, "t   retry");
+        assert_eq!(
+            rows[4..15],
+            [
+                "│ ▌ ✗ Bump sqlx to 0.9           failed  1h ││ slot 2                                              │",
+                "│      ╭ Bump sqlx to 0.9 ────────╮         ││ spend   ──────── $0.00/$5.00                        │",
+                "│ ▾ WOR│ t   retry                │──────── ││                                                     │",
+                "│   ⠋ R│ c   continue             │ng · 12m ││ NEXT   t  retry    c  continue                      │",
+                "│      │ x   discard task         │         ││                                                     │",
+                "│ ▾ LAT│ d   diff                 │──────── ││  Summary  Activity  Gate  Findings  Diff  Run       │",
+                "│   ○ S│ o   open                 │s a slot ││                                                     │",
+                "│      │ ──────────────────────── │         ││ Bump sqlx to 0.9                                    │",
+                "│      │ z   zoom                 │         ││ Failed · slot 2                                     │",
+                "│      │ ]   next for you         │         ││                                                     │",
+                "│      ╰──────────────────────────╯         ││                                                     │",
+            ]
+        );
+        let (mut pressed, _) = failed();
+        pressed.selected = 1;
+        pressed.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.reply_for, pressed.reply_for);
+        assert_eq!((app.reply_for, app.menu), (Some('t'), None));
+
+        // another key closes it and acts; a click outside only closes it
+        let (mut app, now) = failed();
+        send(&mut app, now, right, "Bump sqlx");
+        app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!((app.menu, app.tab), (None, 2));
+        send(&mut app, now, right, "Bump sqlx");
+        send(&mut app, now, left, "NEXT");
+        assert_eq!((app.menu, app.reply_for, app.selected), (None, None, 1));
+    }
+
+    #[test]
+    fn clicking_next_is_its_key() {
+        let theme = Theme::new(false, false);
+        // draws, then clicks the first cell of `text` above the footer
+        let click = |app: &mut App, now, text: &str| {
+            let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(&term);
+            let hit = rows[..23]
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(text));
+            let (y, row) = hit.unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"));
+            let x = row[..row.find(text).unwrap()].chars().count();
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let press = |app: &mut App, c| app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        for (state, key, button) in [("failed", 't', " t  retry"), ("proposed", 'e', " e  edit")] {
+            let (mut pressed, _) = verdict_app(state);
+            press(&mut pressed, key);
+            let (mut clicked, now) = verdict_app(state);
+            assert!(click(&mut clicked, now, button));
+            assert_eq!(
+                (clicked.reply_for, clicked.edit),
+                (pressed.reply_for, pressed.edit)
+            );
+            assert!(clicked.reply_for == Some('t') || clicked.edit, "{state}");
+        }
+
+        // the wheel over the tab pills cycles the tabs
+        let (mut app, now) = verdict_app("review");
+        click(&mut app, now, " Summary ");
+        let y = app.hits.borrow().tabs.y;
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 30,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.tab, RUN);
+    }
+
+    #[test]
+    fn hover_shows_the_key() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let at = |term: &Terminal<TestBackend>, text: &str| {
+            let rows = screen(term);
+            let (y, row) = rows
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.contains(text))
+                .unwrap();
+            Position::new(
+                row[..row.find(text).unwrap()].chars().count() as u16,
+                y as u16,
+            )
+        };
+        let border = |term: &Terminal<TestBackend>| screen(term)[22].clone();
+
+        // a move over a tab sets the hint, one within it changes nothing, empty space clears it
+        let gate = at(&term, "Gate ✓  Findings");
+        assert!(app.hover(gate));
+        assert!(!app.hover(Position {
+            x: gate.x + 1,
+            ..gate
+        }));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(border(&term).ends_with("─ 3 · Gate ╯"), "{}", border(&term));
+        assert!(app.hover(Position::new(70, 8)));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(!border(&term).contains('·'));
+
+        // a footer key: tinted, and named in the bottom border above it
+        let m = at(&term, " m  open PR");
+        assert!(app.hover(m));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued                         slots ▰▱▱   $0.00 ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ ▾ NEEDS YOU 2 ─────────────────────────── ││ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr          │",
+                "│ ▌ ✓ Reject negative max_delay   ready  4m ││                                                     │",
+                "│   ✗ Bump sqlx to 0.9           failed  1h ││ gate    ● 1/1            slot 1 · opus/high         │",
+                "│                                           ││ spend   ──────── $0.00/$5.00                        │",
+                "│ ▾ WORKING 1 ───────────────────────────── ││                                                     │",
+                "│   ⠋ Retry webhook sends     working · 12m ││ NEXT   m  open the PR    r  ask for changes         │",
+                "│                                           ││                                                     │",
+                "│ ▾ LATER 1 ─────────────────────────────── ││  Summary  Activity  Gate ✓  Findings  Diff  Run     │",
+                "│   ○ Split the ledger reconc… needs a slot ││                                                     │",
+                "│                                           ││ Reject negative max_delay                           │",
+                "│                                           ││ Review · u/reject-negative · slot 1 · opus/high     │",
+                "│                                           ││                                                     │",
+                "│                                           ││ max_delay below zero now fails at parse time.       │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰──────────────────────────────────────── m · open PR ╯",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+            ]
+        );
+        let buf = term.backend().buffer();
+        assert_eq!(buf[m].bg, theme.hover);
+        assert_eq!(buf[(m.x + 11, m.y)].bg, theme.hover);
+        assert_ne!(buf[(m.x + 12, m.y)].bg, theme.hover);
+    }
+
+    #[test]
+    fn hovering_a_slot_names_its_task() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let header = &screen(&term)[0];
+        let x = header[..header.find("slots ▰▱▱").unwrap()].chars().count() as u16 + 6;
+        let border = |term: &Terminal<TestBackend>| screen(term)[22].clone();
+
+        assert!(app.hover(Position::new(x, 0)));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(
+            border(&term).contains(" slot 1 · Reject negative max_delay "),
+            "{}",
+            border(&term)
+        );
+
+        assert!(app.hover(Position::new(x + 1, 0)));
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert!(
+            border(&term).contains(" slot 2 · free "),
+            "{}",
+            border(&term)
+        );
+    }
+
+    #[test]
+    fn double_click_zooms() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let row = screen(&term)
+            .iter()
+            .position(|r| r.contains("Bump sqlx"))
+            .unwrap() as u16;
+        let press = |app: &mut App, code| app.key(KeyEvent::new(code, KeyModifiers::NONE));
+        let down = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(down(5, row));
+        assert!(!app.zoom);
+        app.mouse(down(6, row)); // another cell: still one click each
+        assert!(!app.zoom);
+        app.mouse(down(6, row));
+        assert!(app.zoom && app.selected == 1);
+
+        // ←/→ cycle the tabs, wrapping
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.tab, 5);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.tab, 0);
+        app.selected = 0;
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued                         slots ▰▱▱   $0.00 ",
+                "╭ Task ──────────────────────────────────────────────────────────────────────────────── esc unzoom ╮",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr                                                       │",
+                "│                                                                                                  │",
+                "│ gate    ● 1/1                                   slot 1 · opus/high                               │",
+                "│ spend   ──────── $0.00/$5.00                                                                     │",
+                "│                                                                                                  │",
+                "│ NEXT   m  open the PR    r  ask for changes                                                      │",
+                "│                                                                                                  │",
+                "│  Summary  Activity  Gate ✓  Findings  Diff  Run                                                  │",
+                "│                                                                                                  │",
+                "│ Reject negative max_delay                                                                        │",
+                "│ Review · u/reject-negative · slot 1 · opus/high                                                  │",
+                "│                                                                                                  │",
+                "│ max_delay below zero now fails at parse time.                                                    │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "│                                                                                                  │",
+                "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+            ]
+        );
+        // the border label unzooms; z zooms again and esc goes back
+        let label = screen(&term)[1].find("esc unzoom").unwrap();
+        app.mouse(down(screen(&term)[1][..label].chars().count() as u16, 1));
+        assert!(!app.zoom);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.zoom);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.zoom);
+    }
+
+    #[test]
+    fn toasts() {
+        let (mut app, now) = app();
+        app.info = Some("copied the answer".into());
+        app.notice = Some("this task has no worktree".into());
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        let rows = screen(&term);
+        assert_eq!(
+            rows[16..],
+            [
+                "│                                           ││                               ╭───────────────────╮ │",
+                "│                                           ││                               │ copied the answer │ │",
+                "│                                           ││                               ╰───────────────────╯ │",
+                "│                                           ││                       ╭───────────────────────────╮ │",
+                "│                                           ││                       │ this task has no worktree │ │",
+                "│                                           ││                       ╰───────────────────────────╯ │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " m  open PR  r  reply to worker  d  diff  x  discard task  c  continue  w  rewind  ?  more          ",
+            ]
+        );
+
+        // info fades after 4 s, an error stays until esc
+        let t0 = Instant::now();
+        app.expire(t0);
+        app.expire(t0 + Duration::from_millis(3900));
+        assert!(app.info.is_some());
+        app.expire(t0 + Duration::from_secs(4));
+        assert!(app.info.is_none() && app.notice.is_some());
+        assert!(app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+        assert!(app.notice.is_some());
+        assert!(app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.notice.is_none());
+
+        // a click on a toast dismisses it
+        let click = |app: &mut App, term: &mut Terminal<TestBackend>, text: &str| {
+            term.draw(|f| draw(f, app, &theme, 0, now)).unwrap();
+            let rows = screen(term);
+            let y = rows.iter().position(|r| r.contains(text)).unwrap();
+            let x = rows[y][..rows[y].find(text).unwrap()].chars().count();
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        app.info = Some("retrying".into());
+        click(&mut app, &mut term, "retrying");
+        assert!(app.info.is_none());
+        app.notice = Some("the worker made no commits".into());
+        click(&mut app, &mut term, "the worker made");
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
     fn narrow_ascii_one_pane() {
         let (mut app, now) = app();
         app.selected = 2;
@@ -3925,13 +6542,161 @@ mod tests {
             screen(&term),
             [
                 "╭ Tasks ───────────────────────────────────────────────────╮",
-                "│   + Reject negative max_delay                         4m │",
-                "│   x Bump sqlx to 0.9                                  1h │",
+                "│   + Reject negative max_delay                 [ready] 4m │",
+                "│   x Bump sqlx to 0.9                         [failed] 1h │",
                 "│ > / Retry webhook sends                    working · 12m │",
-                "│   o Split the ledger reconciliation job into per-acc~ 2m │",
+                "│   o Split the ledger reconciliation job in~ needs a slot │",
                 "│                                                          │",
                 "╰──────────────────────────────────────────────────────────╯",
-                " yogan · fuse-os  + 1  x 1  | 1  o 1   n new task  j/k move ",
+                " yogan  [* 2]   x  discard task  n  new task  ?  more       ",
+            ]
+        );
+    }
+
+    #[test]
+    fn dragging_the_divider() {
+        let (mut app, now) = app();
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let border = |term: &Terminal<TestBackend>| {
+            let row: Vec<char> = screen(term)[1].chars().collect();
+            row.windows(2).position(|w| w == ['╮', '╭']).unwrap()
+        };
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(border(&term), 44);
+
+        // the detail pane's left border grabs; drags move the list's right border to the cursor
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 45));
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 59));
+        assert_eq!(app.split, 60);
+        term.draw(|f| draw(f, &app, &theme, 0, now)).unwrap();
+        assert_eq!(border(&term), 59);
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2));
+        assert_eq!(app.split, 30);
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 110));
+        assert_eq!(app.split, 70);
+
+        // once released, a drag elsewhere leaves it be
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 110));
+        app.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 50));
+        assert_eq!(app.split, 70);
+    }
+
+    #[test]
+    fn activity_scrollbar() {
+        let (mut app, _) = app();
+        app.activity = (1..=20).map(|i| act("Read", &format!("f{i}.rs"))).collect();
+        app.detail = true;
+        app.tab = 1;
+        let theme = Theme::new(false, false);
+        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                "╭ Task ──────────────────────────────────────────── z zoom ╮",
+                "│ plan ━ queue ━ run ━ check ━ ◉ review ┄ pr               │",
+                "│ gate ● 1/1  ·  slot 1 · opus/high  ·  spend ──────── $0. │",
+                "│ NEXT   m  open the PR    r  ask for changes              │",
+                "│  Activity ▾                                              │",
+                "│ read    f14.rs                                           │",
+                "│ read    f15.rs                                           │",
+                "│ read    f16.rs                                           │",
+                "│ read    f17.rs                                           │",
+                "│ read    f18.rs                                           │",
+                "│ read    f19.rs                                           ┃",
+                "│ read    f20.rs                                           ┃",
+                "╰──────────────────────────────────────────────────────────╯",
+                " yogan   ● 2    m  open PR  r  reply to worker  ?  more     ",
+            ]
+        );
+
+        // clicking the scrollbar's top jumps to the oldest calls
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 59,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.scroll.get(), 13);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert!(screen(&term)[5].contains("f1.rs"));
+    }
+
+    #[test]
+    fn palette_filters_and_runs_the_selected_row() {
+        let (mut app, _) = app();
+        app.tasks[1].0.status = Status::Proposed;
+        app.selected = 1;
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.key(KeyEvent::from(KeyCode::Char(c)));
+            }
+        };
+        typed(&mut app, "?appr");
+        let labels = |app: &App| app.commands().into_iter().map(|c| c.1).collect::<Vec<_>>();
+        assert_eq!(labels(&app), ["approve", "approve all"]);
+        // `e edit` comes first among the rows `ed` keeps; enter runs it and closes the palette
+        app.key(KeyEvent::from(KeyCode::Esc));
+        typed(&mut app, ":ed");
+        assert_eq!(labels(&app)[0], "edit");
+        app.key(KeyEvent::from(KeyCode::Down));
+        app.key(KeyEvent::from(KeyCode::Up));
+        app.key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.edit && app.palette.is_none());
+        // a `Go to` row selects its task
+        typed(&mut app, "?go bump");
+        app.key(KeyEvent::from(KeyCode::Backspace));
+        typed(&mut app, "p");
+        app.key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!((app.selected, app.palette.is_none()), (1, true));
+    }
+
+    #[test]
+    fn palette_snapshot() {
+        let (mut app, _) = app();
+        app.tasks[1].0.status = Status::Proposed;
+        app.selected = 1;
+        app.palette = Some(("appr".into(), 0));
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let theme = Theme::new(false, false);
+        term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(
+            screen(&term),
+            [
+                " yogan · fuse-os   ● 2 need you   ⠋ 1 working  ○ 1 queued                         slots ▰▱▱   $0.00 ",
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ ▾ NEEDS YOU 2 ─────────────────────────── ││ ◉ plan ┄ queue ┄ run ┄ check ┄ review ┄ pr          │",
+                "│   ✓ Reject negative max_delay      ready  ││                                                     │",
+                "│ ▌ ○ Bump sqlx to 0.9        1 to approve  ││ spend   ──────── $0.00/$5.00                        │",
+                "│                                           ││                                                     │",
+                "│ ▾ WORKING 1 ───────────────────────────── ││ NEXT   a  approve    e  edit                        │",
+                "│   ⠋ Retry webhook sends        working ·  ││                                                     │",
+                "│                                           ││  Summary  Activity  Gate  Findings  Diff  Run       │",
+                "│ ▾ LATER 1 ────╭ Commands ────────────────────────────────────────────────────────╮               │",
+                "│   ○ Split the │ › appr▏                              type to filter · ↑↓ · enter │               │",
+                "│               │ ──────────────────────────────────────────────────────────────── │               │",
+                "│               │ ▌ a    approve                                  Bump sqlx to 0.9 │               │",
+                "│               │   A    approve all                              Bump sqlx to 0.9 │               │",
+                "│               ╰──────────────────────────────────────────────────────────────────╯               │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "│                                           ││                                                     │",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " a  approve  A  approve all  e  edit  r  reply to lead  x  discard task  n  new task  ?  more       ",
             ]
         );
     }

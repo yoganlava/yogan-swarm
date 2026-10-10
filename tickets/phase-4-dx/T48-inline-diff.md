@@ -1,4 +1,4 @@
-- [ ] **T48 Inline diff with findings at their lines**
+- [x] **T48 Inline diff with findings at their lines**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Screens › C.
 

@@ -67,7 +67,8 @@ pub fn state_dir(checkout: &Path) -> Result<PathBuf> {
 impl Task {
     /// USD spent across the task's sessions.
     pub fn spent(&self) -> f64 {
-        self.usage.values().sum()
+        // from 0.0, since an empty f64 `sum` is -0.0, which formats as `-0.00`
+        self.usage.values().fold(0.0, |a, b| a + b)
     }
 
     /// Writes `tasks/<id>.toml` atomically.

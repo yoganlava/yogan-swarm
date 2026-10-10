@@ -1,4 +1,4 @@
-- [ ] **T46 Zoom**
+- [x] **T46 Zoom**
 
 Plan: [yogan TUI north star v2](https://claude.ai/artifact/PcPzsUATxe58br5igsDb3Z) › Screens › B, C; Mouse map.
 
