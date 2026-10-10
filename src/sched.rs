@@ -46,7 +46,7 @@ pub(crate) fn now() -> u64 {
     since.map_or(0, |d| d.as_secs())
 }
 
-/// `Approved` tasks whose parent, if any, has its PR open, as many as the limits leave room for.
+/// `Approved` tasks whose parent, if any, has its PR open or is merged, as many as the limits leave room for.
 fn ready(tasks: &[Task], concurrency: u32, slots: u32) -> Vec<Task> {
     let running = |t: &Task| matches!(t.status, Status::Running | Status::Checking);
     let busy = tasks.iter().filter(|t| running(t)).count();
@@ -61,7 +61,7 @@ fn ready(tasks: &[Task], concurrency: u32, slots: u32) -> Vec<Task> {
         None => true,
         Some(p) => tasks
             .iter()
-            .any(|o| &o.id == p && o.status == Status::PrOpen),
+            .any(|o| &o.id == p && matches!(o.status, Status::PrOpen | Status::Merged)),
     };
     let mut ready: Vec<Task> = tasks
         .iter()
@@ -109,6 +109,9 @@ mod tests {
         assert_eq!(ids(ready(&tasks, 1, 5)), ["a"]);
         tasks[4].status = Status::PrOpen;
         assert_eq!(ids(ready(&tasks, 4, 5)), ["a", "b", "c"]);
+        tasks[4].status = Status::Merged;
+        assert_eq!(ids(ready(&tasks, 4, 5)), ["a", "b", "c"]);
+        tasks[4].status = Status::PrOpen;
 
         // running and checking tasks use up concurrency, and their slots
         tasks.push(task("r", Status::Running));

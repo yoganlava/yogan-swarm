@@ -18,6 +18,7 @@ pub enum Status {
     Checking,
     Review,
     PrOpen,
+    Merged,
     Failed,
     Discarded,
 }
@@ -110,9 +111,10 @@ pub(crate) fn read_toml_dir<T: DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
 }
 
 /// What `t` branches from, rebases onto and targets with its PR: its parent's pushed branch,
-/// else `origin/main`.
+/// else `origin/main`, as when the parent is merged.
 pub fn base<'a>(t: &Task, mut tasks: impl Iterator<Item = &'a Task>) -> String {
     let parent = t.parent.as_ref().and_then(|p| tasks.find(|o| &o.id == p));
+    let parent = parent.filter(|p| p.status != Status::Merged);
     parent.map_or("origin/main".into(), |p| format!("origin/{}", p.branch))
 }
 
@@ -254,9 +256,12 @@ mod tests {
             parent: Some("t1".into()),
             ..Default::default()
         };
-        let tasks = [parent.clone(), child.clone()];
+        let mut tasks = [parent.clone(), child.clone()];
         assert_eq!(base(&child, tasks.iter()), "origin/u/parent");
         assert_eq!(base(&parent, tasks.iter()), "origin/main");
+        // a merged parent's work is on main
+        tasks[0].status = Status::Merged;
+        assert_eq!(base(&child, tasks.iter()), "origin/main");
     }
 
     #[test]

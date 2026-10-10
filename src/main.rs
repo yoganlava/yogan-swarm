@@ -25,6 +25,9 @@ enum Command {
         /// Resume the task's session with this, then run the gate and critic again
         #[arg(long, conflicts_with = "pr", allow_hyphen_values = true)]
         reply: Option<String>,
+        /// Rebase the task in Review, re-gate if it moved, and push it to main
+        #[arg(long, conflicts_with_all = ["pr", "reply"])]
+        merge: bool,
     },
     /// Run one request's lead session (internal, spawned detached)
     Lead {
@@ -72,10 +75,11 @@ fn main() -> anyhow::Result<()> {
             pr,
             instruction,
             reply,
+            merge,
         }) => {
             let pr = pr.then(|| instruction.unwrap_or_default());
             let dir = std::env::current_dir()?;
-            yogan_swarm::worker::run(&dir, &id, pr.as_deref(), reply.as_deref())
+            yogan_swarm::worker::run(&dir, &id, pr.as_deref(), reply.as_deref(), merge)
         }
         Some(Command::Lead { id, reply }) => {
             yogan_swarm::lead::run(&std::env::current_dir()?, &id, reply.as_deref())
