@@ -1070,17 +1070,23 @@ impl App {
             .filter(|(t, _)| t.slot.is_some() && slot::running(state, &t.id).is_some())
             .map(|(t, _)| t.id.clone())
             .collect();
-        self.steps = (self.tasks.iter())
+        let step = |id: &String, dir: PathBuf| {
+            let log = state.join(format!("logs/{id}.jsonl"));
+            let quiet = fs::metadata(&log).and_then(|m| m.modified()).ok()?;
+            let call = activity(&log, &dir).into_iter().rfind(|a| a.tool != TEXT)?;
+            Some((id.clone(), (call.tool, call.target), quiet))
+        };
+        let tasks = (self.tasks.iter())
             .filter(|(t, _)| t.status == Status::Running)
             .filter_map(|(t, _)| {
-                let log = state.join(format!("logs/{}.jsonl", t.id));
-                let quiet = fs::metadata(&log).and_then(|m| m.modified()).ok()?;
                 let slot = t.slot.map(|n| state.join("slots").join(n.to_string()));
-                let acts = activity(&log, &slot.unwrap_or_default());
-                let call = acts.into_iter().rfind(|a| a.tool != TEXT)?;
-                Some((t.id.clone(), (call.tool, call.target), quiet))
-            })
-            .collect();
+                step(&t.id, slot.unwrap_or_default())
+            });
+        // a lead works in the repo
+        let leads = (self.requests.iter())
+            .filter(|r| r.status == Phase::Planning)
+            .filter_map(|r| step(&r.id, self.repo.clone()));
+        self.steps = tasks.chain(leads).collect();
         Ok(())
     }
 
@@ -1499,9 +1505,11 @@ impl App {
 
 impl App {
     /// Scrolls the detail pane a step toward the end of its text (`down`) or back; Activity and
-    /// the Gate output count from their tail, so down there means newer.
+    /// the Gate output and a planning request's lead count from their tail, so down there means
+    /// newer.
     fn scroll_by(&mut self, down: bool) {
-        let tail = self.task().is_some() && matches!(self.tab, 1 | 2 | RUN);
+        let planning = self.request().is_some_and(|r| r.status == Phase::Planning);
+        let tail = planning || self.task().is_some() && matches!(self.tab, 1 | 2 | RUN);
         let s = self.scroll.get();
         self.scroll.set(match down != tail {
             true => s.saturating_add(SCROLL),
@@ -1526,6 +1534,10 @@ impl App {
             let text = fs::read_to_string(lead::answer_path(&self.state, &id)).unwrap_or_default();
             let cited = cites(&self.repo, &text);
             self.answer = Some((id, text, cited));
+        }
+        if let Some(r) = self.request().filter(|r| r.status == Phase::Planning) {
+            let log = self.state.join(format!("logs/{}.jsonl", r.id));
+            self.activity = activity(&log, &self.repo);
         }
         let Some((id, since)) = self.task().map(|(t, since)| (t.id.clone(), *since)) else {
             return;
@@ -2334,6 +2346,8 @@ fn activity(log: &Path, slot: &Path) -> Vec<Act> {
                             let key = match name.as_str() {
                                 "Bash" => "command",
                                 "Grep" | "Glob" => "pattern",
+                                "WebSearch" => "query",
+                                "WebFetch" => "url",
                                 _ => "file_path",
                             };
                             let target = input[key].as_str().unwrap_or("").lines().next();
@@ -3270,6 +3284,12 @@ fn list(
                 items.push(ListItem::new(row_line(
                     glyph, title, right, sel, width, theme,
                 )));
+                if let Some((_, (tool, target), at)) = app.steps.iter().find(|s| s.0 == r.id) {
+                    let quiet = now.duration_since(*at).unwrap_or_default();
+                    let late = quiet > app.stall_after / 2;
+                    items.push(ListItem::new(step(tool, target, quiet, late, width, theme)));
+                    rows.push(Some(Target::Row(i)));
+                }
                 continue;
             };
             let age = since.and_then(|s| now.duration_since(s).ok());
@@ -3507,7 +3527,10 @@ fn detail_body(
 ) {
     let Some((t, _)) = app.task() else {
         match app.request() {
-            Some(r) => request(f, inner, r, app.answer.as_ref(), theme, &app.scroll),
+            Some(r) => {
+                let spinner = theme.spinner[tick % theme.spinner.len()];
+                request(f, inner, r, app, spinner, theme)
+            }
             None => f.render_widget(Line::raw("No tasks yet.").dim(), inner),
         }
         return;
@@ -3899,15 +3922,9 @@ fn summary(
 }
 
 /// A request: its first line, status and ticket, why its lead failed, then the full request;
-/// for a question, the answer and the files it cites instead.
-fn request(
-    f: &mut Frame,
-    area: Rect,
-    r: &Request,
-    answer: Option<&(String, String, Vec<String>)>,
-    theme: &Theme,
-    scroll: &Scroll,
-) {
+/// for a question, the answer and the files it cites instead; while planning, the lead's `acts`.
+fn request(f: &mut Frame, area: Rect, r: &Request, app: &App, spinner: &str, theme: &Theme) {
+    let (answer, acts, scroll) = (app.answer.as_ref(), &app.activity, &app.scroll);
     let failed = r.status == Phase::Failed;
     let status = match r.status {
         Phase::Failed => "Failed",
@@ -3934,6 +3951,29 @@ fn request(
             }
         }
         None => lines.extend(r.text.lines().map(|l| Line::raw(l.to_string()).dim())),
+    }
+    // the lead's live activity under the request, following its tail
+    if r.status == Phase::Planning {
+        let width = area.width as usize;
+        let high: usize = (lines.iter())
+            .map(|l| wrap(&l.to_string(), width).len())
+            .sum();
+        let [top, _, below] = Layout::vertical([
+            Constraint::Length(high.min(area.height as usize / 2) as u16),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .areas(area);
+        let text = Paragraph::new(lines).wrap(Wrap { trim: false });
+        f.render_widget(text, top);
+        match acts.is_empty() {
+            true => f.render_widget(
+                Line::raw(format!("{spinner} waiting for the lead")).dim(),
+                below,
+            ),
+            false => activity_tab(f, below, acts, theme, scroll),
+        }
+        return;
     }
     scrolled(
         f,
@@ -4344,6 +4384,8 @@ fn verb<'a>(tool: &'a str, theme: &Theme) -> (&'a str, Style) {
         "Bash" => ("run", Style::new().fg(theme.shell)),
         "Read" => ("read", Style::new().dim()),
         "Grep" | "Glob" => ("search", Style::new().dim()),
+        "WebSearch" => ("web", Style::new().dim()),
+        "WebFetch" => ("fetch", Style::new().dim()),
         NUDGE => ("↻ nudged", Style::new().fg(theme.amber)),
         HANDOFF => ("⇢ handoff", Style::new()),
         other => (other, Style::new()),
@@ -5459,6 +5501,68 @@ mod tests {
         let text = c.request.lines().join("\n");
         assert!(
             text.starts_with("How are tasks saved?\n\nThe answer to build on:\n\n## Atomically")
+        );
+    }
+
+    #[test]
+    fn answering_screen() {
+        let (mut app, now) = app();
+        let state = std::env::temp_dir().join(format!("yogan-answering-{}", std::process::id()));
+        let asking = Request {
+            id: "r6".into(),
+            text: "How are tasks saved?".into(),
+            mode: Mode::Ask,
+            status: Phase::Planning,
+            ..Default::default()
+        };
+        asking.save(&state).unwrap();
+        (app.state, app.repo) = (state.clone(), "/repo".into());
+        let draw_rows = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            term.draw(|f| draw(f, app, &Theme::new(false, false), 0, now))
+                .unwrap();
+            screen(&term)
+        };
+        app.reload(&state).unwrap();
+        app.selected = 0;
+        app.load_tab();
+        let rows = draw_rows(&app);
+        assert!(rows[6].contains("⠋ waiting for the lead"), "{rows:#?}");
+
+        let call = |id: &str, name: &str, input: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{id}","usage":{{}},"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+            )
+        };
+        let lines = [
+            call("a", "Grep", r#"{"pattern":"fn save"}"#),
+            call("b", "Read", r#"{"file_path":"/repo/src/task.rs"}"#),
+            r#"{"type":"assistant","message":{"id":"t","usage":{},"content":[{"type":"text","text":"Saves go through a tmp file."}]}}"#.into(),
+            call("c", "WebSearch", r#"{"query":"atomic rename posix"}"#),
+            call("d", "WebFetch", r#"{"url":"https://man7.org/rename.2.html"}"#),
+        ];
+        fs::create_dir_all(state.join("logs")).unwrap();
+        fs::write(state.join("logs/r6.jsonl"), lines.join("\n")).unwrap();
+        app.reload(&state).unwrap();
+        app.load_tab();
+        app.steps[0].2 = now - Duration::from_secs(2 * 60);
+        fs::remove_dir_all(&state).unwrap();
+        assert_eq!(
+            draw_rows(&app),
+            [
+                "╭ Tasks ────────────────────────────────────╮╭ Task ─────────────────────────────────────── z zoom ╮",
+                "│ ▌ ⠋ How are tasks saved?        answering ││ How are tasks saved?                                │",
+                "│       fetch https://man7.org/re… quiet 2m ││ Planning                                            │",
+                "│                                           ││                                                     │",
+                "│                                           ││ How are tasks saved?                                │",
+                "│                                           ││                                                     │",
+                "│                                           ││ read    src/task.rs                                 │",
+                "│                                           ││   │ Saves go through a tmp file.                    ┃",
+                "│                                           ││ web     atomic rename posix                         ┃",
+                "│                                           ││ fetch   https://man7.org/rename.2.html              ┃",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
+                " yogan  ✓ nothing needs you   n  new task  j/k  move  tab  pane  q  quit  ?  more                   ",
+            ]
         );
     }
 
