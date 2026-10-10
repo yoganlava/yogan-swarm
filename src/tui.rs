@@ -541,7 +541,7 @@ struct Hits {
     tabs: Rect,
     palette: Rect,
     /// The compose panes; a hint outside them, like Submit's, goes in the last one's border.
-    panes: Vec<Rect>,
+    panes: [Rect; 3],
     targets: Vec<(Rect, Target, String)>,
 }
 
@@ -2857,9 +2857,9 @@ fn draw(f: &mut Frame, app: &App, theme: &Theme, tick: usize, now: SystemTime) {
             .set_style(*rect, Style::new().bg(theme.hover));
         let pane = [hits.list, hits.detail]
             .into_iter()
-            .chain(hits.panes.iter().copied())
+            .chain(hits.panes)
             .find(|p| p.contains(at))
-            .or(hits.panes.last().copied());
+            .or(Some(hits.panes[2]).filter(|p| !p.is_empty()));
         let hint = Line::styled(format!(" {hint} "), theme.accent).right_aligned();
         let area = pane.unwrap_or(body).inner(Margin::new(1, 0));
         f.render_widget(Block::new().title_bottom(hint), area);
@@ -3116,15 +3116,17 @@ fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme, hits: &mut Hit
     let block = pane("Mode", c.focus == 2, theme);
     let inner = block.inner(mode);
     let mut modes = Vec::new();
+    let mut x = inner.x;
     for (i, (m, name)) in MODES.iter().enumerate() {
         let span = match *m == c.mode {
             true => Span::styled(*name, theme.accent).bold().underlined(),
             false => Span::raw(*name).dim(),
         };
-        let x = inner.x + Line::from(modes.clone()).width() as u16;
-        let rect = Rect::new(x, inner.y, span.width() as u16, 1).intersection(inner);
+        let w = span.width() as u16;
+        let rect = Rect::new(x, inner.y, w, 1).intersection(inner);
         hits.targets
             .push((rect, Target::Mode(i), format!("click · {name} mode")));
+        x = x.saturating_add(w + 2);
         modes.extend([span, Span::raw("  ")]);
     }
     f.render_widget(Line::from(modes), inner);
@@ -3142,7 +3144,7 @@ fn compose(f: &mut Frame, area: Rect, c: &Compose, theme: &Theme, hits: &mut Hit
         let hint = format!("click · type the {}", title.to_lowercase());
         hits.targets.push((area, Target::Focus(i), hint));
     }
-    hits.panes = vec![mode, request, ticket];
+    hits.panes = [mode, request, ticket];
 }
 
 /// ` yogan · repo  ● 2 need you  ⠋ 1 working  ○ 1 queued`, with the slot meter and spend flush
