@@ -1741,13 +1741,15 @@ impl App {
         };
         let t = &self.tasks[i].0;
         if *merge {
-            // a merged task leaves Review; one that stays has its reason in the log
-            if t.status == Status::Review && exited {
+            // it may pass through Checking or Running on the way; one left in Review has its
+            // reason in the log
+            if t.status != Status::Merged && !exited {
+                return;
+            }
+            if t.status == Status::Review {
                 let log = self.state.join(format!("logs/{id}.pr.log"));
                 let why = fs::read_to_string(log).unwrap_or("the worker exited".into());
                 self.notice = Some(format!("not merged: {}", why.trim()));
-            } else if t.status == Status::Review {
-                return;
             }
             self.awaiting = None;
         } else if t.status == Status::Review && t.pr_draft.is_some() && t.pr_draft != *old {
@@ -5378,6 +5380,11 @@ mod tests {
         app.awaiting = Some(("t1".into(), None, 1, true));
         app.check_awaiting(false);
         assert!(app.awaiting.is_some() && app.notice.is_none());
+        // re-gating a moved head passes through Checking
+        app.tasks[0].0.status = Status::Checking;
+        app.check_awaiting(false);
+        assert!(app.awaiting.is_some() && app.notice.is_none());
+        app.tasks[0].0.status = Status::Review;
         app.check_awaiting(true);
         assert!(app.awaiting.is_none());
         let notice = app.notice.take();
