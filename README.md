@@ -11,227 +11,189 @@
 
 ---
 
-yogan is a terminal UI that runs several Claude Code sessions in parallel on one repo. A read-only
-lead session turns your request into proposed tasks. You approve them. Each worker then runs
-unattended in its own git worktree, passes your gate and an adversarial critic, and waits for you
-to review the diff. Nothing is pushed until you approve the pull request.
+yogan is a terminal UI that runs several Claude Code sessions in parallel on one repo. You describe
+the work, approve the plan, and review each finished diff. Nothing is pushed until you approve the
+pull request.
 
-It is one Rust binary with no daemon, database or web UI. Agents are detached processes that
-write to files, so closing the terminal never stops them.
+![The yogan inbox: tasks that need you, work in progress and queued work](assets/screenshots/overview.png)
 
 ## How it works
 
 ```
- request ─► lead ─► proposed tasks ─► you approve ─► worker in slot N ─► gate ─► critic ─► Review ─► you approve PR ─► push + gh pr create
-                                                         ▲                           │
-                                                         └──── fix round ◄───────────┘
-                                                           (gate failure or blocking finding)
+request → lead → proposals → you approve → worker → gate → critic → you review → PR
+                                             ▲                │
+                                             └── fix rounds ──┘
 ```
 
-- **Lead proposes, you approve.** The lead reads the code (no Edit, Write or shell) and files
-  tasks with one to five testable acceptance criteria each. Questions get an answer instead.
-- **Isolated workers.** Each task runs in a numbered slot: a persistent worktree with its own
-  `CARGO_TARGET_DIR`, so incremental builds stay warm between tasks.
-- **Your gate, not the agent's word.** After Claude exits, yogan runs your gate steps itself,
-  scoped to the crates or paths the diff touched.
-- **Adversarial review.** A separate critic session, on a different model by default, tries to
-  break the change. Blocker and major findings go back to the worker before you see it.
-- **One task, one PR.** On your approval of the drafted title and body, yogan rebases, pushes the
-  branch and opens the PR with `gh`. After that the PR is yours.
-- **Unattended safety.** Stalls and loops get a nudge, a filling context hands off to a fresh
-  session, rate limits park the worker, and a per-task spend ceiling stops runaways. Every failure
-  ends in a visible status.
-
-## Requirements
-
-- macOS or Linux (Windows is not supported)
-- [Claude Code](https://docs.claude.com/en/docs/claude-code) on `PATH`, signed in
-- `git`, and the [GitHub CLI](https://cli.github.com) (`gh`) authenticated for opening PRs
-- A Rust toolchain with edition 2024 support (Rust 1.88 or later) to build yogan
+- **A lead plans, you approve.** A read-only session splits your request into tasks, each with
+  testable acceptance criteria.
+- **Workers run in isolation.** Each task gets its own persistent git worktree, so builds stay warm.
+- **Checked before you see it.** yogan runs your gate (fmt, clippy, tests) itself, then a critic
+  session on a different model tries to break the change. Failures go back to the worker.
+- **One task, one PR.** yogan drafts the PR; you approve it, and it pushes and opens it with `gh`.
+- **Runs unattended.** Agents are detached processes, so closing the terminal stops nothing.
+  Stalls get nudged, spend is capped, and every failure ends in a visible status.
 
 ## Install
+
+You need macOS or Linux, [Claude Code](https://docs.claude.com/en/docs/claude-code) signed in,
+`git`, an authenticated [GitHub CLI](https://cli.github.com) (`gh`) and Rust 1.88 or later.
 
 ```sh
 git clone https://github.com/yoganlava/yogan-swarm.git
 cd yogan-swarm
-make install    # cargo install --path . --locked --force
+make install    # installs `yogan` into ~/.cargo/bin
 ```
 
-This installs the `yogan` binary into `~/.cargo/bin`.
+Then run `yogan` from inside any repo.
 
-## Quick start
+## Walkthrough
 
-```sh
-cd path/to/your/repo
-yogan
-```
+The screenshots are the real TUI on a sample repo.
 
-1. Press `n`, pick a mode (Auto, Plan or Ask), type a request and submit.
-2. Proposals appear under **Needs you**. Press `a` to approve one, `A` for all, `e` to edit or `r`
-   to reply to the lead.
-3. Approved tasks queue for a free slot and run. Watch them in the Activity tab, or close the
-   terminal and come back later.
-4. When a task reaches **Review**, read the Summary, Gate, Findings and Diff tabs.
-5. Press `m` to draft the PR, then `enter` to push and open it. `esc` backs out without pushing.
+**1. Ask for work.** Press `n`, type a request and submit. Auto lets the lead decide whether to plan
+or answer, Plan always files tasks and Ask always answers. An optional ticket ID goes into every PR
+title.
 
-Press `?` at any time for the command palette, which lists every key valid for the selection.
+![Compose screen](assets/screenshots/compose.png)
+
+**2. Approve the plan.** Proposals appear under **Needs you** with their acceptance criteria. Press
+`a` to approve one, `A` for all, `e` to edit, or `r` to send the lead feedback.
+
+![A proposed task with its acceptance criteria](assets/screenshots/proposal.png)
+
+**3. Watch, or walk away.** Approved tasks start as slots free up. Activity shows each tool call as
+it happens.
+
+![Activity timeline of a running worker](assets/screenshots/activity.png)
+
+**4. Review.** When a task reaches Review, its tabs show the gate, the critic's findings and the
+diff. Press `r` to ask for changes or `c` to take over the session yourself.
+
+| Gate | Findings | Diff |
+| --- | --- | --- |
+| ![Gate tab with a failing test](assets/screenshots/gate.png) | ![Findings tab](assets/screenshots/findings.png) | ![Diff tab with hunks unfolded](assets/screenshots/diff.png) |
+
+**5. Ship.** Press `m` to draft the PR. `g` regenerates it with an instruction, `e` edits, and
+`enter` pushes the branch and opens the PR.
+
+![PR preview](assets/screenshots/pr.png)
+
+Questions skip all of this: the lead answers in Markdown, citing files. Press `p` to turn an
+answer into a plan.
+
+![An answered question](assets/screenshots/question.png)
 
 ## Keys
 
+Press `?` for the command palette, which lists every key valid for the selection.
+
+![Command palette](assets/screenshots/palette.png)
+
+<details>
+<summary>All keys</summary>
+
 | Key | Action |
 | --- | --- |
-| `n` | New request (plan or question) |
+| `n` | New request |
 | `j` `k` / `↑` `↓` | Move selection |
-| `tab`, `1`–`6` | Switch pane, switch detail tab |
-| `a` / `A` | Approve a proposal / approve all |
-| `e` | Edit a proposal (TOML) or the PR draft |
-| `r` | Reply: to the lead, to a task in Review, or a follow-up question |
+| `tab`, `1`–`6` | Switch pane, switch tab |
+| `a` / `A` | Approve a proposal / all proposals |
+| `e` | Edit a proposal or the PR draft |
+| `r` | Reply to the lead or worker, or ask a follow-up |
 | `p` | Turn an answer into a plan |
-| `m` | Draft the PR (nothing is pushed until `enter`) |
-| `M` | Rebase and push the task to main |
-| `g` | Regenerate the PR draft with an instruction |
+| `m` / `M` | Draft the PR / rebase and push to main |
+| `g` | Regenerate the PR draft |
 | `d` | Full diff in `$PAGER` |
-| `w` | Rewind the slot to one of the worker's commits |
-| `t` | Retry a failed task on a model you pick |
-| `c` | Continue the session interactively in its slot |
+| `w` | Rewind to one of the worker's commits |
+| `t` | Retry a failed task on another model |
+| `c` | Continue the session interactively |
 | `R` | Start or stop the slot's run script |
-| `o` | Open the selected file, or the task's worktree |
-| `x` | Discard the task and free its slot |
+| `o` | Open the selected file or worktree |
+| `x` | Discard the task |
 | `y` | Copy the answer |
 | `z` | Zoom the detail pane |
-| `]` | Jump to the next task that needs you |
+| `]` | Next task that needs you |
 | `,` | Settings |
-| `?` | Command palette |
 | `q` | Quit (agents keep running) |
 
-The mouse works too: click selects, double-click zooms, the wheel scrolls and hovering shows the
-key a target presses.
+The mouse works too: click selects, double-click zooms and hovering shows a target's key.
+
+</details>
 
 ## Configuration
 
-yogan writes nothing into your repo. Configuration is layered, highest first:
-
-1. A task's own `model` and `effort`, set with `e` on a proposal
-2. The compose screen's model and effort, for that request
-3. The project file
-4. `~/.config/yogan/config.toml`
-5. Built-in defaults ([`src/defaults.toml`](src/defaults.toml))
-
-The project is found by its `origin` remote's repo name, falling back to the checkout's folder
-name, in the global file's `[projects]` table. Settings (`,`) edits and saves these files for you;
-hand edits work too.
+yogan writes nothing into your repo. Settings (`,`) edits the config for you; the files are
+plain TOML if you prefer editing by hand.
 
 ```toml
 # ~/.config/yogan/config.toml
 branch_prefix = "you/"
 
 [projects]
-"my-repo" = "~/.config/yogan/projects/my-repo.toml"
+"my-repo" = "~/.config/yogan/projects/my-repo.toml"   # keyed by the origin repo name
 ```
 
-A project file can override any table:
+A project file overrides any table of the [defaults](src/defaults.toml):
 
 ```toml
 # ~/.config/yogan/projects/my-repo.toml
 [worker]
 concurrency = 3
-slots = 4
-budget_usd = 8.0                    # per-task spend ceiling; 0 turns it off
-mcp_config = ".mcp.json"            # the only MCP servers workers get
-read_tools = ["mcp__graft"]          # extra tools for the lead, Ask and the critic
-deny = ["Bash(docker *)"]           # added to the built-in deny list
-
-[pr]
-title_format = "type(scope): desc [TICKET]"
-types = ["feat", "fix", "refactor", "chore"]
+budget_usd = 8.0               # per-task spend ceiling; 0 turns it off
 
 [gate]
 steps = [
-  { name = "fmt",    run = "cargo fmt {crates} -- --check" },
   { name = "clippy", run = "cargo clippy {crates} --all-targets -- -D warnings" },
   { name = "test",   run = "cargo test {crates}" },
-  { name = "sqlx",   run = "cargo sqlx prepare --check", when_changed = ["migrations/**"] },
 ]
 
-[ports]                             # slot n gets ports base + n * per_slot onwards
-base = 20000
-per_slot = 10
-
-[scripts]                           # run in the slot; all optional
+[scripts]                      # optional, run in each slot
 setup = "./scripts/worktree_up.sh"
-teardown = "./scripts/worktree_down.sh"
 run = "./scripts/dev.sh"
 ```
 
-Gate steps take `{crates}` (`-p` flags for touched crates) or `{paths}` (changed top-level
-directories), so non-Rust repos work too. A step whose placeholder is empty is skipped. Cargo
-features (target dirs, build permits, crate scoping) switch on only when the repo has a
-`Cargo.toml`.
+Gate steps take `{crates}` (the touched crates as `-p` flags) or `{paths}` (changed top-level
+directories), so non-Rust repos work too.
 
-Roles that run Claude each have a `model` and `effort`: `[lead]`, `[ask]`, `[critic]`, `[worker]`
-and `[pr]`. Thresholds for stalls, loops and handoffs live in `[watch]`; slot cleanup in `[disk]`.
-See [`src/defaults.toml`](src/defaults.toml) for every key and its default.
+<details>
+<summary>More options</summary>
 
-### Slot environment
+- **Precedence**, highest first: the task's own model and effort, the compose screen's, the
+  project file, the global file, the built-in defaults.
+- **Roles**: `[lead]`, `[ask]`, `[critic]`, `[worker]` and `[pr]` each set a `model` and
+  `effort`.
+- **Worker tools**: `[worker] mcp_config`, `read_tools`, `allowed_tools` and `deny` (added to the
+  built-in deny list).
+- **PR titles**: `[pr] title_format` and `types`.
+- **Thresholds**: stalls, loops and handoffs in `[watch]`; slot cleanup in `[disk]`.
+- **Ports**: `[ports] base` and `per_slot` give each slot its own range.
+- **Environment**: `YOGAN_ASCII=1` for ASCII glyphs, `YOGAN_DIR` to move the state directory.
+  Slot scripts get `YOGAN_ROOT`, `YOGAN_SLOT`, `YOGAN_SLOT_DIR`, `YOGAN_TASK_ID`, `YOGAN_CRATES`
+  and, with `[ports]`, `YOGAN_PORT_BASE` and `YOGAN_PORT_COUNT`.
+- **State** lives in `~/.local/share/yogan/<repo>/`: tasks, requests, redacted logs, findings,
+  answers and the slot worktrees.
 
-Slot scripts, Claude, the gate and the critic all run with:
-
-| Variable | Meaning |
-| --- | --- |
-| `YOGAN_ROOT` | Your main checkout |
-| `YOGAN_SLOT`, `YOGAN_SLOT_DIR` | Slot number and worktree path |
-| `YOGAN_TASK_ID`, `YOGAN_CRATES` | The current task and its crates |
-| `YOGAN_PORT_BASE`, `YOGAN_PORT_COUNT` | This slot's port range, when `[ports]` is set |
-
-### Environment variables
-
-| Variable | Effect |
-| --- | --- |
-| `YOGAN_ASCII=1` | ASCII glyphs instead of Unicode |
-| `YOGAN_DIR` | Override the state directory |
-| `COLORTERM=truecolor` | Truecolor theme; otherwise the 16 ANSI colours |
-
-## State
-
-State lives outside the repo, in `~/.local/share/yogan/<repo>/`, so your editor, `rg` and `cargo`
-never see the agents' copies:
-
-```
-requests/<id>.toml   one per plan or question
-tasks/<id>.toml      one per task
-logs/<id>.jsonl      Claude's stream, redacted
-findings/<id>.toml   the critic's findings
-answers/<id>.md      answers to questions
-slots/1..N/          persistent worktrees
-```
-
-Everything yogan writes passes through a redactor that masks token-like strings. On restart the
-TUI rebuilds its view from these files and checks whether each recorded worker is still alive.
-
-## Safety model
-
-Workers run Claude Code headless with an explicit `--allowedTools` list, project settings only
-(`--setting-sources project`, so no user hooks or plugins) and `--strict-mcp-config`. A built-in
-deny list blocks `git push`, `git checkout`, `git reset`, `git clean`, `git worktree`, `gh` and
-similar commands; your project can add more.
-
-This is a rule, not a sandbox. Anything an allowed program runs (`build.rs`, tests, scripts)
-executes as you, with your credentials. Run yogan on repos and dependencies you trust.
+</details>
 
 ## VS Code
 
-yogan is built to live in VS Code's integrated terminal. It detects `TERM_PROGRAM=vscode` and opens
-files with `code -g`, diffs with `code --diff` and edits with `code --wait`. It uses the 16 ANSI
-colours there so it follows your VS Code theme. Below 24 rows it switches to a compact layout that
-fits a short panel.
+yogan is built for VS Code's integrated terminal. There it opens files with `code -g`, diffs with
+`code --diff`, and follows your theme's colours. Below 24 rows it switches to a compact layout.
+
+![Compact layout](assets/screenshots/compact.png)
+
+## Safety
+
+Workers get an explicit tool allowlist, no user hooks or plugins, and a deny list covering
+`git push`, `git reset`, `gh` and similar. That is a rule, not a sandbox: code an allowed tool runs,
+such as `build.rs` or tests, runs as you. Use yogan on repos you trust.
 
 ## Development
 
 ```sh
-cargo fmt
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-TUI screens are snapshot-tested with ratatui's `TestBackend`. Work is tracked as one file per
-ticket under [`tickets/`](tickets), in build order.
+Screens are snapshot-tested with ratatui's `TestBackend`. Work is tracked as one ticket per file in
+[`tickets/`](tickets).
