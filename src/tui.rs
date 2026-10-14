@@ -124,7 +124,7 @@ const MODELS: &[&str] = &[
 ];
 
 /// What Settings edits, as (table, key, label, field); an empty label continues the row above.
-const SETTINGS: [(&str, &str, &str, Field); 26] = [
+const SETTINGS: [(&str, &str, &str, Field); 27] = [
     ("lead", "model", "lead", Field::Pick(MODELS)),
     ("lead", "effort", "", Field::Pick(worker::EFFORTS)),
     ("ask", "model", "questions", Field::Pick(MODELS)),
@@ -147,6 +147,12 @@ const SETTINGS: [(&str, &str, &str, Field); 26] = [
         "budget_usd",
         "budget usd",
         Field::Step(1.0, 0.0, 100.0),
+    ),
+    (
+        "worker",
+        "permission_mode",
+        "permissions",
+        Field::Pick(&["acceptEdits", "auto"]),
     ),
     (
         "build",
@@ -216,9 +222,9 @@ const SETTINGS: [(&str, &str, &str, Field); 26] = [
 const SECTIONS: [(usize, &str); 5] = [
     (0, "Models"),
     (10, "Workers"),
-    (16, "Watch"),
-    (22, "Disk"),
-    (24, "Other"),
+    (17, "Watch"),
+    (23, "Disk"),
+    (25, "Other"),
 ];
 
 /// The `,` screen: the `SETTINGS` values in effect for the file it saves to, as loaded and as
@@ -4997,20 +5003,20 @@ mod tests {
         assert_eq!(err, "nothing changed");
         s.row = 7;
         s.cycle(true); // workers' effort: high to xhigh
-        s.row = 16;
+        s.row = 17;
         s.cycle(true); // stall after: 15m to 20m
-        s.row = 20;
+        s.row = 21;
         s.cycle(false); // handoff at: 0.8 to 0.75
         s.row = 10;
         s.cycle(false); // concurrency: 4 to 3
-        s.row = 25;
+        s.row = 26;
         s.cycle(true); // mouse: true to false
         s.row = 4;
         s.cycle(true); // critic: fable wraps round to opus
 
         let (mut app, _) = app();
         app.settings = Some(s);
-        let mut term = Terminal::new(TestBackend::new(60, 41)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(60, 42)).unwrap();
         let theme = Theme::new(false, false);
         term.draw(|f| draw(f, &app, &theme, 0, SystemTime::UNIX_EPOCH))
             .unwrap();
@@ -5037,6 +5043,7 @@ mod tests {
                 "│   concurrency        3 •                                 │",
                 "│   slots              5                                   │",
                 "│   budget usd         5.0                                 │",
+                "│   permissions        acceptEdits                         │",
                 "│   cargo builds       2                                   │",
                 "│   fix rounds         2                                   │",
                 "│   questions at once  2                                   │",
