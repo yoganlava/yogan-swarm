@@ -164,7 +164,9 @@ directories), so non-Rust repos work too.
 - **Roles**: `[lead]`, `[ask]`, `[critic]`, `[worker]` and `[pr]` each set a `model` and
   `effort`.
 - **Worker tools**: `[worker] mcp_config`, `read_tools`, `allowed_tools` and `deny` (added to the
-  built-in deny list).
+  built-in deny list). `permission_mode = "auto"` lets Claude Code's classifier approve other
+  calls; anything still denied is listed in Review, where `a` allows it for that task and resumes
+  the worker.
 - **PR titles**: `[pr] title_format` and `types`.
 - **Thresholds**: stalls, loops and handoffs in `[watch]`; slot cleanup in `[disk]`.
 - **Ports**: `[ports] base` and `per_slot` give each slot its own range.

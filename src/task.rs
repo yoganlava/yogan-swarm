@@ -51,6 +51,12 @@ pub struct Task {
     /// Title and body awaiting approval.
     pub pr_draft: Option<crate::pr::Draft>,
     pub pr_url: Option<String>,
+    /// Allow rules for calls the worker was denied, awaiting the human's `a`.
+    #[serde(default)]
+    pub denied: Vec<String>,
+    /// Allow rules the human approved for this task's worker.
+    #[serde(default)]
+    pub allowed: Vec<String>,
 }
 
 /// `$YOGAN_DIR`, else `~/.local/share/yogan/<repo>/`.
@@ -231,6 +237,8 @@ mod tests {
             gate: None,
             pr_draft: None,
             pr_url: None,
+            denied: vec!["Bash(sed -i x a.txt)".into()],
+            allowed: vec![],
         };
         task.save(&dir).unwrap();
         task.status = Status::Review;

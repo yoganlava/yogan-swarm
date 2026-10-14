@@ -27,6 +27,8 @@ effort = "high"
 budget_usd = 5.0  # spend ceiling per task; 0 turns it off
 concurrency = 4
 slots = 5
+# Claude Code's --permission-mode; "auto" lets its classifier approve calls outside allowed_tools
+permission_mode = "acceptEdits"
 # a project's allowed_tools replaces this list; its deny adds to the built-in one
 allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(cargo *)",
                  "Bash(git status*)", "Bash(git diff *)", "Bash(git log *)",

@@ -1498,6 +1498,11 @@ impl App {
                     self.notice = Some(format!("{e:#}"));
                 }
             }
+            KeyCode::Char('a') if self.task().is_some_and(|(t, _)| t.status == Status::Review) => {
+                if let Err(e) = self.allow_denied() {
+                    self.notice = Some(format!("{e:#}"));
+                }
+            }
             KeyCode::Char(c @ ('a' | 'A')) => {
                 if let Err(e) = self.approve(c == 'A') {
                     self.notice = Some(format!("{e:#}"));
@@ -2210,6 +2215,24 @@ impl App {
             None if ids.len() == 1 => "approved".into(),
             None => format!("approved {} tasks", ids.len()),
         });
+        Ok(())
+    }
+
+    /// `a` on a task in Review: allows the calls its worker was denied and resumes it to retry them.
+    fn allow_denied(&mut self) -> Result<()> {
+        let (t, _) = self.task().context("no task selected")?;
+        ensure!(!t.denied.is_empty(), "nothing was denied");
+        let mut t = t.clone();
+        let rules = std::mem::take(&mut t.denied);
+        t.allowed.extend(rules.iter().cloned());
+        t.save(&self.state)?;
+        let prompt = format!(
+            "The human allowed these calls you were denied:\n- {}\n\nRetry what needed them, \
+             then carry on.",
+            rules.join("\n- ")
+        );
+        worker::spawn(&self.repo, &t.id, &["--reply", &prompt])?;
+        self.info = Some("allowed; the worker is retrying".into());
         Ok(())
     }
 
@@ -2934,7 +2957,10 @@ fn valid(app: &App, k: &str) -> bool {
             answered
                 || selected.is_some_and(|t| matches!(t.status, Status::Proposed | Status::Review))
         }
-        "a" | "e" => selected.is_some_and(|t| t.status == Status::Proposed),
+        "a" => selected.is_some_and(|t| {
+            t.status == Status::Proposed || (t.status == Status::Review && !t.denied.is_empty())
+        }),
+        "e" => selected.is_some_and(|t| t.status == Status::Proposed),
         "A" => app.tasks.iter().any(|(t, _)| t.status == Status::Proposed),
         _ => true,
     }
@@ -2945,7 +2971,7 @@ fn actions(app: &App) -> Vec<(&'static str, &'static str)> {
     let status = app.task().map(|(t, _)| t.status);
     let answered = app.request().is_some_and(|r| r.status == Phase::Done);
     let first: &[&str] = match status {
-        Some(Status::Review) => &["m", "M", "r", "d", "x", "c", "w", "R", "o"],
+        Some(Status::Review) => &["a", "m", "M", "r", "d", "x", "c", "w", "R", "o"],
         Some(Status::Failed) => &["t", "c", "x", "d", "o"],
         Some(Status::Proposed) => &["a", "A", "e", "r", "x"],
         _ if answered => &["p", "r", "y", "x"],
@@ -2957,6 +2983,7 @@ fn actions(app: &App) -> Vec<(&'static str, &'static str)> {
         .filter_map(|k| KEYS.into_iter().find(|(key, _)| key == k))
         .map(|(k, label)| match (k, status) {
             ("x", Some(_)) => (k, "discard task"),
+            ("a", Some(Status::Review)) => (k, "allow denied"),
             ("r", Some(Status::Review)) => (k, "reply to worker"),
             ("r", _) => (k, "reply to lead"),
             _ => (k, label),

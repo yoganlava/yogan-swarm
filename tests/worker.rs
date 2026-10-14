@@ -153,7 +153,7 @@ fn worker_runs_setup_then_claude() {
     assert_eq!(t1.effort.as_deref(), Some("high"));
     let args = fs::read_to_string(root.join("claude.args")).unwrap();
     for want in [
-        "--model\nopus-x\n--effort\nhigh\n",
+        "--permission-mode\nacceptEdits\n--model\nopus-x\n--effort\nhigh\n",
         "--setting-sources\nproject\n",
         "--strict-mcp-config\n",
         "--mcp-config\n.mcp.json\n--resume\ns-1\n",
@@ -266,11 +266,25 @@ fn worker_runs_setup_then_claude() {
     let (ok, t4) = worker("t4", "true", "graft", denial, None);
     assert!(ok);
     assert_eq!(t4.status, Status::Review);
-    let summary = t4.summary.unwrap();
+    let summary = t4.summary.clone().unwrap();
     assert!(
         summary.starts_with("Permission denied:\n- Bash sed -i x a.txt"),
         "{summary}"
     );
+    // `a` allows it for this task, and the resumed worker gets it in --allowedTools
+    assert_eq!(t4.denied, ["Bash(sed -i x a.txt)"]);
+    let t4 = Task {
+        allowed: t4.denied.clone(),
+        denied: Vec::new(),
+        ..t4
+    };
+    t4.save(&state).unwrap();
+    let (ok, t4) = yogan(&["worker", "t4", "--reply", "retry"], "graft", "");
+    assert!(ok);
+    assert!(t4.denied.is_empty());
+    let args = fs::read_to_string(root.join("claude.args")).unwrap();
+    let want = "Bash(git rebase *)\nBash(sed -i x a.txt)\n--disallowedTools\n";
+    assert!(args.contains(want), "{args}");
 
     // an unknown effort fails before Claude starts
     let (ok, t5) = worker("t5", "true", "graft", "", Some("bogus"));

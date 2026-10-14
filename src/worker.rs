@@ -288,6 +288,17 @@ fn call(name: &str, input: &Value) -> String {
     format!("{name} {target}").chars().take(200).collect()
 }
 
+/// The allow rule that would have let a denied call through.
+fn rule(name: &str, input: &Value) -> String {
+    match (input["command"].as_str(), input["file_path"].as_str()) {
+        (Some(cmd), _) if name == "Bash" => format!("Bash({cmd})"),
+        // `//` makes the path absolute; Edit rules cover Write and NotebookEdit too
+        (_, Some(path)) if name == "Read" => format!("Read(/{path})"),
+        (_, Some(path)) => format!("Edit(/{path})"),
+        _ => name.to_string(),
+    }
+}
+
 /// The tail of the first tool result in a user message.
 fn tool_result(message: &Value) -> Option<String> {
     let blocks = message["content"].as_array()?;
@@ -512,7 +523,13 @@ fn lifecycle(
     );
     // a rebase conflict is the worker's to resolve
     let rebasing = ["Bash(git rebase *)".to_string()];
-    let allowed = [&w.allowed_tools[..], &w.read_tools[..], &rebasing].concat();
+    let allowed = [
+        &w.allowed_tools[..],
+        &w.read_tools[..],
+        &rebasing,
+        &task.allowed,
+    ]
+    .concat();
     let servers = match &w.mcp_config {
         Some(file) => mcp_servers(&dir.join(file))?,
         None => Vec::new(),
@@ -543,7 +560,7 @@ fn lifecycle(
         let mut retried = false;
         loop {
             let mut cmd = Command::new("claude");
-            cmd.args(["--permission-mode", "acceptEdits"])
+            cmd.args(["--permission-mode", &w.permission_mode])
                 .args(["--model", &model, "--effort", &effort])
                 .args(["--autocompact", &cfg.watch.autocompact.to_string()]);
             if let Some(file) = &w.mcp_config {
@@ -571,7 +588,7 @@ fn lifecycle(
                 .current_dir(&dir)
                 .env("GIT_EDITOR", "true") // `rebase --continue` must not wait on an editor
                 .envs(env.iter().cloned());
-            let (mut denied, mut reply) = (Vec::new(), None);
+            let (mut denied, mut rules, mut reply) = (Vec::new(), Vec::new(), None);
             let (mut fresh, mut said) = (None, None);
             let (mut rejected, mut step, mut outcome) = (None, None, None);
             let watch = Some((&cfg.watch, queue.as_path()));
@@ -649,6 +666,11 @@ fn lifecycle(
                             .iter()
                             .map(|d| call(&d.tool_name, &d.tool_input))
                             .collect();
+                        rules = r
+                            .permission_denials
+                            .iter()
+                            .map(|d| rule(&d.tool_name, &d.tool_input))
+                            .collect();
                     }
                     _ => {}
                 }
@@ -711,6 +733,11 @@ fn lifecycle(
                     .take()
                     .map_or(note.clone(), |s| format!("{s}\n\n{note}"));
                 task.summary = Some(summary);
+                for r in rules {
+                    if !task.denied.contains(&r) {
+                        task.denied.push(r);
+                    }
+                }
                 task.save(state)?;
             }
             return Ok(reply);
@@ -951,6 +978,19 @@ mod tests {
     use super::*;
     use rustix::process::getsid;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn denied_calls_become_allow_rules() {
+        let bash = serde_json::json!({"command": "sed -i x a.txt"});
+        assert_eq!(rule("Bash", &bash), "Bash(sed -i x a.txt)");
+        let file = serde_json::json!({"file_path": "/tmp/out.txt", "content": "x"});
+        assert_eq!(rule("Write", &file), "Edit(//tmp/out.txt)");
+        assert_eq!(rule("Read", &file), "Read(//tmp/out.txt)");
+        assert_eq!(
+            rule("WebSearch", &serde_json::json!({"query": "q"})),
+            "WebSearch"
+        );
+    }
 
     fn result(json: &str) -> RunResult {
         let base = serde_json::json!({

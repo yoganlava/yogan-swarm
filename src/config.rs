@@ -97,6 +97,8 @@ pub struct Worker {
     pub slots: u32,
     /// Workers running at once.
     pub concurrency: u32,
+    /// Passed as `--permission-mode`, e.g. `acceptEdits` or `auto`.
+    pub permission_mode: String,
     /// Relative to the slot, e.g. `.mcp.json`.
     pub mcp_config: Option<String>,
     #[serde(default)]
