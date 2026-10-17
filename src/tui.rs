@@ -79,7 +79,7 @@ const RUN: usize = 5;
 /// Lines a scroll key moves the detail pane.
 const SCROLL: u16 = 10;
 
-const KEYS: [(&str, &str); 25] = [
+const KEYS: [(&str, &str); 24] = [
     ("n", "new task"),
     ("j/k", "move"),
     ("tab", "pane"),
@@ -102,7 +102,6 @@ const KEYS: [(&str, &str); 25] = [
     ("R", "run"),
     ("o", "open"),
     (",", "settings"),
-    ("pgup/pgdn", "scroll"),
     ("z", "zoom"),
     ("]", "next for you"),
 ];
@@ -334,14 +333,12 @@ pub struct Theme {
     todo: &'static str,
     current: &'static str,
     dot: &'static str,
-    rest: &'static str,
     spinner: &'static [&'static str],
     /// A slot meter's held and free cells.
     slot: (&'static str, &'static str),
     /// A group heading's unfolded and folded marks, and its rule.
     fold: (&'static str, &'static str),
     rule: &'static str,
-    need: &'static str,
     ascii: bool,
 }
 
@@ -381,7 +378,6 @@ impl Theme {
             todo: glyphs("┄", "-"),
             current: glyphs("◉", "(*)"),
             dot: glyphs("●", "*"),
-            rest: glyphs("─", "-"),
             spinner: if ascii {
                 &["|", "/", "-", "\\"]
             } else {
@@ -390,7 +386,6 @@ impl Theme {
             slot: if ascii { ("#", ".") } else { ("▰", "▱") },
             fold: if ascii { ("v", ">") } else { ("▾", "▸") },
             rule: glyphs("─", "-"),
-            need: glyphs("●", "*"),
             ascii,
         }
     }
@@ -734,11 +729,11 @@ pub fn run(repo: &Path) -> Result<()> {
         finding: 0,
         marked: BTreeSet::new(),
         disputed: Vec::new(),
-        sessions: config::load(repo).map_or(0, |c| c.watch.max_handoffs + 1),
+        sessions: cfg.as_ref().map_or(0, |c| c.watch.max_handoffs + 1),
         run: RunTab::default(),
         serving: Vec::new(),
         steps: Vec::new(),
-        stall_after: config::load(repo).map_or(Duration::MAX, |c| c.watch.stall_after),
+        stall_after: cfg.as_ref().map_or(Duration::MAX, |c| c.watch.stall_after),
         settings: None,
         vscode: vscode(),
         editing: None,
@@ -753,13 +748,15 @@ pub fn run(repo: &Path) -> Result<()> {
         budget: cfg.as_ref().map_or(0.0, |c| c.worker.budget_usd),
         folded: [false; 3],
         slots: cfg.as_ref().map_or(0, |c| c.worker.slots),
-        window: cfg.map_or((0, 1.0), |c| (c.watch.autocompact, c.watch.handoff_at)),
+        window: cfg
+            .as_ref()
+            .map_or((0, 1.0), |c| (c.watch.autocompact, c.watch.handoff_at)),
         hits: RefCell::default(),
         hover: None,
         menu: None,
     };
     let theme = Theme::detect();
-    let mouse = config::load(repo).is_ok_and(|c| c.tui.mouse);
+    let mouse = cfg.is_some_and(|c| c.tui.mouse);
     let mut terminal = init(mouse);
     let mut in_review: Option<Vec<String>> = None;
     let start = Instant::now();
@@ -839,9 +836,7 @@ pub fn run(repo: &Path) -> Result<()> {
                 restore(mouse);
                 let opened = editor(&file, line);
                 terminal = init(mouse);
-                if let Err(e) = opened {
-                    app.notice = Some(format!("{e:#}"));
-                }
+                app.attempt(|_| opened);
             }
             if std::mem::take(&mut app.edit) {
                 match app.edit_file() {
@@ -864,18 +859,15 @@ pub fn run(repo: &Path) -> Result<()> {
                         restore(mouse);
                         let edited = editor(&edit.2, None);
                         terminal = init(mouse);
-                        if let Err(e) = edited.and_then(|()| app.apply_edit(edit)) {
-                            app.notice = Some(format!("{e:#}"));
-                        }
+                        app.attempt(|a| edited.and_then(|()| a.apply_edit(edit)));
                     }
                 }
             }
             let closed = app.editing.as_mut().map(|(c, _)| c.try_wait());
             if closed.is_some_and(|w| !matches!(w, Ok(None)))
                 && let Some((_, edit)) = app.editing.take()
-                && let Err(e) = app.apply_edit(edit)
             {
-                app.notice = Some(format!("{e:#}"));
+                app.attempt(|a| a.apply_edit(edit));
             }
         }
     })();
@@ -1227,15 +1219,8 @@ impl App {
                 KeyCode::Esc => self.compose = None,
                 KeyCode::Tab => c.focus = (c.focus + 1) % 4,
                 // enter alone and alt+enter (VS Code's shift+enter) are newlines in the request
-                KeyCode::Enter if c.focus == 3 || ctrl_enter => {
-                    if let Err(e) = self.submit() {
-                        self.notice = Some(format!("{e:#}"));
-                    }
-                }
-                _ if ctrl('s') => {
-                    if let Err(e) = self.submit() {
-                        self.notice = Some(format!("{e:#}"));
-                    }
+                _ if ctrl('s') || (key.code == KeyCode::Enter && (c.focus == 3 || ctrl_enter)) => {
+                    self.attempt(App::submit)
                 }
                 KeyCode::Left | KeyCode::Right if c.focus == 2 => {
                     let i = MODES.iter().position(|(m, _)| *m == c.mode).unwrap_or(0);
@@ -1280,9 +1265,7 @@ impl App {
                 _ if ctrl('s') => {
                     let text = input.lines().join("\n");
                     self.reply = None;
-                    if let Err(e) = self.send_reply(&text) {
-                        self.notice = Some(format!("{e:#}"));
-                    }
+                    self.attempt(|a| a.send_reply(&text));
                 }
                 _ => _ = input.input(key),
             }
@@ -1294,9 +1277,7 @@ impl App {
                 KeyCode::Enter => {
                     let text = input.lines().join(" ");
                     self.instruction = None;
-                    if let Err(e) = self.draft(Some(text.trim())) {
-                        self.notice = Some(format!("{e:#}"));
-                    }
+                    self.attempt(|a| a.draft(Some(text.trim())));
                 }
                 _ => _ = input.input(key),
             }
@@ -1319,13 +1300,10 @@ impl App {
             return true;
         }
         if let Some(action) = self.confirm.take() {
-            let res = match (key.code, action) {
-                (KeyCode::Char('y'), 'M') => self.merge(),
-                (KeyCode::Char('y'), _) => self.discard(),
-                _ => Ok(()),
-            };
-            if let Err(e) = res {
-                self.notice = Some(format!("{e:#}"));
+            match (key.code, action) {
+                (KeyCode::Char('y'), 'M') => self.attempt(App::merge),
+                (KeyCode::Char('y'), _) => self.attempt(App::discard),
+                _ => {}
             }
             return true;
         }
@@ -1392,9 +1370,7 @@ impl App {
                     return true;
                 }
                 KeyCode::Char(c @ ('f' | 'F')) => {
-                    if let Err(e) = self.send_findings(c == 'F') {
-                        self.notice = Some(format!("{e:#}"));
-                    }
+                    self.attempt(|a| a.send_findings(c == 'F'));
                     return true;
                 }
                 _ => {}
@@ -1421,9 +1397,7 @@ impl App {
                     return true;
                 }
                 KeyCode::Char('o') => {
-                    if let Err(e) = self.open_diff() {
-                        self.notice = Some(format!("{e:#}"));
-                    }
+                    self.attempt(App::open_diff);
                     return true;
                 }
                 _ => {}
@@ -1454,16 +1428,8 @@ impl App {
             KeyCode::Left => self.tab = (self.tab + TABS.len() - 1) % TABS.len(),
             KeyCode::Char('z') => self.zoom = !self.zoom,
             KeyCode::Esc => self.zoom = false,
-            KeyCode::Char('R') => {
-                if let Err(e) = self.toggle_run() {
-                    self.notice = Some(format!("{e:#}"));
-                }
-            }
-            KeyCode::Char('o') if self.task().is_some() => {
-                if let Err(e) = self.open() {
-                    self.notice = Some(format!("{e:#}"));
-                }
-            }
+            KeyCode::Char('R') => self.attempt(App::toggle_run),
+            KeyCode::Char('o') if self.task().is_some() => self.attempt(App::open),
             KeyCode::Char('d') => match self.slot_dir() {
                 Some(dir) => self.pager = Some((dir, self.base().unwrap_or_default(), None)),
                 None => self.notice = Some("this task has no worktree".into()),
@@ -1472,11 +1438,7 @@ impl App {
                 self.confirm = (self.task().is_some() || failed || answered).then_some('x');
             }
             KeyCode::Char('M') if valid(self, "M") => self.confirm = Some('M'),
-            KeyCode::Char('t') if failed => {
-                if let Err(e) = self.retry() {
-                    self.notice = Some(format!("{e:#}"));
-                }
-            }
+            KeyCode::Char('t') if failed => self.attempt(App::retry),
             KeyCode::Char('t') if status == Some(Status::Failed) => {
                 let model = self.task().and_then(|(t, _)| t.model.clone());
                 let keep = model.map_or(String::new(), |m| format!("; empty keeps {m}"));
@@ -1499,21 +1461,11 @@ impl App {
                 Ok(_) => self.notice = Some("the worker made no commits".into()),
                 Err(e) => self.notice = Some(format!("{e:#}")),
             },
-            KeyCode::Char('m') => {
-                if let Err(e) = self.draft(None) {
-                    self.notice = Some(format!("{e:#}"));
-                }
-            }
+            KeyCode::Char('m') => self.attempt(|a| a.draft(None)),
             KeyCode::Char('a') if self.task().is_some_and(|(t, _)| t.status == Status::Review) => {
-                if let Err(e) = self.allow_denied() {
-                    self.notice = Some(format!("{e:#}"));
-                }
+                self.attempt(App::allow_denied)
             }
-            KeyCode::Char(c @ ('a' | 'A')) => {
-                if let Err(e) = self.approve(c == 'A') {
-                    self.notice = Some(format!("{e:#}"));
-                }
-            }
+            KeyCode::Char(c @ ('a' | 'A')) => self.attempt(|a| a.approve(c == 'A')),
             KeyCode::Char('e') => self.edit = proposed,
             KeyCode::Char('r') if proposed => {
                 self.reply = Some(field("What should the lead change?"));
@@ -1530,11 +1482,7 @@ impl App {
             _ => {}
         }
         if (self.selected, self.tab) != before {
-            self.scroll.set(0);
-            self.diff_file = 0;
-        }
-        if self.selected != before.0 {
-            self.unfolded.clear();
+            self.reset_view(self.selected != before.0);
         }
         true
     }
@@ -1657,6 +1605,22 @@ impl App {
         self.free_slot(t, "discarded")
     }
 
+    /// Back to the top of the detail pane after a new tab or row; a new row also refolds its diff.
+    fn reset_view(&mut self, new_row: bool) {
+        self.scroll.set(0);
+        self.diff_file = 0;
+        if new_row {
+            self.unfolded.clear();
+        }
+    }
+
+    /// Runs `f`, showing its error as the notice.
+    fn attempt(&mut self, f: impl FnOnce(&mut App) -> Result<()>) {
+        if let Err(e) = f(self) {
+            self.notice = Some(format!("{e:#}"));
+        }
+    }
+
     /// `t` on a failed request: reruns its lead, resuming the session when it has one.
     fn retry(&mut self) -> Result<()> {
         let id = self.request().context("no request selected")?.id.clone();
@@ -1754,8 +1718,7 @@ impl App {
         if let Some(text) = instruction {
             args.extend(["--instruction", text]);
         }
-        let _ = fs::remove_file(self.state.join(format!("logs/{}.pr.log", t.id))); // may not exist
-        let pid = worker::spawn(&self.repo, &t.id, &args)?;
+        let pid = self.spawn_pr(&t.id, &args)?;
         self.awaiting = Some((t.id.clone(), t.pr_draft.clone(), pid, false));
         self.preview = false;
         Ok(())
@@ -1766,10 +1729,30 @@ impl App {
         ensure!(self.awaiting.is_none(), "a PR draft or merge is on its way");
         let (t, _) = self.task().context("no task selected")?;
         let id = t.id.clone();
-        let _ = fs::remove_file(self.state.join(format!("logs/{id}.pr.log"))); // may not exist
-        let pid = worker::spawn(&self.repo, &id, &["--merge"])?;
+        let pid = self.spawn_pr(&id, &["--merge"])?;
         self.awaiting = Some((id, None, pid, true));
         Ok(())
+    }
+
+    /// Starts a worker on `id` with `args`, clearing its last `.pr.log`.
+    fn spawn_pr(&self, id: &str, args: &[&str]) -> Result<u32> {
+        let _ = fs::remove_file(self.state.join(format!("logs/{id}.pr.log"))); // may not exist
+        worker::spawn(&self.repo, id, args)
+    }
+
+    /// Why the worker for `id` stopped, from its `.pr.log`.
+    fn pr_log_why(&self, id: &str) -> String {
+        let why = fs::read_to_string(self.state.join(format!("logs/{id}.pr.log")));
+        why.unwrap_or("the worker exited".into()).trim().into()
+    }
+
+    /// Whether a modal is open whose keys would act on the selection if it moved.
+    fn modal(&self) -> bool {
+        self.compose.is_some()
+            || self.reply.is_some()
+            || self.confirm.is_some()
+            || self.palette.is_some()
+            || self.instruction.is_some()
     }
 
     /// Opens the preview once the awaited task has a new draft; gives up if it can't get one
@@ -1778,10 +1761,7 @@ impl App {
         let Some((id, old, _, merge)) = &self.awaiting else {
             return;
         };
-        // never move the selection under an open modal, whose keys would then act on it
-        let modal = self.confirm.is_some() || self.palette.is_some() || self.reply.is_some();
-        let modal = modal || self.compose.is_some();
-        if modal || self.instruction.is_some() {
+        if self.modal() {
             return;
         }
         let Some(i) = self.tasks.iter().position(|(t, _)| &t.id == id) else {
@@ -1796,9 +1776,7 @@ impl App {
                 return;
             }
             if t.status == Status::Review {
-                let log = self.state.join(format!("logs/{id}.pr.log"));
-                let why = fs::read_to_string(log).unwrap_or("the worker exited".into());
-                self.notice = Some(format!("not merged: {}", why.trim()));
+                self.notice = Some(format!("not merged: {}", self.pr_log_why(id)));
             }
             self.awaiting = None;
         } else if t.status == Status::Review && t.pr_draft.is_some() && t.pr_draft != *old {
@@ -1808,9 +1786,7 @@ impl App {
             self.notice = Some("no PR draft: see the task's Summary and Gate tabs".into());
             self.awaiting = None;
         } else if exited {
-            let log = self.state.join(format!("logs/{id}.pr.log"));
-            let why = fs::read_to_string(log).unwrap_or("the worker exited".into());
-            self.notice = Some(format!("no PR draft: {}", why.trim()));
+            self.notice = Some(format!("no PR draft: {}", self.pr_log_why(id)));
             self.awaiting = None;
         }
     }
@@ -1968,9 +1944,7 @@ impl App {
             Some(Target::Key(key)) => return self.press(key, true),
             Some(Target::Row(i)) if i != self.selected => {
                 self.selected = i;
-                self.scroll.set(0);
-                self.diff_file = 0;
-                self.unfolded.clear();
+                self.reset_view(true);
             }
             _ => {}
         }
@@ -1995,12 +1969,7 @@ impl App {
     /// A click presses the key of the target under it or selects its row; the wheel scrolls the
     /// detail pane or moves through the list. Returns false to quit.
     fn mouse(&mut self, m: MouseEvent) -> bool {
-        let modal = self.compose.is_some() || self.settings.is_some() || self.reply.is_some();
-        let modal = modal
-            || self.preview
-            || self.confirm.is_some()
-            || self.palette.is_some()
-            || self.instruction.is_some();
+        let modal = self.modal() || self.settings.is_some() || self.preview;
         let at = Position::new(m.column, m.row);
         let (in_list, in_detail, in_tabs, in_palette, hit) = {
             let hits = self.hits.borrow();
@@ -2112,9 +2081,7 @@ impl App {
             _ => {}
         }
         if self.selected != before {
-            self.scroll.set(0);
-            self.diff_file = 0;
-            self.unfolded.clear();
+            self.reset_view(true);
         }
         true
     }
@@ -2493,6 +2460,13 @@ fn scrolled(f: &mut Frame, area: Rect, p: Paragraph, scroll: &Scroll) {
 
 /// For a view that follows its tail: how many of `len` lines to hide below, clamped so a full
 /// page of `area` stays in view.
+/// Renders the window of `lines` that fits `area`, `scroll` lines up from the tail.
+fn tail_view(f: &mut Frame, area: Rect, mut lines: Vec<Line>, scroll: &Scroll) {
+    lines.truncate(lines.len() - from_tail(lines.len(), area, scroll));
+    let skip = lines.len().saturating_sub(area.height as usize);
+    f.render_widget(Paragraph::new(lines.split_off(skip)), area);
+}
+
 fn from_tail(len: usize, area: Rect, scroll: &Scroll) -> usize {
     let max = len.saturating_sub(area.height as usize);
     scroll.set(scroll.get().min(max as u16));
@@ -3223,8 +3197,8 @@ fn header_line(app: &App, theme: &Theme, area: Rect, compact: bool) -> Line<'sta
     let x = area.x + Line::from(spans.clone()).width() as u16;
     let chip = match (need, compact) {
         (0, _) => Span::styled(format!("{} nothing needs you", theme.pass), theme.green),
-        (n, true) => theme.chip(&format!("{} {n}", theme.need), theme.amber),
-        (n, false) => theme.chip(&format!("{} {n} need you", theme.need), theme.amber),
+        (n, true) => theme.chip(&format!("{} {n}", theme.dot), theme.amber),
+        (n, false) => theme.chip(&format!("{} {n} need you", theme.dot), theme.amber),
     };
     let rect = Rect::new(x, area.y, chip.width() as u16, 1).intersection(area);
     let key = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE);
@@ -3380,9 +3354,7 @@ fn list(
                 items.push(ListItem::new(row_line(
                     glyph, title, right, sel, width, theme,
                 )));
-                if let Some((_, (tool, target), at)) = app.steps.iter().find(|s| s.0 == r.id) {
-                    let quiet = now.duration_since(*at).unwrap_or_default();
-                    let late = quiet > app.stall_after / 2;
+                if let Some(((tool, target), quiet, late)) = quiet(app, &r.id, now) {
                     items.push(ListItem::new(step(tool, target, quiet, late, width, theme)));
                     rows.push(Some(Target::Row(i)));
                 }
@@ -3438,9 +3410,7 @@ fn list(
                 theme,
                 tick,
             )));
-            if let Some((_, (tool, target), at)) = app.steps.iter().find(|s| s.0 == t.id) {
-                let quiet = now.duration_since(*at).unwrap_or_default();
-                let late = quiet > app.stall_after / 2;
+            if let Some(((tool, target), quiet, late)) = quiet(app, &t.id, now) {
                 items.push(ListItem::new(step(tool, target, quiet, late, width, theme)));
                 rows.push(Some(Target::Row(i)));
             }
@@ -3486,6 +3456,18 @@ fn list(
     });
     hits.targets.extend(rows);
     hits.targets.extend(bar);
+}
+
+/// Running row `id`'s last step, how long it's been quiet, and whether that's past half the
+/// stall time.
+fn quiet<'a>(
+    app: &'a App,
+    id: &str,
+    now: SystemTime,
+) -> Option<(&'a (String, String), Duration, bool)> {
+    let (_, call, at) = app.steps.iter().find(|s| s.0 == id)?;
+    let quiet = now.duration_since(*at).unwrap_or_default();
+    Some((call, quiet, quiet > app.stall_after / 2))
 }
 
 /// `      edit src/retry.rs…  quiet 2m`, dim under a Running row; `quiet` is amber when `late`.
@@ -3830,7 +3812,7 @@ fn verdict(
         let n = (ratio.clamp(0.0, 1.0) * 8.0).round() as usize;
         vec![
             Span::styled(theme.done.repeat(n), color),
-            Span::raw(theme.rest.repeat(8 - n)).dim(),
+            Span::raw(theme.rule.repeat(8 - n)).dim(),
         ]
     };
     let mut cells = Vec::new();
@@ -3846,9 +3828,7 @@ fn verdict(
             let pct = Span::styled(format!(" {:.0}%", ratio * 100.0), color);
             cells.push(("context", [gauge(ratio, color), vec![pct]].concat()));
         }
-        if let Some((_, _, at)) = app.steps.iter().find(|s| s.0 == t.id) {
-            let quiet = now.duration_since(*at).unwrap_or_default();
-            let late = quiet > app.stall_after / 2;
+        if let Some((_, quiet, late)) = quiet(app, &t.id, now) {
             let quiet = Span::raw(short(quiet));
             cells.push((
                 "quiet",
@@ -3897,10 +3877,7 @@ fn verdict(
         }
     }
     let mut at: Vec<_> = t.slot.map(|n| format!("slot {n}")).into_iter().collect();
-    at.extend(t.model.as_ref().map(|m| match &t.effort {
-        Some(e) => format!("{m}/{e}"),
-        None => m.clone(),
-    }));
+    at.extend(model_label(t));
     if !at.is_empty() {
         cells.push(("", vec![Span::raw(at.join(" · ")).dim()]));
     }
@@ -3972,10 +3949,14 @@ fn run_tab(f: &mut Frame, area: Rect, t: &Task, run: &RunTab, theme: &Theme, scr
         f.render_widget(Line::raw(text).dim(), output);
         return;
     }
-    let mut lines: Vec<Line> = run.log.lines().map(|l| Line::raw(l.to_string())).collect();
-    lines.truncate(lines.len() - from_tail(lines.len(), output, scroll));
-    let skip = lines.len().saturating_sub(output.height as usize);
-    f.render_widget(Paragraph::new(lines.split_off(skip)), output);
+    let lines = run.log.lines().map(|l| Line::raw(l.to_string())).collect();
+    tail_view(f, output, lines, scroll);
+}
+
+/// `model/effort`, or just the model.
+fn model_label(t: &Task) -> Option<String> {
+    let m = t.model.as_ref()?;
+    Some(t.effort.as_ref().map_or(m.clone(), |e| format!("{m}/{e}")))
 }
 
 /// `parent` is the parent task's title; `sessions` the most a task gets, shown once it hands off.
@@ -3994,10 +3975,7 @@ fn summary(
     let n = t.sessions.len();
     meta.extend((n > 1).then(|| format!("session {n}/{sessions}")));
     meta.extend((t.spent() > 0.0).then(|| format!("${:.2}", t.spent())));
-    meta.extend(t.model.as_ref().map(|m| match &t.effort {
-        Some(e) => format!("{m}/{e}"),
-        None => m.clone(),
-    }));
+    meta.extend(model_label(t));
     meta.extend(t.ticket.clone());
     meta.extend((!t.crates.is_empty()).then(|| t.crates.join(", ")));
     meta.extend(parent.map(|p| format!("after “{p}”")));
@@ -4407,10 +4385,7 @@ fn activity_tab(f: &mut Frame, area: Rect, acts: &[Act], theme: &Theme, scroll: 
         f.render_widget(Line::raw("No tool calls yet.").dim(), area);
         return;
     }
-    let lines = act_lines(acts, area.width as usize, theme);
-    let end = lines.len() - from_tail(lines.len(), area, scroll);
-    let start = end.saturating_sub(area.height as usize);
-    f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
+    tail_view(f, area, act_lines(acts, area.width as usize, theme), scroll);
 }
 
 /// The Activity tab's lines for `acts`, each at most `width` columns.
@@ -4523,9 +4498,7 @@ fn gate_tab(f: &mut Frame, area: Rect, t: &Task, log: &str, theme: &Theme, scrol
             lines.extend(body.lines().map(|l| Line::raw(l.to_string())));
         }
     }
-    lines.truncate(lines.len() - from_tail(lines.len(), output, scroll));
-    let skip = lines.len().saturating_sub(output.height as usize);
-    f.render_widget(Paragraph::new(lines.split_off(skip)), output);
+    tail_view(f, output, lines, scroll);
 }
 
 /// git-style `+`/`-` counts with bars scaled to the largest change, and the unfolded files'

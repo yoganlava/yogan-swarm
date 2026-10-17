@@ -1,6 +1,6 @@
 //! The critic: a fresh, read-only session on another model that tries to break the change.
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -217,12 +217,7 @@ pub fn run(
     let read = ["Read", "Grep", "Glob"].map(String::from);
     let run = ["cargo check", "cargo test", "git diff", "git log"].map(|b| format!("Bash({b}:*)"));
     let allowed = [&read[..], &cfg.worker.read_tools[..], &run[..]].concat();
-    fs::create_dir_all(logs)?;
-    let append = |name: &str| {
-        let path = logs.join(format!("{}.{name}", task.id));
-        File::options().create(true).append(true).open(path)
-    };
-    let (mut log, err_log) = (append("critic.jsonl")?, append("stderr.log")?);
+    let (mut log, err_log) = worker::open_logs(logs, &task.id, "critic.jsonl")?;
 
     let mut cmd = Command::new("claude");
     cmd.args(["--model", &c.model, "--effort", &c.effort]);
@@ -265,19 +260,7 @@ pub fn run(
 }
 
 fn prompt(task: &Task, base: &str, previous: &Findings) -> String {
-    let mut p = format!(
-        "Review this change.\n\nTask: {}\n\n{}\n",
-        task.title, task.body
-    );
-    if !task.crates.is_empty() {
-        p.push_str(&format!("\nCrates: {}\n", task.crates.join(", ")));
-    }
-    if !task.acceptance.is_empty() {
-        p.push_str(&format!(
-            "\nAcceptance criteria:\n- {}\n",
-            task.acceptance.join("\n- ")
-        ));
-    }
+    let mut p = format!("Review this change.\n\nTask: {}", worker::prompt(task));
     p.push_str(&format!(
         "\nThe change is `git diff {base}...HEAD`, its commits `git log {base}..HEAD`.\n"
     ));

@@ -37,8 +37,6 @@ pub enum Event {
 pub enum System {
     Init {
         session_id: String,
-        model: String,
-        tools: Vec<String>,
         #[serde(default)]
         mcp_servers: Vec<McpServer>,
     },
@@ -53,7 +51,6 @@ pub struct McpServer {
 
 #[derive(Debug, Deserialize)]
 pub struct Message {
-    pub id: String,
     pub content: Vec<Content>,
     pub usage: Usage,
 }
@@ -79,12 +76,10 @@ pub struct Usage {
     pub input_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
-    pub output_tokens: u64,
 }
 
 impl Usage {
-    /// Tokens in context, for an assistant message's usage. A message's events repeat it, so
-    /// the latest message's is the context; a result's sums every call and isn't.
+    /// Tokens in context. A message's events repeat it, so the latest message's is the context.
     pub fn context(&self) -> u64 {
         self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
     }
@@ -105,7 +100,6 @@ pub struct RunResult {
     pub subtype: String,
     pub is_error: bool,
     pub total_cost_usd: f64,
-    pub usage: Usage,
     pub permission_denials: Vec<Denial>,
     /// Claude's final message.
     #[serde(default)]
@@ -143,16 +137,12 @@ mod tests {
 
         let Event::System(System::Init {
             session_id,
-            model,
-            tools,
             mcp_servers,
         }) = &events[0]
         else {
             panic!("first event is init: {:?}", events[0]);
         };
         assert_eq!(session_id, "b98a1af4-0d10-40db-a505-3f1141bfa52d");
-        assert_eq!(model, "claude-haiku-5-5");
-        assert!(tools.contains(&"Read".to_string()));
         assert!(mcp_servers.is_empty());
 
         let tool_calls: Vec<&str> = events
@@ -187,11 +177,10 @@ mod tests {
         };
         assert_eq!((r.subtype.as_str(), r.is_error), ("success", false));
         assert!(r.total_cost_usd > 0.0);
-        assert!(r.usage.cache_read_input_tokens > 0);
         assert_eq!(r.permission_denials[0].tool_name, "Write");
         assert_eq!(r.permission_denials[0].tool_input["content"], "x");
 
-        // context is the latest assistant message's input, not the result's sum of calls
+        // context is the latest assistant message's input
         let context: Vec<u64> = events
             .iter()
             .filter_map(|e| match e {
@@ -201,7 +190,6 @@ mod tests {
             .collect();
         assert_eq!(context.first(), Some(&(2 + 4012 + 13801)));
         assert_eq!(context.last(), Some(&(2 + 318 + 18009)));
-        assert_eq!(r.usage.context(), 6 + 4526 + 49623);
     }
 
     #[test]

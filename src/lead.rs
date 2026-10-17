@@ -256,19 +256,17 @@ pub fn run(repo: &Path, id: &str, reply: Option<&str>) -> Result<()> {
     req.pid = Some(std::process::id());
     req.save(&state)?;
     let res = plan(repo, &state, &mut req, reply);
-    req.status = if res.is_ok() {
-        Phase::Done
-    } else {
-        Phase::Failed
+    let asked = match &res {
+        Ok(()) => {
+            req.status = Phase::Done;
+            req.follow_up.take()
+        }
+        Err(e) => {
+            req.status = Phase::Failed;
+            req.summary = Some(format!("{e:#}"));
+            None
+        }
     };
-    let asked = if res.is_ok() {
-        req.follow_up.take()
-    } else {
-        None
-    };
-    if let Err(e) = &res {
-        req.summary = Some(format!("{e:#}"));
-    }
     req.save(&state)?;
     res?;
     save_answer(&state, &req, asked.as_deref())
@@ -326,13 +324,7 @@ fn plan(repo: &Path, state: &Path, req: &mut Request, reply: Option<&str>) -> Re
     let path = std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
     ))?;
-    let logs = state.join("logs");
-    fs::create_dir_all(&logs)?;
-    let append = |name: &str| {
-        let path = logs.join(format!("{}.{name}", req.id));
-        File::options().create(true).append(true).open(path)
-    };
-    let (mut log, err_log) = (append("jsonl")?, append("stderr.log")?);
+    let (mut log, err_log) = worker::open_logs(&state.join("logs"), &req.id, "jsonl")?;
 
     let mut cmd = Command::new("claude");
     cmd.args(["--model", model, "--effort", effort]);

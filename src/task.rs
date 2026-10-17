@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use anyhow::{Context, Result, ensure};
 use serde::de::DeserializeOwned;
@@ -64,7 +63,7 @@ pub fn state_dir(checkout: &Path) -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("YOGAN_DIR") {
         return Ok(dir.into());
     }
-    let home = std::env::home_dir().context("no home directory")?;
+    let home = crate::config::home()?;
     let repo = crate::config::origin_name(checkout)
         .or_else(|| Some(checkout.file_name()?.to_str()?.to_string()))
         .context("no repo name for the checkout")?;
@@ -126,11 +125,7 @@ pub fn base<'a>(t: &Task, mut tasks: impl Iterator<Item = &'a Task>) -> String {
 
 /// `<prefix><unix seconds>`, so ids sort by creation.
 pub fn now_id(prefix: &str) -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{prefix}{secs}")
+    format!("{prefix}{}", crate::sched::now())
 }
 
 /// Files a lead proposal as `Proposed` with a free id and branch `<prefix><slug>`, and returns

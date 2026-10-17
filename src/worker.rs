@@ -369,6 +369,18 @@ fn kill_tree(root: u32) {
     signal(Signal::KILL);
 }
 
+/// Opens `<logs>/<id>.<stream>` and `<logs>/<id>.stderr.log` for appending.
+pub(crate) fn open_logs(logs: &Path, id: &str, stream: &str) -> Result<(File, File)> {
+    fs::create_dir_all(logs)?;
+    let append = |name: &str| {
+        File::options()
+            .create(true)
+            .append(true)
+            .open(logs.join(format!("{id}.{name}")))
+    };
+    Ok((append(stream)?, append("stderr.log")?))
+}
+
 /// Claude only warns on an unknown effort and runs on its default, so yogan fails instead.
 pub(crate) fn check_effort(effort: &str) -> Result<()> {
     ensure!(
@@ -497,7 +509,7 @@ fn lifecycle(
     };
     let mut env = slot::env(repo, &dir, n, task, cfg.ports.as_ref());
     if repo.join("Cargo.toml").exists() {
-        let home = std::env::home_dir().context("no home directory")?;
+        let home = config::home()?;
         let wrapper = cfg.cargo.as_ref().and_then(|c| c.wrapper.as_ref());
         env.extend(shim::env(
             state,
@@ -534,12 +546,7 @@ fn lifecycle(
         Some(file) => mcp_servers(&dir.join(file))?,
         None => Vec::new(),
     };
-    fs::create_dir_all(&logs)?;
-    let append = |name: &str| {
-        let path = logs.join(format!("{}.{name}", task.id));
-        File::options().create(true).append(true).open(path)
-    };
-    let (mut log, err_log) = (append("jsonl")?, append("stderr.log")?);
+    let (mut log, err_log) = open_logs(&logs, &task.id, "jsonl")?;
 
     // one Claude run in the slot; `resume` continues the task's last session, and a `schema`
     // asks for a structured reply, which it returns. A stall or loop resumes it with a nudge,
@@ -960,7 +967,7 @@ fn handoff(
     Ok(p)
 }
 
-fn prompt(task: &Task) -> String {
+pub(crate) fn prompt(task: &Task) -> String {
     let mut p = format!("{}\n\n{}\n", task.title, task.body);
     // the lead files 1-5; a task typed in compose has none
     if !task.acceptance.is_empty() {

@@ -84,11 +84,7 @@ pub fn run(
             .run
             .replace("{crates}", &crates.join(" "))
             .replace("{paths}", &paths.join(" "));
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(format!("exec 2>&1\n{cmd}"))
-            .current_dir(slot)
-            .envs(env.iter().cloned())
+        let out = crate::slot::sh(&cmd, slot, env)
             .env("BASE_SHA", &base_sha)
             .env("HEAD_SHA", &head_sha)
             .output()?;

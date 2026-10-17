@@ -212,12 +212,7 @@ pub fn setup(
 
 /// Runs a `[scripts]` command with `sh` in the slot; stdout and stderr, redacted, go to `log`.
 pub fn run_script(cmd: &str, slot: &Path, env: &[(&str, String)], log: &Path) -> Result<()> {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(format!("exec 2>&1\n{cmd}"))
-        .current_dir(slot)
-        .envs(env.iter().cloned())
-        .output()?;
+    let out = sh(cmd, slot, env).output()?;
     if let Some(dir) = log.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -229,6 +224,16 @@ pub fn run_script(cmd: &str, slot: &Path, env: &[(&str, String)], log: &Path) ->
         log.display()
     );
     Ok(())
+}
+
+/// `sh -c cmd` in `dir` with `env`, stderr merged into stdout.
+pub(crate) fn sh(cmd: &str, dir: &Path, env: &[(&str, String)]) -> Command {
+    let mut sh = Command::new("sh");
+    sh.arg("-c")
+        .arg(format!("exec 2>&1\n{cmd}"))
+        .current_dir(dir)
+        .envs(env.iter().cloned());
+    sh
 }
 
 /// Starts `[scripts] run` for task `id` detached in the slot; output goes to `logs/<id>.run.log`.
